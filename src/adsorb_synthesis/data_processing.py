@@ -1,0 +1,140 @@
+﻿"""Utilities for loading and enriching the adsorption synthesis dataset."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Iterable
+
+import numpy as np
+import pandas as pd
+
+from .constants import (
+    ADSORPTION_FEATURES,
+    LIGAND_DESCRIPTOR_FEATURES,
+    METAL_DESCRIPTOR_FEATURES,
+    SOLVENT_DESCRIPTOR_FEATURES,
+    TEMPERATURE_CATEGORIES,
+)
+
+EPSILON = 1e-9
+R_GAS_CONSTANT = 8.314  # J/(mol*K)
+TEMPERATURE_DEFAULT_K = 298.15
+
+
+@dataclass(frozen=True)
+class LookupTables:
+    """Collections of descriptor lookups keyed by entity name."""
+
+    metal: pd.DataFrame
+    ligand: pd.DataFrame
+    solvent: pd.DataFrame
+
+    def to_dict(self) -> Dict[str, pd.DataFrame]:
+        return {
+            "metal": self.metal.copy(),
+            "ligand": self.ligand.copy(),
+            "solvent": self.solvent.copy(),
+        }
+
+
+def load_dataset(csv_path: str, *, add_categories: bool = True) -> pd.DataFrame:
+    """Load the prepared dataset and ensure derived features exist."""
+
+    df = pd.read_csv(csv_path)
+    df = df.copy()
+
+    _ensure_adsorption_features(df)
+
+    if add_categories:
+        add_temperature_categories(df)
+
+    return df
+
+
+def add_temperature_categories(df: pd.DataFrame) -> None:
+    """Add categorical temperature buckets used for classification models."""
+
+    for category_name, spec in TEMPERATURE_CATEGORIES.items():
+        column = spec["column"]
+        bins = spec["bins"]
+        labels = spec["labels"]
+        if column not in df.columns:
+            continue
+        df[category_name] = pd.cut(df[column], bins=bins, labels=labels, right=False)
+
+
+def build_lookup_tables(df: pd.DataFrame) -> LookupTables:
+    """Create lookup tables for descriptor features used during inference."""
+
+    missing_cols: Dict[str, Iterable[str]] = {
+        "metal": _missing_columns(df, METAL_DESCRIPTOR_FEATURES + ["Металл"]),
+        "ligand": _missing_columns(df, LIGAND_DESCRIPTOR_FEATURES + ["Лиганд"]),
+        "solvent": _missing_columns(df, SOLVENT_DESCRIPTOR_FEATURES + ["Растворитель"]),
+    }
+    for entity, cols in missing_cols.items():
+        if cols:
+            raise ValueError(f"Dataset is missing required columns {sorted(cols)} for {entity} lookup")
+
+    metal_table = (
+        df[["Металл", *METAL_DESCRIPTOR_FEATURES]].drop_duplicates().set_index("Металл").sort_index()
+    )
+    ligand_table = (
+        df[["Лиганд", *LIGAND_DESCRIPTOR_FEATURES]].drop_duplicates().set_index("Лиганд").sort_index()
+    )
+    solvent_table = (
+        df[["Растворитель", *SOLVENT_DESCRIPTOR_FEATURES]].drop_duplicates().set_index("Растворитель").sort_index()
+    )
+
+    return LookupTables(metal=metal_table, ligand=ligand_table, solvent=solvent_table)
+
+
+def _ensure_adsorption_features(df: pd.DataFrame) -> None:
+    """Compute engineered adsorption descriptors when they are missing."""
+
+    required_base = {
+        'E, кДж/моль',
+        'Ws, см3/г',
+        'а0, ммоль/г',
+        'SБЭТ, м2/г',
+        'W0, см3/г',
+        'E0, кДж/моль',
+        'х0, нм',
+    }
+    if not required_base.issubset(df.columns):
+        missing = required_base.difference(df.columns)
+        raise ValueError(
+            "Dataset is missing base adsorption columns required for feature engineering: "
+            f"{missing}"
+        )
+
+    if 'Adsorption_Potential' not in df.columns:
+        df['Adsorption_Potential'] = df['E, кДж/моль'] * df['Ws, см3/г']
+    if 'Capacity_Density' not in df.columns:
+        df['Capacity_Density'] = df['а0, ммоль/г'] / (df['SБЭТ, м2/г'] + EPSILON)
+    if 'SurfaceArea_MicroVol_Ratio' not in df.columns:
+        df['SurfaceArea_MicroVol_Ratio'] = df['SБЭТ, м2/г'] / (df['W0, см3/г'] + EPSILON)
+    if 'Adsorption_Energy_Ratio' not in df.columns:
+        df['Adsorption_Energy_Ratio'] = df['E, кДж/моль'] / (df['E0, кДж/моль'] + EPSILON)
+    if 'S_BET_E' not in df.columns:
+        df['S_BET_E'] = df['SБЭТ, м2/г'] * df['E, кДж/моль']
+    if 'x0_W0' not in df.columns:
+        df['x0_W0'] = df['х0, нм'] * df['W0, см3/г']
+
+    if 'K_equilibrium' not in df.columns or 'Delta_G' not in df.columns:
+        R_kj = R_GAS_CONSTANT / 1000
+        df['K_equilibrium'] = np.exp(df['E, кДж/моль'] / (R_kj * TEMPERATURE_DEFAULT_K))
+        df['Delta_G'] = -R_kj * TEMPERATURE_DEFAULT_K * np.log(df['K_equilibrium'] + EPSILON)
+
+    if 'B_micropore' not in df.columns:
+        e_j_per_mol = df['E, кДж/моль'] * 1000
+        df['B_micropore'] = ((2.303 * R_GAS_CONSTANT) / (e_j_per_mol + EPSILON)) ** 2
+
+    expected = set(ADSORPTION_FEATURES)
+    missing_after = expected.difference(df.columns)
+    if missing_after:
+        raise ValueError(
+            "Missing engineered adsorption features after processing: "
+            f"{sorted(missing_after)}"
+        )
+
+def _missing_columns(df: pd.DataFrame, columns: Iterable[str]) -> Iterable[str]:
+    return [col for col in columns if col not in df.columns]
