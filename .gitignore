@@ -1,0 +1,24 @@
+# Python cache artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Model artefacts and experiment outputs
+artifacts/
+catboost_info/
+*.joblib
+
+# Data science helpers
+*.ipynb_checkpoints
+tmp_inference_input.csv
+predictions.csv
+
+# OS clutter
+.DS_Store
+Thumbs.db

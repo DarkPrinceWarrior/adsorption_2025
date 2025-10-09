@@ -27,20 +27,6 @@ def _import_tabnet(problem_type: str):
     return TabNetModel
 
 
-def _import_lightgbm(problem_type: str):
-    try:
-        import lightgbm as lgb
-    except ImportError as exc:
-        raise ImportError(
-            "lightgbm is required for ModernTabularEnsemble. "
-            "Install it with `pip install lightgbm`."
-        ) from exc
-    return (
-        lgb.LGBMClassifier if problem_type == "classification" else lgb.LGBMRegressor,
-        lgb,
-    )
-
-
 def _import_catboost(problem_type: str):
     try:
         import catboost as cb
@@ -67,49 +53,36 @@ def _default_tabnet_params(problem_type: str, random_state: int) -> Dict:
     import torch
 
     params = dict(
-        n_d=64,
-        n_a=64,
-        n_steps=5,
-        gamma=1.5,
-        lambda_sparse=1e-4,
-        optimizer_fn=torch.optim.Adam,
-        optimizer_params=dict(lr=2e-2),
-        scheduler_params=dict(step_size=50, gamma=0.9),
-        scheduler_fn=torch.optim.lr_scheduler.StepLR,
+        n_d=32,
+        n_a=32,
+        n_steps=3,
+        gamma=1.25,
+        lambda_sparse=1e-5,
+        n_independent=1,
+        n_shared=1,
+        momentum=0.02,
+        clip_value=2.0,
+        optimizer_fn=torch.optim.AdamW,
+        optimizer_params=dict(lr=8e-3, weight_decay=1e-4),
+        scheduler_params=dict(T_max=200, eta_min=1e-4),
+        scheduler_fn=torch.optim.lr_scheduler.CosineAnnealingLR,
         seed=random_state,
     )
     if problem_type == "classification":
-        params["mask_type"] = "entmax"
+        params["mask_type"] = "sparsemax"
     return params
-
-
-def _default_lightgbm_params(problem_type: str, random_state: int) -> Dict:
-    base = dict(
-        n_estimators=1000,
-        learning_rate=0.05,
-        max_depth=-1,
-        num_leaves=31,
-        min_child_samples=20,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=0.1,
-        random_state=random_state,
-        n_jobs=-1,
-    )
-    if problem_type == "classification":
-        base["objective"] = "binary"
-    else:
-        base["objective"] = "regression"
-    return base
 
 
 def _default_catboost_params(problem_type: str, random_state: int) -> Dict:
     base = dict(
-        iterations=1000,
-        learning_rate=0.05,
-        depth=6,
-        l2_leaf_reg=3,
+        iterations=1600,
+        learning_rate=0.03,
+        depth=8,
+        l2_leaf_reg=6.0,
+        min_data_in_leaf=5,
+        bagging_temperature=0.2,
+        random_strength=0.8,
+        border_count=254,
         random_seed=random_state,
         verbose=False,
     )
@@ -122,15 +95,16 @@ def _default_catboost_params(problem_type: str, random_state: int) -> Dict:
 
 def _default_xgboost_params(problem_type: str, random_state: int) -> Dict:
     base = dict(
-        n_estimators=1000,
-        learning_rate=0.05,
-        max_depth=6,
-        min_child_weight=1,
-        subsample=0.8,
+        n_estimators=1600,
+        learning_rate=0.03,
+        max_depth=5,
+        min_child_weight=4,
+        subsample=0.85,
         colsample_bytree=0.8,
-        gamma=0.1,
+        colsample_bylevel=0.7,
+        gamma=0.2,
         reg_alpha=0.1,
-        reg_lambda=1.0,
+        reg_lambda=2.0,
         random_state=random_state,
         tree_method="hist",
         n_jobs=-1,
@@ -151,7 +125,6 @@ class _ModernTabularEnsemble(BaseEstimator):
         problem_type: str,
         tabnet_params: Optional[Dict] = None,
         tabnet_fit_params: Optional[Dict] = None,
-        lgbm_params: Optional[Dict] = None,
         catboost_params: Optional[Dict] = None,
         xgb_params: Optional[Dict] = None,
         validation_fraction: float = 0.2,
@@ -164,7 +137,6 @@ class _ModernTabularEnsemble(BaseEstimator):
         self.problem_type = problem_type
         self.tabnet_params = tabnet_params
         self.tabnet_fit_params = tabnet_fit_params
-        self.lgbm_params = lgbm_params
         self.catboost_params = catboost_params
         self.xgb_params = xgb_params
         self.validation_fraction = validation_fraction
@@ -178,13 +150,6 @@ class _ModernTabularEnsemble(BaseEstimator):
         if self.tabnet_params:
             params.update(dict(self.tabnet_params))
         return TabNet(**params)
-
-    def _make_lightgbm(self):
-        cls, module = _import_lightgbm(self.problem_type)
-        params = _default_lightgbm_params(self.problem_type, self.random_state)
-        if self.lgbm_params:
-            params.update(dict(self.lgbm_params))
-        return cls(**params), module
 
     def _make_catboost(self):
         cls = _import_catboost(self.problem_type)
@@ -202,12 +167,12 @@ class _ModernTabularEnsemble(BaseEstimator):
 
     def _tabnet_fit_kwargs(self, n_samples: int) -> Dict:
         fit_params = self.tabnet_fit_params or {}
-        max_epochs = int(fit_params.get("max_epochs", 200))
-        patience = int(fit_params.get("patience", 20))
-        batch_size = int(min(fit_params.get("batch_size", 256), max(n_samples, 8)))
-        batch_size = max(batch_size, 8)
-        virtual_batch_size = int(min(fit_params.get("virtual_batch_size", 128), batch_size))
-        virtual_batch_size = max(virtual_batch_size, 8)
+        max_epochs = int(fit_params.get("max_epochs", 400))
+        patience = int(fit_params.get("patience", 60))
+        batch_size = int(min(fit_params.get("batch_size", 128), max(n_samples, 16)))
+        batch_size = max(batch_size, 16)
+        virtual_batch_size = int(min(fit_params.get("virtual_batch_size", 64), batch_size))
+        virtual_batch_size = max(virtual_batch_size, 16)
         return dict(
             max_epochs=max_epochs,
             patience=patience,
@@ -300,10 +265,7 @@ class _ModernTabularEnsemble(BaseEstimator):
         weights: List[float] = []
 
         for weight, name, model in zip(self.weights_, self.model_names_, self.models_):
-            if name == "lightgbm" and hasattr(model, "feature_importances_"):
-                importances.append(np.asarray(model.feature_importances_, dtype=np.float64))
-                weights.append(weight)
-            elif name == "catboost" and hasattr(model, "get_feature_importance"):
+            if name == "catboost" and hasattr(model, "get_feature_importance"):
                 importances.append(np.asarray(model.get_feature_importance(), dtype=np.float64))
                 weights.append(weight)
             elif name == "xgboost" and hasattr(model, "feature_importances_"):
@@ -320,13 +282,12 @@ class _ModernTabularEnsemble(BaseEstimator):
 
 
 class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
-    """Ensemble of TabNet, LightGBM, CatBoost and XGBoost for classification."""
+    """Ensemble of TabNet, CatBoost and XGBoost for classification."""
 
     def __init__(
         self,
         tabnet_params: Optional[Dict] = None,
         tabnet_fit_params: Optional[Dict] = None,
-        lgbm_params: Optional[Dict] = None,
         catboost_params: Optional[Dict] = None,
         xgb_params: Optional[Dict] = None,
         validation_fraction: float = 0.2,
@@ -338,7 +299,6 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
             problem_type="classification",
             tabnet_params=tabnet_params,
             tabnet_fit_params=tabnet_fit_params,
-            lgbm_params=lgbm_params,
             catboost_params=catboost_params,
             xgb_params=xgb_params,
             validation_fraction=validation_fraction,
@@ -386,40 +346,20 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         except Exception as exc:  # pragma: no cover - defensive
             warnings.warn(f"TabNet training failed and will be skipped: {exc}", RuntimeWarning)
 
-        # LightGBM
-        try:
-            lgbm_model, lgb_module = self._make_lightgbm()
-            if self.n_classes_ > 2:
-                lgbm_model.set_params(objective="multiclass", num_class=self.n_classes_)
-                eval_metric = "multi_logloss"
-            else:
-                lgbm_model.set_params(objective="binary")
-                eval_metric = "binary_logloss"
-            lgbm_model.fit(
-                X_train,
-                y_train,
-                eval_set=[(X_val, y_val)],
-                eval_metric=eval_metric,
-                callbacks=[lgb_module.early_stopping(50)],
-            )
-            models.append(lgbm_model)
-            names.append("lightgbm")
-            val_predictions.append(self._normalise_proba(lgbm_model.predict_proba(X_val), self.n_classes_))
-        except Exception as exc:  # pragma: no cover - defensive
-            warnings.warn(f"LightGBM training failed and will be skipped: {exc}", RuntimeWarning)
-
         # CatBoost
         try:
             cat_model = self._make_catboost()
             if self.n_classes_ > 2:
-                cat_model.set_params(loss_function="MultiClass")
+                cat_model.set_params(loss_function="MultiClass", eval_metric="TotalF1")
             else:
-                cat_model.set_params(loss_function="Logloss")
+                cat_model.set_params(loss_function="Logloss", eval_metric="Logloss")
+            if self.n_classes_ == 2:
+                cat_model.set_params(auto_class_weights="Balanced")
             cat_model.fit(
                 X_train,
                 y_train,
                 eval_set=(X_val, y_val),
-                early_stopping_rounds=50,
+                early_stopping_rounds=100,
                 verbose=False,
             )
             models.append(cat_model)
@@ -436,11 +376,17 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
                     objective="multi:softprob",
                     num_class=self.n_classes_,
                     eval_metric="mlogloss",
+                    max_delta_step=1,
                 )
             else:
+                positives = np.count_nonzero(y_train == 1)
+                negatives = y_train.shape[0] - positives
+                if positives > 0:
+                    xgb_model.set_params(scale_pos_weight=negatives / positives)
                 xgb_model.set_params(
                     objective="binary:logistic",
-                    eval_metric="logloss",
+                    eval_metric=["logloss", "auc"],
+                    max_delta_step=1,
                 )
             xgb_model.fit(
                 X_train,
@@ -483,13 +429,12 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
 
 
 class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
-    """Ensemble of TabNet, LightGBM, CatBoost and XGBoost for regression."""
+    """Ensemble of TabNet, CatBoost and XGBoost for regression."""
 
     def __init__(
         self,
         tabnet_params: Optional[Dict] = None,
         tabnet_fit_params: Optional[Dict] = None,
-        lgbm_params: Optional[Dict] = None,
         catboost_params: Optional[Dict] = None,
         xgb_params: Optional[Dict] = None,
         validation_fraction: float = 0.2,
@@ -501,7 +446,6 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
             problem_type="regression",
             tabnet_params=tabnet_params,
             tabnet_fit_params=tabnet_fit_params,
-            lgbm_params=lgbm_params,
             catboost_params=catboost_params,
             xgb_params=xgb_params,
             validation_fraction=validation_fraction,
@@ -542,31 +486,15 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         except Exception as exc:  # pragma: no cover - defensive
             warnings.warn(f"TabNet training failed and will be skipped: {exc}", RuntimeWarning)
 
-        # LightGBM
-        try:
-            lgbm_model, lgb_module = self._make_lightgbm()
-            lgbm_model.set_params(objective="regression", metric="rmse")
-            lgbm_model.fit(
-                X_train,
-                y_train,
-                eval_set=[(X_val, y_val)],
-                callbacks=[lgb_module.early_stopping(50)],
-            )
-            models.append(lgbm_model)
-            names.append("lightgbm")
-            val_predictions.append(np.asarray(lgbm_model.predict(X_val), dtype=np.float64).ravel())
-        except Exception as exc:  # pragma: no cover - defensive
-            warnings.warn(f"LightGBM training failed and will be skipped: {exc}", RuntimeWarning)
-
         # CatBoost
         try:
             cat_model = self._make_catboost()
-            cat_model.set_params(loss_function="RMSE")
+            cat_model.set_params(loss_function="RMSE", eval_metric="RMSE", subsample=0.85, rsm=0.85)
             cat_model.fit(
                 X_train,
                 y_train,
                 eval_set=(X_val, y_val),
-                early_stopping_rounds=50,
+                early_stopping_rounds=100,
                 verbose=False,
             )
             models.append(cat_model)
@@ -578,7 +506,7 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         # XGBoost
         try:
             xgb_model = self._make_xgboost()
-            xgb_model.set_params(objective="reg:squarederror")
+            xgb_model.set_params(objective="reg:squarederror", eval_metric="rmse", max_delta_step=1)
             xgb_model.fit(
                 X_train,
                 y_train,

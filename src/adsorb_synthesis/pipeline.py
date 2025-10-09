@@ -86,9 +86,9 @@ def default_stage_configs() -> List[StageConfig]:
     salt_features = sorted(set(
         solvent_features + list(SOLVENT_DESCRIPTOR_FEATURES) + process_context + ['Растворитель']
     ))
-    acid_features = sorted(set(salt_features + ['m (соли), г']))
-    volume_predictors = sorted(set(acid_features + ['m(кис-ты), г']))
-    tsyn_predictors = sorted(set(volume_predictors + ['Vсин. (р-ля), мл']))
+    acid_features = sorted(set(salt_features + ['m (соли), г', 'n_соли']))
+    volume_predictors = sorted(set(acid_features + ['m(кис-ты), г', 'n_кислоты', 'n_ratio']))
+    tsyn_predictors = sorted(set(volume_predictors + ['Vсин. (р-ля), мл', 'Vsyn_m']))
     dry_predictors = sorted(set(tsyn_predictors + ['Tsyn_Category']))
     regen_predictors = sorted(set(dry_predictors + ['Tdry_Category']))
 
@@ -234,6 +234,7 @@ class InverseDesignPipeline:
         data = dataset.copy()
         _ensure_process_defaults(data)
         _augment_with_lookup_descriptors(data, lookup_tables)
+        _update_stoichiometry_features(data)
 
         rng_seed = self.random_state
         self.stage_results.clear()
@@ -277,6 +278,7 @@ class InverseDesignPipeline:
 
         for stage in self.stage_configs:
             _augment_with_lookup_descriptors(results, self.lookup_tables)
+            _update_stoichiometry_features(results)
 
             features = list(stage.feature_columns)
             missing = [col for col in features if col not in results.columns]
@@ -522,3 +524,23 @@ def _ensure_process_defaults(df: pd.DataFrame) -> None:
         if feature not in df.columns:
             df[feature] = 1.0
         df[feature] = df[feature].fillna(1.0)
+
+
+def _update_stoichiometry_features(df: pd.DataFrame) -> None:
+    """Derive stoichiometric helper features used by downstream stages."""
+
+    if {'m (соли), г', 'Молярка_соли'}.issubset(df.columns):
+        denom = df['Молярка_соли'].replace(0, np.nan)
+        df['n_соли'] = df['m (соли), г'] / denom
+
+    if {'m(кис-ты), г', 'Молярка_кислоты'}.issubset(df.columns):
+        denom = df['Молярка_кислоты'].replace(0, np.nan)
+        df['n_кислоты'] = df['m(кис-ты), г'] / denom
+
+    if {'n_соли', 'n_кислоты'}.issubset(df.columns):
+        denom = df['n_кислоты'].replace(0, np.nan)
+        df['n_ratio'] = df['n_соли'] / denom
+
+    if {'Vсин. (р-ля), мл', 'm (соли), г'}.issubset(df.columns):
+        denom = df['m (соли), г'].replace(0, np.nan)
+        df['Vsyn_m'] = df['Vсин. (р-ля), мл'] / denom

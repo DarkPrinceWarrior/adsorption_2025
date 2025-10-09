@@ -1,6 +1,6 @@
 ﻿# Инверсионный дизайн адсорбентов
 
-Репозиторий содержит полный цикл обратного проектирования МОF-адсорбентов: подготовку данных СЭХ, обучение последовательности моделей и инференс технологических параметров (металл, лиганд, растворитель, массы реагентов, объём растворителя и температурные режимы). Используется стек Python 3.10 + ModernTabularEnsemble (TabNet + LightGBM + CatBoost + XGBoost, SciPy ≥ 1.11), а процессы завернуты в CLI-скрипты.
+Репозиторий содержит полный цикл обратного проектирования МОF-адсорбентов: подготовку данных СЭХ, обучение последовательности моделей и инференс технологических параметров (металл, лиганд, растворитель, массы реагентов, объём растворителя и температурные режимы). Используется стек Python 3.10 + ModernTabularEnsemble (TabNet + CatBoost + XGBoost, SciPy ≥ 1.11), а процессы завернуты в CLI-скрипты.
 
 ## 1. Данные
 
@@ -58,7 +58,7 @@ adsorb_synthesis/
 ## 4. Модели и последовательность стадий
 
 ### 4.1 Алгоритмы
-- `ModernTabularEnsembleClassifier` и `ModernTabularEnsembleRegressor` объединяют TabNet (n_d=n_a=64, n_steps=5, Adam lr=2e-2, StepLR) с LightGBM, CatBoost и XGBoost (по 1000 деревьев, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8) и оптимизируют веса ансамбля через SciPy SLSQP по логлоссу/ MSE.
+- `ModernTabularEnsembleClassifier` и `ModernTabularEnsembleRegressor` объединяют TabNet (n_d=n_a=32, n_steps=3, AdamW lr=8e-3, CosineAnnealingLR), CatBoost (depth=8, iterations=1600, balanced классовые веса, subsample=0.85) и XGBoost (max_depth=5, n_estimators=1600, subsample=0.85, colsample_bytree=0.8, reg_lambda=2.0) и оптимизируют веса ансамбля через SciPy SLSQP по логлоссу/ MSE.
 - Регрессионные таргеты очищаются от выбросов `IsolationForest(contamination=0.05)`.
 
 ### 4.2 Стадии `default_stage_configs`
@@ -166,7 +166,7 @@ python -m pip install -r requirements.txt
 ## 10. Дальнейшее развитие
 1. Добавить unit-тесты для `default_stage_configs`, `_augment_with_lookup_descriptors`, CLI.
 2. Зафиксировать окружение в `pyproject.toml` / `poetry.lock` либо `environment.yml`.
-3. Провести гипертюнинг (Optuna) и протестировать CatBoost/LightGBM для стадий с дисбалансом классов.
+3. Провести гипертюнинг (Optuna) и протестировать дополнительные архитектуры CatBoost/XGBoost для стадий с дисбалансом классов.
 4. Интегрировать интерпретацию моделей (SHAP, permutation importance).
 
 ## 11. FAQ
@@ -181,4 +181,3 @@ python -m pip install -r requirements.txt
 4. Получить предсказания: `python scripts/predict_inverse_design.py --model artifacts --input tmp_inference_input.csv --targets-only`.
 
 Система готова к использованию и соответствует требованиям на 1 октября 2025 года.
-
