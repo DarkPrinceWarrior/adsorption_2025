@@ -1,4 +1,10 @@
-﻿pandas
+pandas
 numpy
 scikit-learn
 joblib
+torch
+pytorch-tabnet
+lightgbm
+catboost
+xgboost
+optuna

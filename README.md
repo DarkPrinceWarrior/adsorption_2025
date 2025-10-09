@@ -1,6 +1,6 @@
 ﻿# Инверсионный дизайн адсорбентов
 
-Репозиторий содержит полный цикл обратного проектирования МОF-адсорбентов: подготовку данных СЭХ, обучение последовательности моделей и инференс технологических параметров (металл, лиганд, растворитель, массы реагентов, объём растворителя и температурные режимы). Используется стек Python 3.10 + HistGradientBoosting (scikit-learn ≥ 1.7.2), а процессы завернуты в CLI-скрипты.
+Репозиторий содержит полный цикл обратного проектирования МОF-адсорбентов: подготовку данных СЭХ, обучение последовательности моделей и инференс технологических параметров (металл, лиганд, растворитель, массы реагентов, объём растворителя и температурные режимы). Используется стек Python 3.10 + ModernTabularEnsemble (TabNet + LightGBM + CatBoost + XGBoost, SciPy ≥ 1.11), а процессы завернуты в CLI-скрипты.
 
 ## 1. Данные
 
@@ -58,7 +58,7 @@ adsorb_synthesis/
 ## 4. Модели и последовательность стадий
 
 ### 4.1 Алгоритмы
-- `HistGradientBoostingClassifier` и `HistGradientBoostingRegressor` с параметрами: `max_iter=500`, `learning_rate=0.05`, `l2_regularization=0.1`. Для классификации используется `class_weight="balanced"`.
+- `ModernTabularEnsembleClassifier` и `ModernTabularEnsembleRegressor` объединяют TabNet (n_d=n_a=64, n_steps=5, Adam lr=2e-2, StepLR) с LightGBM, CatBoost и XGBoost (по 1000 деревьев, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8) и оптимизируют веса ансамбля через SciPy SLSQP по логлоссу/ MSE.
 - Регрессионные таргеты очищаются от выбросов `IsolationForest(contamination=0.05)`.
 
 ### 4.2 Стадии `default_stage_configs`

@@ -10,11 +10,7 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import (
-    HistGradientBoostingClassifier,
-    HistGradientBoostingRegressor,
-    IsolationForest,
-)
+from sklearn.ensemble import IsolationForest
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
@@ -38,6 +34,10 @@ from .constants import (
     TEST_SIZE,
 )
 from .data_processing import LookupTables, build_lookup_tables
+from .modern_models import (
+    ModernTabularEnsembleClassifier,
+    ModernTabularEnsembleRegressor,
+)
 
 ProblemType = Literal["classification", "regression"]
 
@@ -67,25 +67,12 @@ class StageResult:
     feature_columns: List[str]
 
 
-def _default_classifier(random_state: int) -> HistGradientBoostingClassifier:
-    return HistGradientBoostingClassifier(
-        max_depth=None,
-        learning_rate=0.05,
-        max_iter=500,
-        l2_regularization=0.1,
-        class_weight="balanced",
-        random_state=random_state,
-    )
+def _default_classifier(random_state: int) -> BaseEstimator:
+    return ModernTabularEnsembleClassifier(random_state=random_state)
 
 
-def _default_regressor(random_state: int) -> HistGradientBoostingRegressor:
-    return HistGradientBoostingRegressor(
-        max_depth=None,
-        learning_rate=0.05,
-        max_iter=500,
-        l2_regularization=0.1,
-        random_state=random_state,
-    )
+def _default_regressor(random_state: int) -> BaseEstimator:
+    return ModernTabularEnsembleRegressor(random_state=random_state)
 
 
 def default_stage_configs() -> List[StageConfig]:
