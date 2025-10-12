@@ -7,7 +7,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
-from sklearn.metrics import log_loss, mean_squared_error
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
@@ -89,7 +90,8 @@ def _default_catboost_params(problem_type: str, random_state: int) -> Dict:
     if problem_type == "classification":
         base.setdefault("loss_function", "Logloss")
     else:
-        base.setdefault("loss_function", "RMSE")
+        # Use MAE for robustness to outliers
+        base.setdefault("loss_function", "MAE")
     return base
 
 
@@ -115,7 +117,8 @@ def _default_xgboost_params(problem_type: str, random_state: int) -> Dict:
         base["use_label_encoder"] = False
         base["eval_metric"] = "logloss"
     else:
-        base["objective"] = "reg:squarederror"
+        # Use Huber loss (pseudo-huber via MAE-like robustness)
+        base["objective"] = "reg:absoluteerror"
     return base
 
 
@@ -208,27 +211,46 @@ class _ModernTabularEnsemble(BaseEstimator):
             return np.ones(n_models, dtype=np.float64) / n_models
 
         initial = np.ones(n_models, dtype=np.float64) / n_models
+        l2_penalty = 0.01  # L2 regularization strength
 
         if self.problem_type == "classification":
             n_classes = predictions.shape[-1]
-            labels = np.arange(n_classes)
-
+            
             def objective(weights: np.ndarray) -> float:
                 weights = np.clip(weights, 0.0, None)
                 total = weights.sum()
                 if total == 0:
                     return np.inf
-                ensemble = np.tensordot(weights / total, predictions, axes=(0, 0))
+                w_norm = weights / total
+                ensemble = np.tensordot(w_norm, predictions, axes=(0, 0))
                 ensemble = np.clip(ensemble, 1e-6, 1 - 1e-6)
-                return float(log_loss(y_val, ensemble, labels=labels))
+                
+                # Use Brier score for better calibration
+                if n_classes == 2:
+                    # Binary case: use brier_score_loss
+                    brier = float(brier_score_loss(y_val, ensemble[:, 1]))
+                else:
+                    # Multi-class: average Brier score across all classes
+                    y_one_hot = np.eye(n_classes)[y_val.astype(int)]
+                    brier = float(np.mean((ensemble - y_one_hot) ** 2))
+                
+                # Add L2 regularization to prevent extreme weights
+                reg = l2_penalty * float(np.sum((w_norm - initial) ** 2))
+                return brier + reg
         else:
             def objective(weights: np.ndarray) -> float:
                 weights = np.clip(weights, 0.0, None)
                 total = weights.sum()
                 if total == 0:
                     return np.inf
-                ensemble = np.tensordot(weights / total, predictions, axes=(0, 0))
-                return float(mean_squared_error(y_val, ensemble))
+                w_norm = weights / total
+                ensemble = np.tensordot(w_norm, predictions, axes=(0, 0))
+                
+                # Use MAE instead of MSE for robustness
+                mae = float(mean_absolute_error(y_val, ensemble))
+                # Add L2 regularization
+                reg = l2_penalty * float(np.sum((w_norm - initial) ** 2))
+                return mae + reg
 
         constraints = {"type": "eq", "fun": lambda w: float(np.sum(w)) - 1.0}
         bounds = [(0.0, 1.0)] * n_models
@@ -282,7 +304,7 @@ class _ModernTabularEnsemble(BaseEstimator):
 
 
 class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
-    """Ensemble of TabNet, CatBoost and XGBoost for classification."""
+    """Ensemble of TabNet, CatBoost and XGBoost for classification with calibration."""
 
     def __init__(
         self,
@@ -293,6 +315,8 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         validation_fraction: float = 0.2,
         optimize_weights: bool = True,
         weight_opt_params: Optional[Dict] = None,
+        calibrate_predictions: bool = True,
+        calibration_method: str = "isotonic",
         random_state: int = 42,
     ) -> None:
         super().__init__(
@@ -306,6 +330,8 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
             weight_opt_params=weight_opt_params,
             random_state=random_state,
         )
+        self.calibrate_predictions = calibrate_predictions
+        self.calibration_method = calibration_method
 
     def fit(self, X, y):
         X_arr, y_arr = check_X_y(X, y, accept_sparse=False, ensure_min_samples=2)
@@ -403,7 +429,39 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         if not models:
             raise RuntimeError("All base models failed to train; cannot fit ensemble.")
 
-        self.models_ = models
+        # Apply calibration to base models if requested
+        if self.calibrate_predictions:
+            calibrated_models: List = []
+            calibrated_predictions: List[np.ndarray] = []
+            
+            for model, name in zip(models, names):
+                try:
+                    # Create a calibrated version of the model
+                    cal_model = CalibratedClassifierCV(
+                        model,
+                        method=self.calibration_method,
+                        cv="prefit",
+                        ensemble=False,
+                    )
+                    # Use validation set for calibration
+                    cal_model.fit(X_val, y_val)
+                    calibrated_models.append(cal_model)
+                    calibrated_predictions.append(
+                        self._normalise_proba(cal_model.predict_proba(X_val), self.n_classes_)
+                    )
+                except Exception as exc:  # pragma: no cover
+                    warnings.warn(
+                        f"Calibration failed for {name}, using uncalibrated model: {exc}",
+                        RuntimeWarning,
+                    )
+                    calibrated_models.append(model)
+                    calibrated_predictions.append(val_predictions[len(calibrated_models) - 1])
+            
+            self.models_ = calibrated_models
+            val_predictions = calibrated_predictions
+        else:
+            self.models_ = models
+        
         self.model_names_ = names
         val_stack = np.stack(val_predictions, axis=0)
         self.weights_ = self._optimize_weights(val_stack, y_val)

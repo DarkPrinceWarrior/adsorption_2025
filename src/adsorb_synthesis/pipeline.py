@@ -480,7 +480,7 @@ class InverseDesignPipeline:
             else:
                 n_splits = max(2, min(5, len(y)))
                 cv = KFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
-            cv_scores = cross_val_score(pipeline, X, y, cv=cv, scoring='accuracy')
+            cv_scores = cross_val_score(pipeline, X, y, cv=cv, scoring='balanced_accuracy')
         else:
             rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
             metrics = {
@@ -490,7 +490,7 @@ class InverseDesignPipeline:
             }
             n_splits = max(2, min(5, len(y)))
             cv = KFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
-            cv_scores = cross_val_score(pipeline, X, y, cv=cv, scoring='r2')
+            cv_scores = cross_val_score(pipeline, X, y, cv=cv, scoring='neg_mean_absolute_error')
 
         return metrics, float(np.mean(cv_scores)), float(np.std(cv_scores))
 
