@@ -36,7 +36,7 @@ class LookupTables:
         }
 
 
-def load_dataset(csv_path: str, *, add_categories: bool = True) -> pd.DataFrame:
+def load_dataset(csv_path: str, *, add_categories: bool = True, add_salt_features: bool = True) -> pd.DataFrame:
     """Load the prepared dataset and ensure derived features exist."""
 
     df = pd.read_csv(csv_path)
@@ -46,8 +46,32 @@ def load_dataset(csv_path: str, *, add_categories: bool = True) -> pd.DataFrame:
 
     if add_categories:
         add_temperature_categories(df)
+    
+    if add_salt_features:
+        add_salt_mass_features(df)
 
     return df
+
+
+def add_salt_mass_features(df: pd.DataFrame) -> None:
+    """Add engineered features for salt_mass prediction."""
+    
+    # Metal-Ligand interaction (categorical combination)
+    if 'Металл' in df.columns and 'Лиганд' in df.columns:
+        df['Metal_Ligand_Combo'] = df['Металл'].astype(str) + '_' + df['Лиганд'].astype(str)
+    
+    # Log-transformed molecular weights if available
+    if 'Total molecular weight (metal)' in df.columns:
+        df['Log_Metal_MW'] = np.log1p(df['Total molecular weight (metal)'])
+    
+    # Metal-specific indicator for Cu (high salt mass)
+    if 'Металл' in df.columns:
+        df['Is_Cu'] = (df['Металл'] == 'Cu').astype(int)
+        df['Is_Zn'] = (df['Металл'] == 'Zn').astype(int)
+    
+    # Log-transform salt mass target (handles extreme right-skew)
+    if 'm (соли), г' in df.columns:
+        df['log_salt_mass'] = np.log1p(df['m (соли), г'])  # log1p = log(1 + x)
 
 
 def add_temperature_categories(df: pd.DataFrame) -> None:

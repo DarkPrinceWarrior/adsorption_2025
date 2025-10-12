@@ -18,8 +18,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train inverse design models for adsorption synthesis.")
     parser.add_argument(
         "--data",
-        default="data/SEC_SYN_with_features.csv",
-        help="Path to the prepared dataset with engineered features.",
+        default="data/SEC_SYN_with_features_DMFA_only_no_Y.csv",
+        help="Path to the prepared dataset with engineered features (ДМФА only, Y metal removed).",
     )
     parser.add_argument(
         "--output",

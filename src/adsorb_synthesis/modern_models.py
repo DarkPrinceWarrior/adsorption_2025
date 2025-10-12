@@ -11,7 +11,60 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
+from sklearn.utils.class_weight import compute_class_weight
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
+
+
+def _try_import_smote():
+    """Try to import SMOTE/ADASYN from imbalanced-learn."""
+    try:
+        from imblearn.over_sampling import ADASYN, SMOTE
+        return SMOTE, ADASYN
+    except ImportError:
+        return None, None
+
+
+def _compute_focal_class_weights(y: np.ndarray, gamma: float = 2.0) -> Dict[int, float]:
+    """Compute class weights for focal loss effect."""
+    classes = np.unique(y)
+    class_weights = compute_class_weight('balanced', classes=classes, y=y)
+    weight_dict = {}
+    for i, cls in enumerate(classes):
+        # Scale weights exponentially for rare classes
+        freq = np.sum(y == cls) / len(y)
+        weight_dict[int(cls)] = float(class_weights[i] * (1.0 / (freq + 1e-6)) ** gamma)
+    return weight_dict
+
+
+def _apply_smote_if_available(X: np.ndarray, y: np.ndarray, random_state: int) -> tuple:
+    """Apply SMOTE/ADASYN if available, otherwise return original data."""
+    SMOTE, ADASYN = _try_import_smote()
+    if SMOTE is None:
+        return X, y
+    
+    try:
+        # Count samples per class
+        unique, counts = np.unique(y, return_counts=True)
+        min_samples = counts.min()
+        
+        # Only apply if we have enough samples and imbalance exists
+        if min_samples >= 2 and len(unique) > 1 and counts.max() / min_samples > 1.5:
+            # Try ADASYN first (adaptive synthetic sampling)
+            try:
+                sampler = ADASYN(random_state=random_state, n_neighbors=min(5, min_samples - 1))
+                X_resampled, y_resampled = sampler.fit_resample(X, y)
+                return X_resampled, y_resampled
+            except Exception:
+                # Fall back to SMOTE if ADASYN fails
+                try:
+                    sampler = SMOTE(random_state=random_state, k_neighbors=min(5, min_samples - 1))
+                    X_resampled, y_resampled = sampler.fit_resample(X, y)
+                    return X_resampled, y_resampled
+                except Exception:
+                    return X, y
+        return X, y
+    except Exception:
+        return X, y
 
 
 def _import_tabnet(problem_type: str):
@@ -89,6 +142,8 @@ def _default_catboost_params(problem_type: str, random_state: int) -> Dict:
     )
     if problem_type == "classification":
         base.setdefault("loss_function", "Logloss")
+        # Auto class weights for all classification tasks
+        base.setdefault("auto_class_weights", "Balanced")
     else:
         # Use MAE for robustness to outliers
         base.setdefault("loss_function", "MAE")
@@ -117,8 +172,9 @@ def _default_xgboost_params(problem_type: str, random_state: int) -> Dict:
         base["use_label_encoder"] = False
         base["eval_metric"] = "logloss"
     else:
-        # Use Huber loss (pseudo-huber via MAE-like robustness)
-        base["objective"] = "reg:absoluteerror"
+        # Use pseudo-Huber loss for robustness to outliers
+        base["objective"] = "reg:pseudohubererror"
+        base["huber_slope"] = 5.0  # Adjusted to match typical data scale
     return base
 
 
@@ -133,6 +189,8 @@ class _ModernTabularEnsemble(BaseEstimator):
         validation_fraction: float = 0.2,
         optimize_weights: bool = True,
         weight_opt_params: Optional[Dict] = None,
+        use_smote: bool = True,
+        focal_gamma: float = 2.0,
         random_state: int = 42,
     ) -> None:
         if not 0.0 < validation_fraction < 1.0:
@@ -145,6 +203,8 @@ class _ModernTabularEnsemble(BaseEstimator):
         self.validation_fraction = validation_fraction
         self.optimize_weights = optimize_weights
         self.weight_opt_params = weight_opt_params
+        self.use_smote = use_smote
+        self.focal_gamma = focal_gamma
         self.random_state = random_state
 
     def _make_tabnet(self):
@@ -317,6 +377,8 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         weight_opt_params: Optional[Dict] = None,
         calibrate_predictions: bool = True,
         calibration_method: str = "isotonic",
+        use_smote: bool = True,
+        focal_gamma: float = 2.0,
         random_state: int = 42,
     ) -> None:
         super().__init__(
@@ -328,6 +390,8 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
             validation_fraction=validation_fraction,
             optimize_weights=optimize_weights,
             weight_opt_params=weight_opt_params,
+            use_smote=use_smote,
+            focal_gamma=focal_gamma,
             random_state=random_state,
         )
         self.calibrate_predictions = calibrate_predictions
@@ -351,6 +415,20 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
             random_state=self.random_state,
             stratify=stratify,
         )
+
+        # Apply SMOTE/ADASYN to training data if enabled
+        if self.use_smote and self.n_classes_ > 1:
+            print(f"  [INFO] Applying SMOTE/ADASYN for class balancing (n_classes={self.n_classes_})")
+            X_train_orig_shape = X_train.shape
+            X_train, y_train = _apply_smote_if_available(X_train, y_train, self.random_state)
+            if X_train.shape[0] != X_train_orig_shape[0]:
+                print(f"  [INFO] SMOTE applied: {X_train_orig_shape[0]} → {X_train.shape[0]} samples")
+            else:
+                print(f"  [INFO] SMOTE not applied (balanced or insufficient samples)")
+        
+        # Compute focal class weights
+        focal_weights = _compute_focal_class_weights(y_train, gamma=self.focal_gamma)
+        print(f"  [INFO] Focal weights computed (gamma={self.focal_gamma}): {focal_weights}")
 
         models: List = []
         names: List[str] = []
@@ -376,11 +454,17 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         try:
             cat_model = self._make_catboost()
             if self.n_classes_ > 2:
-                cat_model.set_params(loss_function="MultiClass", eval_metric="TotalF1")
+                cat_model.set_params(
+                    loss_function="MultiClass",
+                    eval_metric="TotalF1",
+                    class_weights=list(focal_weights.values()),
+                )
             else:
-                cat_model.set_params(loss_function="Logloss", eval_metric="Logloss")
-            if self.n_classes_ == 2:
-                cat_model.set_params(auto_class_weights="Balanced")
+                cat_model.set_params(
+                    loss_function="Logloss",
+                    eval_metric="Logloss",
+                    class_weights=list(focal_weights.values()),
+                )
             cat_model.fit(
                 X_train,
                 y_train,
@@ -397,6 +481,9 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         # XGBoost
         try:
             xgb_model = self._make_xgboost()
+            # Compute sample weights from focal weights
+            sample_weights = np.array([focal_weights[int(label)] for label in y_train])
+            
             if self.n_classes_ > 2:
                 xgb_model.set_params(
                     objective="multi:softprob",
@@ -405,10 +492,7 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
                     max_delta_step=1,
                 )
             else:
-                positives = np.count_nonzero(y_train == 1)
-                negatives = y_train.shape[0] - positives
-                if positives > 0:
-                    xgb_model.set_params(scale_pos_weight=negatives / positives)
+                # For binary, use focal weights via sample_weight
                 xgb_model.set_params(
                     objective="binary:logistic",
                     eval_metric=["logloss", "auc"],
@@ -417,6 +501,7 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
             xgb_model.fit(
                 X_train,
                 y_train,
+                sample_weight=sample_weights,
                 eval_set=[(X_val, y_val)],
                 verbose=False,
             )
@@ -487,7 +572,7 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
 
 
 class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
-    """Ensemble of TabNet, CatBoost and XGBoost for regression."""
+    """Ensemble of TabNet, CatBoost and XGBoost for regression with robust losses."""
 
     def __init__(
         self,
@@ -498,6 +583,9 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         validation_fraction: float = 0.2,
         optimize_weights: bool = True,
         weight_opt_params: Optional[Dict] = None,
+        use_quantile: bool = False,
+        quantile_alpha: float = 0.5,
+        huber_delta: float = 1.0,
         random_state: int = 42,
     ) -> None:
         super().__init__(
@@ -509,8 +597,12 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
             validation_fraction=validation_fraction,
             optimize_weights=optimize_weights,
             weight_opt_params=weight_opt_params,
+            use_smote=False,  # Not applicable for regression
             random_state=random_state,
         )
+        self.use_quantile = use_quantile
+        self.quantile_alpha = quantile_alpha
+        self.huber_delta = huber_delta
 
     def fit(self, X, y):
         X_arr, y_arr = check_X_y(X, y, accept_sparse=False, y_numeric=True)
@@ -547,7 +639,23 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         # CatBoost
         try:
             cat_model = self._make_catboost()
-            cat_model.set_params(loss_function="RMSE", eval_metric="RMSE", subsample=0.85, rsm=0.85)
+            if self.use_quantile:
+                print(f"  [INFO] Using Quantile Regression (alpha={self.quantile_alpha})")
+                cat_model.set_params(
+                    loss_function=f"Quantile:alpha={self.quantile_alpha}",
+                    eval_metric="MAE",
+                    subsample=0.85,
+                    rsm=0.85,
+                )
+            else:
+                # Use MAE for robustness (CatBoost Huber doesn't support delta parameter)
+                print(f"  [INFO] Using MAE loss for regression (CatBoost)")
+                cat_model.set_params(
+                    loss_function="MAE",
+                    eval_metric="MAE",
+                    subsample=0.85,
+                    rsm=0.85,
+                )
             cat_model.fit(
                 X_train,
                 y_train,
@@ -564,7 +672,21 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         # XGBoost
         try:
             xgb_model = self._make_xgboost()
-            xgb_model.set_params(objective="reg:squarederror", eval_metric="rmse", max_delta_step=1)
+            if self.use_quantile:
+                print(f"  [INFO] Using Quantile Regression (alpha={self.quantile_alpha}) for XGBoost")
+                xgb_model.set_params(
+                    objective=f"reg:quantileerror",
+                    quantile_alpha=self.quantile_alpha,
+                    eval_metric="mae",
+                )
+            else:
+                # Use pseudo-Huber (reg:pseudohubererror) for robustness
+                print(f"  [INFO] Using Pseudo-Huber loss (delta={self.huber_delta}) for XGBoost")
+                xgb_model.set_params(
+                    objective="reg:pseudohubererror",
+                    huber_slope=self.huber_delta,
+                    eval_metric="mae",
+                )
             xgb_model.fit(
                 X_train,
                 y_train,

@@ -33,7 +33,7 @@ from .constants import (
     SOLVENT_DESCRIPTOR_FEATURES,
     TEST_SIZE,
 )
-from .data_processing import LookupTables, build_lookup_tables
+from .data_processing import LookupTables, add_salt_mass_features, build_lookup_tables
 from .modern_models import (
     ModernTabularEnsembleClassifier,
     ModernTabularEnsembleRegressor,
@@ -68,11 +68,30 @@ class StageResult:
 
 
 def _default_classifier(random_state: int) -> BaseEstimator:
-    return ModernTabularEnsembleClassifier(random_state=random_state)
+    return ModernTabularEnsembleClassifier(
+        random_state=random_state,
+        use_smote=True,
+        focal_gamma=2.0,
+        calibrate_predictions=True,
+        calibration_method="isotonic",
+    )
 
 
 def _default_regressor(random_state: int) -> BaseEstimator:
-    return ModernTabularEnsembleRegressor(random_state=random_state)
+    return ModernTabularEnsembleRegressor(
+        random_state=random_state,
+        use_quantile=False,
+        huber_delta=5.0,  # Increased from 1.0 to match data scale (std~29)
+    )
+
+
+def _salt_mass_regressor(random_state: int) -> BaseEstimator:
+    """Special regressor for salt_mass with extreme right-skew distribution."""
+    return ModernTabularEnsembleRegressor(
+        random_state=random_state,
+        use_quantile=True,  # Predict median instead of mean
+        quantile_alpha=0.5,  # Median is more robust for skewed data
+    )
 
 
 def default_stage_configs() -> List[StageConfig]:
@@ -80,13 +99,16 @@ def default_stage_configs() -> List[StageConfig]:
 
     adsorption_features = list(ADSORPTION_FEATURES)
     ligand_features = sorted(set(adsorption_features + list(METAL_DESCRIPTOR_FEATURES) + ['Металл']))
-    solvent_features = sorted(set(ligand_features + list(LIGAND_DESCRIPTOR_FEATURES) + ['Лиганд']))
+    # Removed solvent_features - now using ligand_features directly with solvent descriptors
     process_context = list(PROCESS_CONTEXT_FEATURES)
 
+    # Salt features: ligand + ligand descriptors + solvent descriptors + engineered features
     salt_features = sorted(set(
-        solvent_features + list(SOLVENT_DESCRIPTOR_FEATURES) + process_context + ['Растворитель']
+        ligand_features + list(LIGAND_DESCRIPTOR_FEATURES) + 
+        list(SOLVENT_DESCRIPTOR_FEATURES) + process_context + 
+        ['Лиганд', 'Metal_Ligand_Combo', 'Log_Metal_MW', 'Is_Cu', 'Is_Zn']
     ))
-    acid_features = sorted(set(salt_features + ['m (соли), г', 'n_соли']))
+    acid_features = sorted(set(salt_features + ['m (соли), г', 'n_соли', 'log_salt_mass']))
     volume_predictors = sorted(set(acid_features + ['m(кис-ты), г', 'n_кислоты', 'n_ratio']))
     tsyn_predictors = sorted(set(volume_predictors + ['Vсин. (р-ля), мл', 'Vsyn_m']))
     dry_predictors = sorted(set(tsyn_predictors + ['Tsyn_Category']))
@@ -110,24 +132,17 @@ def default_stage_configs() -> List[StageConfig]:
             depends_on=("Металл",),
             description="Predict ligand conditioned on adsorption profile and metal.",
         ),
-        StageConfig(
-            name="solvent",
-            target="Растворитель",
-            problem_type="classification",
-            feature_columns=solvent_features,
-            estimator_factory=_default_classifier,
-            depends_on=("Металл", "Лиганд"),
-            description="Predict solvent system given structural choices and adsorption metrics.",
-        ),
+        # Solvent stage removed: dataset filtered to DMFA only (340/380 samples)
+        # Solvent is now set as constant "ДМФА" in _ensure_process_defaults()
         StageConfig(
             name="salt_mass",
-            target="m (соли), г",
+            target="log_salt_mass",  # Log-transformed target for better linearity
             problem_type="regression",
             feature_columns=salt_features,
-            estimator_factory=_default_regressor,
-            depends_on=("Металл", "Лиганд", "Растворитель"),
-            outlier_contamination=0.05,
-            description="Estimate required salt mass for synthesis stage.",
+            estimator_factory=_default_regressor,  # Back to Huber - log-space is linear-friendly
+            depends_on=("Металл", "Лиганд"),
+            outlier_contamination=0.02,  # Reduced from 0.05 - keep more data
+            description="Estimate required salt mass (log-transformed) for synthesis stage.",
         ),
         StageConfig(
             name="acid_mass",
@@ -135,7 +150,7 @@ def default_stage_configs() -> List[StageConfig]:
             problem_type="regression",
             feature_columns=acid_features,
             estimator_factory=_default_regressor,
-            depends_on=("Металл", "Лиганд", "Растворитель", "m (соли), г"),
+            depends_on=("Металл", "Лиганд", "m (соли), г", "log_salt_mass"),
             outlier_contamination=0.05,
             description="Estimate ligand acid mass conditioned on salt mass.",
         ),
@@ -148,7 +163,6 @@ def default_stage_configs() -> List[StageConfig]:
             depends_on=(
                 "Металл",
                 "Лиганд",
-                "Растворитель",
                 "m (соли), г",
                 "m(кис-ты), г",
             ),
@@ -164,7 +178,6 @@ def default_stage_configs() -> List[StageConfig]:
             depends_on=(
                 "Металл",
                 "Лиганд",
-                "Растворитель",
                 "m (соли), г",
                 "m(кис-ты), г",
                 "Vсин. (р-ля), мл",
@@ -180,7 +193,6 @@ def default_stage_configs() -> List[StageConfig]:
             depends_on=(
                 "Металл",
                 "Лиганд",
-                "Растворитель",
                 "m (соли), г",
                 "m(кис-ты), г",
                 "Vсин. (р-ля), мл",
@@ -197,7 +209,6 @@ def default_stage_configs() -> List[StageConfig]:
             depends_on=(
                 "Металл",
                 "Лиганд",
-                "Растворитель",
                 "m (соли), г",
                 "m(кис-ты), г",
                 "Vсин. (р-ля), мл",
@@ -235,6 +246,7 @@ class InverseDesignPipeline:
         _ensure_process_defaults(data)
         _augment_with_lookup_descriptors(data, lookup_tables)
         _update_stoichiometry_features(data)
+        add_salt_mass_features(data)  # Add engineered features for salt_mass
 
         rng_seed = self.random_state
         self.stage_results.clear()
@@ -256,7 +268,12 @@ class InverseDesignPipeline:
                 feature_columns=list(stage.feature_columns),
             )
 
-            data[stage.target] = stage_data[stage.target]
+            # Store predictions, inverse-transform log_salt_mass if needed
+            if stage.target == "log_salt_mass":
+                data["m (соли), г"] = np.expm1(stage_data[stage.target])  # Transform back to original
+                data[stage.target] = stage_data[stage.target]  # Keep log version too
+            else:
+                data[stage.target] = stage_data[stage.target]
 
         self._trained = True
 
@@ -275,6 +292,7 @@ class InverseDesignPipeline:
 
         results = inputs.copy()
         _ensure_process_defaults(results)
+        add_salt_mass_features(results)  # Add engineered features
 
         for stage in self.stage_configs:
             _augment_with_lookup_descriptors(results, self.lookup_tables)
@@ -289,10 +307,17 @@ class InverseDesignPipeline:
 
             stage_result = self.stage_results[stage.name]
             predictions = stage_result.pipeline.predict(results[features])
-            results[stage.target] = predictions
+            
+            # Inverse-transform log_salt_mass predictions
+            if stage.target == "log_salt_mass":
+                results["m (соли), г"] = np.expm1(predictions)  # Transform back
+                results[stage.target] = predictions  # Keep log version
+            else:
+                results[stage.target] = predictions
 
         if not return_intermediate:
-            targets = [stage.target for stage in self.stage_configs]
+            targets = [stage.target if stage.target != "log_salt_mass" else "m (соли), г" 
+                      for stage in self.stage_configs]
             return results[targets]
         return results
 
@@ -524,6 +549,11 @@ def _ensure_process_defaults(df: pd.DataFrame) -> None:
         if feature not in df.columns:
             df[feature] = 1.0
         df[feature] = df[feature].fillna(1.0)
+    
+    # Set solvent to ДМФА (constant after dataset filtering)
+    if 'Растворитель' not in df.columns:
+        df['Растворитель'] = 'ДМФА'
+    df['Растворитель'] = df['Растворитель'].fillna('ДМФА')
 
 
 def _update_stoichiometry_features(df: pd.DataFrame) -> None:
