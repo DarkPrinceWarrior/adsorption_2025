@@ -7,6 +7,12 @@ CV_FOLDS_CLASSIFICATION: int = 5
 CV_FOLDS_REGRESSION: int = 5
 OUTLIER_CONTAMINATION: float = 0.05
 
+# Physics-informed loss constants
+R_GAS_J_MOL_K: float = 8.314  # Gas constant in J/(mol·K)
+E0_BOUNDS_KJ_MOL: tuple[float, float] = (10.0, 50.0)  # Bounds for E0 in kJ/mol (physisorption range)
+ADSORPTION_ENERGY_RATIO_BOUNDS: tuple[float, float] = (0.2, 1.0)  # Bounds for E/E0 ratio
+THERMODYNAMIC_TOLERANCE: float = 0.15  # 15% tolerance for K_eq vs theoretical
+
 ADSORPTION_FEATURES = [
     'W0, см3/г',
     'E0, кДж/моль',

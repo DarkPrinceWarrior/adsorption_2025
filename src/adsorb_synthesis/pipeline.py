@@ -38,6 +38,7 @@ from .modern_models import (
     ModernTabularEnsembleClassifier,
     ModernTabularEnsembleRegressor,
 )
+from .physics_losses import combined_physics_loss
 
 ProblemType = Literal["classification", "regression"]
 
@@ -67,7 +68,18 @@ class StageResult:
     feature_columns: List[str]
 
 
-def _default_classifier(random_state: int) -> BaseEstimator:
+def _default_classifier(random_state: int, enable_physics: bool = False) -> BaseEstimator:
+    """Factory for classification models with optional physics-informed loss."""
+    if enable_physics:
+        return ModernTabularEnsembleClassifier(
+            random_state=random_state,
+            use_smote=True,
+            focal_gamma=2.0,
+            calibrate_predictions=True,
+            calibration_method="isotonic",
+            physics_loss_fn=combined_physics_loss,
+            physics_loss_weight=0.1,  # Initial weight: w_thermo=0.05, w_energy=0.02 inside combined_physics_loss
+        )
     return ModernTabularEnsembleClassifier(
         random_state=random_state,
         use_smote=True,
@@ -120,17 +132,17 @@ def default_stage_configs() -> List[StageConfig]:
             target="Металл",
             problem_type="classification",
             feature_columns=adsorption_features,
-            estimator_factory=_default_classifier,
-            description="Predict metal identity from adsorption performance.",
+            estimator_factory=lambda rs: _default_classifier(rs, enable_physics=True),
+            description="Predict metal identity from adsorption performance with physics constraints.",
         ),
         StageConfig(
             name="ligand",
             target="Лиганд",
             problem_type="classification",
             feature_columns=ligand_features,
-            estimator_factory=_default_classifier,
+            estimator_factory=lambda rs: _default_classifier(rs, enable_physics=True),
             depends_on=("Металл",),
-            description="Predict ligand conditioned on adsorption profile and metal.",
+            description="Predict ligand conditioned on adsorption profile and metal with physics constraints.",
         ),
         # Solvent stage removed: dataset filtered to DMFA only (340/380 samples)
         # Solvent is now set as constant "ДМФА" in _ensure_process_defaults()
@@ -257,6 +269,11 @@ class InverseDesignPipeline:
                 raise ValueError(f"Stage '{stage.name}' has no data after preprocessing")
 
             model = stage.estimator_factory(rng_seed)
+            
+            # Pass feature names to physics-informed models
+            if hasattr(model, 'feature_names') and model.feature_names is None:
+                model.feature_names = list(stage.feature_columns)
+            
             pipeline = self._build_pipeline(stage_data, stage.feature_columns, model)
             metrics, cv_mean, cv_std = self._train_and_evaluate(stage, pipeline, stage_data)
 

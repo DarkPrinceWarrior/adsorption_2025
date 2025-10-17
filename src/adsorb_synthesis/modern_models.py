@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import warnings
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
@@ -192,6 +192,9 @@ class _ModernTabularEnsemble(BaseEstimator):
         use_smote: bool = True,
         focal_gamma: float = 2.0,
         random_state: int = 42,
+        physics_loss_fn: Optional[Callable] = None,
+        physics_loss_weight: float = 0.0,
+        feature_names: Optional[List[str]] = None,
     ) -> None:
         if not 0.0 < validation_fraction < 1.0:
             raise ValueError("validation_fraction must be between 0 and 1.")
@@ -206,6 +209,9 @@ class _ModernTabularEnsemble(BaseEstimator):
         self.use_smote = use_smote
         self.focal_gamma = focal_gamma
         self.random_state = random_state
+        self.physics_loss_fn = physics_loss_fn
+        self.physics_loss_weight = physics_loss_weight
+        self.feature_names = feature_names
 
     def _make_tabnet(self):
         TabNet = _import_tabnet(self.problem_type)
@@ -242,6 +248,52 @@ class _ModernTabularEnsemble(BaseEstimator):
             batch_size=batch_size,
             virtual_batch_size=virtual_batch_size,
         )
+
+    def _compute_physics_sample_weights(self, X: np.ndarray, base_weights: np.ndarray) -> np.ndarray:
+        """Compute sample weights incorporating physics violations."""
+        if self.physics_loss_fn is None or self.physics_loss_weight <= 0:
+            return base_weights
+        
+        if self.feature_names is None:
+            warnings.warn(
+                "feature_names not provided; physics loss cannot be computed. Using base weights.",
+                RuntimeWarning,
+            )
+            return base_weights
+        
+        try:
+            # Compute per-sample physics loss
+            # Note: physics_loss_fn should return per-sample losses, not mean
+            physics_violations = []
+            for i in range(X.shape[0]):
+                sample = X[i:i+1, :]
+                loss = self.physics_loss_fn(sample, self.feature_names)
+                physics_violations.append(loss)
+            
+            physics_violations = np.array(physics_violations)
+            
+            # Scale violations to [0, 1] range
+            if physics_violations.max() > 0:
+                physics_violations = physics_violations / (physics_violations.max() + 1e-6)
+            
+            # Increase weight for samples with high physics violations
+            # Interpretation: train more on "physically wrong" samples to correct them
+            physics_weights = 1.0 + self.physics_loss_weight * physics_violations
+            
+            # Combine with base weights
+            combined_weights = base_weights * physics_weights
+            
+            # Normalize to preserve total weight
+            combined_weights = combined_weights * (base_weights.sum() / combined_weights.sum())
+            
+            return combined_weights
+            
+        except Exception as exc:
+            warnings.warn(
+                f"Physics loss computation failed: {exc}. Using base weights.",
+                RuntimeWarning,
+            )
+            return base_weights
 
     def _normalise_proba(self, proba: np.ndarray, n_classes: int) -> np.ndarray:
         arr = np.asarray(proba, dtype=np.float64)
@@ -380,6 +432,9 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         use_smote: bool = True,
         focal_gamma: float = 2.0,
         random_state: int = 42,
+        physics_loss_fn: Optional[Callable] = None,
+        physics_loss_weight: float = 0.0,
+        feature_names: Optional[List[str]] = None,
     ) -> None:
         super().__init__(
             problem_type="classification",
@@ -393,6 +448,9 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
             use_smote=use_smote,
             focal_gamma=focal_gamma,
             random_state=random_state,
+            physics_loss_fn=physics_loss_fn,
+            physics_loss_weight=physics_loss_weight,
+            feature_names=feature_names,
         )
         self.calibrate_predictions = calibrate_predictions
         self.calibration_method = calibration_method
@@ -587,6 +645,9 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         quantile_alpha: float = 0.5,
         huber_delta: float = 1.0,
         random_state: int = 42,
+        physics_loss_fn: Optional[Callable] = None,
+        physics_loss_weight: float = 0.0,
+        feature_names: Optional[List[str]] = None,
     ) -> None:
         super().__init__(
             problem_type="regression",
@@ -599,6 +660,9 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
             weight_opt_params=weight_opt_params,
             use_smote=False,  # Not applicable for regression
             random_state=random_state,
+            physics_loss_fn=physics_loss_fn,
+            physics_loss_weight=physics_loss_weight,
+            feature_names=feature_names,
         )
         self.use_quantile = use_quantile
         self.quantile_alpha = quantile_alpha
