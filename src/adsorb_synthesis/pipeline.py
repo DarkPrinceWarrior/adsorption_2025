@@ -29,9 +29,11 @@ from .constants import (
     ADSORPTION_FEATURES,
     LIGAND_DESCRIPTOR_FEATURES,
     METAL_DESCRIPTOR_FEATURES,
+    N_RATIO_BOUNDS,
     PROCESS_CONTEXT_FEATURES,
     RANDOM_SEED,
     SOLVENT_DESCRIPTOR_FEATURES,
+    TEMPERATURE_CATEGORIES,
     TEST_SIZE,
 )
 from .data_processing import (
@@ -392,6 +394,8 @@ class InverseDesignPipeline:
                 residual_column="K_equilibrium_residual",
             )
             add_thermodynamic_features(results)
+            _project_stoichiometry(results)
+            _enforce_temperature_order(results)
 
         if not return_intermediate:
             targets = [stage.target if stage.target != "log_salt_mass" else "m (соли), г"
@@ -765,7 +769,90 @@ def _update_stoichiometry_features(df: pd.DataFrame) -> None:
     if {'n_соли', 'n_кислоты'}.issubset(df.columns):
         denom = df['n_кислоты'].replace(0, np.nan)
         df['n_ratio'] = df['n_соли'] / denom
+        lower, upper = N_RATIO_BOUNDS
+        ratio = df['n_ratio']
+        clipped = ratio.clip(lower, upper)
+        df['n_ratio_residual'] = ratio - clipped
 
     if {'Vсин. (р-ля), мл', 'm (соли), г'}.issubset(df.columns):
         denom = df['m (соли), г'].replace(0, np.nan)
         df['Vsyn_m'] = df['Vсин. (р-ля), мл'] / denom
+
+
+def _project_stoichiometry(df: pd.DataFrame) -> None:
+    """Adjust acid mass to keep molar ratio within physical bounds."""
+
+    required = {
+        'm (соли), г',
+        'Молярка_соли',
+        'm(кис-ты), г',
+        'Молярка_кислоты',
+        'n_соли',
+        'n_кислоты',
+        'n_ratio',
+    }
+    if not required.issubset(df.columns):
+        return
+
+    lower, upper = N_RATIO_BOUNDS
+    ratio = pd.to_numeric(df['n_ratio'], errors='coerce')
+    n_salt = pd.to_numeric(df['n_соли'], errors='coerce')
+    molar_acid = pd.to_numeric(df['Молярка_кислоты'], errors='coerce')
+
+    target_ratio = ratio.clip(lower, upper)
+    adjust_mask = (
+        np.isfinite(target_ratio)
+        & np.isfinite(n_salt)
+        & np.isfinite(molar_acid)
+        & (molar_acid > 0)
+        & (np.abs(target_ratio - ratio) > 1e-6)
+    )
+    if not adjust_mask.any():
+        return
+
+    target_n_acid = n_salt[adjust_mask] / target_ratio[adjust_mask]
+    new_acid_mass = target_n_acid * molar_acid[adjust_mask]
+    df.loc[adjust_mask, 'm(кис-ты), г'] = new_acid_mass
+
+    # Refresh stoichiometric helpers after adjustment
+    _update_stoichiometry_features(df)
+
+
+def _enforce_temperature_order(df: pd.DataFrame) -> None:
+    """Ensure drying and regeneration categories are not below synthesis category."""
+
+    sequence = ['Tsyn_Category', 'Tdry_Category', 'Treg_Category']
+    order_maps = {
+        name: {label: idx for idx, label in enumerate(TEMPERATURE_CATEGORIES[name]['labels'])}
+        for name in sequence
+        if name in TEMPERATURE_CATEGORIES
+    }
+    inverse_maps = {
+        name: {idx: label for idx, label in enumerate(TEMPERATURE_CATEGORIES[name]['labels'])}
+        for name in sequence
+        if name in TEMPERATURE_CATEGORIES
+    }
+
+    prev_numeric: Optional[np.ndarray] = None
+    for name in sequence:
+        if name not in df.columns or name not in order_maps:
+            prev_numeric = None
+            continue
+
+        mapping = order_maps[name]
+        inverse = inverse_maps[name]
+        arr = df[name].map(mapping).to_numpy(dtype=float, copy=True)
+        max_index = len(mapping) - 1
+
+        valid = np.isfinite(arr)
+        arr[valid] = np.clip(arr[valid], 0, max_index)
+
+        if prev_numeric is not None:
+            valid_both = valid & np.isfinite(prev_numeric)
+            arr[valid_both] = np.maximum(arr[valid_both], prev_numeric[valid_both])
+
+        # Update column with corrected category labels
+        updated = pd.Series(arr, index=df.index)
+        df[name] = updated.map(inverse).where(~updated.isna(), np.nan)
+
+        prev_numeric = arr

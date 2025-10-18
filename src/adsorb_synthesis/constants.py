@@ -84,3 +84,5 @@ TEMPERATURE_CATEGORIES = {
         'labels': ['Низкая (<155°C)', 'Средняя (155-265°C)', 'Высокая (>265°C)'],
     },
 }
+
+N_RATIO_BOUNDS: tuple[float, float] = (0.45, 2.3)

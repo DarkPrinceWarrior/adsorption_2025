@@ -82,7 +82,7 @@ def evaluate_trial(
     configs: Sequence[StageConfig],
     df,
     lookups,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, float]:
     pipeline = InverseDesignPipeline(stage_configs=configs)
     pipeline.fit(df, lookup_tables=lookups)
 
@@ -98,7 +98,12 @@ def evaluate_trial(
     else:
         residual_mae = float("nan")
 
-    return balanced_accuracy, physics_penalty, residual_mae
+    if "n_ratio_residual" in preds:
+        ratio_mae = float(preds["n_ratio_residual"].abs().mean())
+    else:
+        ratio_mae = float("nan")
+
+    return balanced_accuracy, physics_penalty, residual_mae, ratio_mae
 
 
 def main() -> None:
@@ -119,12 +124,13 @@ def main() -> None:
         configs = build_stage_configs(base_stage_configs, physics_weight, w_thermo, w_energy)
 
         try:
-            bal_acc, penalty, residual_mae = evaluate_trial(configs, df, lookups)
+            bal_acc, penalty, residual_mae, ratio_mae = evaluate_trial(configs, df, lookups)
         except Exception as exc:  # pragma: no cover - diagnostic output for failed trials
             trial.set_user_attr("exception", str(exc))
             raise
 
         trial.set_user_attr("residual_mae", residual_mae)
+        trial.set_user_attr("ratio_residual_mae", ratio_mae)
         return bal_acc, penalty
 
     study_kwargs = dict(directions=["maximize", "minimize"], study_name=args.study_name)
@@ -147,7 +153,8 @@ def main() -> None:
         print(
             f"Trial {t.number}: bal_acc={t.values[0]:.3f}, physics_penalty={t.values[1]:.4f}, "
             f"physics_weight={t.params['physics_weight']:.3f}, w_thermo={t.params['w_thermo']:.3f}, "
-            f"w_energy={t.params['w_energy']:.3f}, residual_mae={t.user_attrs.get('residual_mae'):.4f}"
+            f"w_energy={t.params['w_energy']:.3f}, "
+            f"ΔG_res_mae={t.user_attrs.get('residual_mae'):.4f}, ratio_res_mae={t.user_attrs.get('ratio_residual_mae'):.4f}"
         )
 
 
