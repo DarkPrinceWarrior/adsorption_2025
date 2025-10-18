@@ -142,8 +142,6 @@ def _default_catboost_params(problem_type: str, random_state: int) -> Dict:
     )
     if problem_type == "classification":
         base.setdefault("loss_function", "Logloss")
-        # Auto class weights for all classification tasks
-        base.setdefault("auto_class_weights", "Balanced")
     else:
         # Use MAE for robustness to outliers
         base.setdefault("loss_function", "MAE")
@@ -311,10 +309,24 @@ class _ModernTabularEnsemble(BaseEstimator):
             row_sums = arr.sum(axis=1, keepdims=True)
         return arr / row_sums
 
-    def _optimize_weights(self, predictions: np.ndarray, y_val: np.ndarray) -> np.ndarray:
+    def _optimize_weights(
+        self,
+        predictions: np.ndarray,
+        y_val: np.ndarray,
+        sample_weight: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         n_models = predictions.shape[0]
         if n_models == 1 or not self.optimize_weights:
             return np.ones(n_models, dtype=np.float64) / n_models
+
+        if sample_weight is not None:
+            sample_weight = np.asarray(sample_weight, dtype=np.float64)
+            if sample_weight.ndim != 1 or sample_weight.shape[0] != y_val.shape[0]:
+                raise ValueError("sample_weight must be 1D and match validation targets.")
+            sw = sample_weight.copy()
+            sw = sw / sw.sum() if sw.sum() > 0 else None
+        else:
+            sw = None
 
         try:
             from scipy.optimize import minimize
@@ -327,7 +339,7 @@ class _ModernTabularEnsemble(BaseEstimator):
 
         if self.problem_type == "classification":
             n_classes = predictions.shape[-1]
-            
+
             def objective(weights: np.ndarray) -> float:
                 weights = np.clip(weights, 0.0, None)
                 total = weights.sum()
@@ -336,16 +348,23 @@ class _ModernTabularEnsemble(BaseEstimator):
                 w_norm = weights / total
                 ensemble = np.tensordot(w_norm, predictions, axes=(0, 0))
                 ensemble = np.clip(ensemble, 1e-6, 1 - 1e-6)
-                
+
                 # Use Brier score for better calibration
                 if n_classes == 2:
                     # Binary case: use brier_score_loss
-                    brier = float(brier_score_loss(y_val, ensemble[:, 1]))
+                    if sw is not None:
+                        brier = float(brier_score_loss(y_val, ensemble[:, 1], sample_weight=sw))
+                    else:
+                        brier = float(brier_score_loss(y_val, ensemble[:, 1]))
                 else:
                     # Multi-class: average Brier score across all classes
                     y_one_hot = np.eye(n_classes)[y_val.astype(int)]
-                    brier = float(np.mean((ensemble - y_one_hot) ** 2))
-                
+                    diff = (ensemble - y_one_hot) ** 2
+                    if sw is not None:
+                        brier = float(np.average(np.sum(diff, axis=1), weights=sw))
+                    else:
+                        brier = float(np.mean(np.sum(diff, axis=1)))
+
                 # Add L2 regularization to prevent extreme weights
                 reg = l2_penalty * float(np.sum((w_norm - initial) ** 2))
                 return brier + reg
@@ -357,9 +376,12 @@ class _ModernTabularEnsemble(BaseEstimator):
                     return np.inf
                 w_norm = weights / total
                 ensemble = np.tensordot(w_norm, predictions, axes=(0, 0))
-                
+
                 # Use MAE instead of MSE for robustness
-                mae = float(mean_absolute_error(y_val, ensemble))
+                if sw is not None:
+                    mae = float(mean_absolute_error(y_val, ensemble, sample_weight=sw))
+                else:
+                    mae = float(mean_absolute_error(y_val, ensemble))
                 # Add L2 regularization
                 reg = l2_penalty * float(np.sum((w_norm - initial) ** 2))
                 return mae + reg
@@ -455,7 +477,7 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         self.calibrate_predictions = calibrate_predictions
         self.calibration_method = calibration_method
 
-    def fit(self, X, y):
+    def fit(self, X, y, sample_weight=None):
         X_arr, y_arr = check_X_y(X, y, accept_sparse=False, ensure_min_samples=2)
         X_arr = np.asarray(X_arr, dtype=np.float32)
         self._label_encoder = LabelEncoder()
@@ -463,19 +485,37 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         self.classes_ = self._label_encoder.classes_
         self.n_classes_ = len(self.classes_)
 
+        if sample_weight is not None:
+            sample_weight = np.asarray(sample_weight, dtype=np.float32).ravel()
+            if sample_weight.shape[0] != X_arr.shape[0]:
+                raise ValueError("sample_weight must match number of samples.")
+        else:
+            sample_weight = None
+
         counts = np.bincount(y_encoded)
         stratify = y_encoded if self.n_classes_ > 1 and np.all(counts >= 2) else None
 
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_arr,
-            y_encoded,
-            test_size=self.validation_fraction,
-            random_state=self.random_state,
-            stratify=stratify,
-        )
+        if sample_weight is not None:
+            X_train, X_val, y_train, y_val, sw_train, sw_val = train_test_split(
+                X_arr,
+                y_encoded,
+                sample_weight,
+                test_size=self.validation_fraction,
+                random_state=self.random_state,
+                stratify=stratify,
+            )
+        else:
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_arr,
+                y_encoded,
+                test_size=self.validation_fraction,
+                random_state=self.random_state,
+                stratify=stratify,
+            )
+            sw_train = sw_val = None
 
         # Apply SMOTE/ADASYN to training data if enabled
-        if self.use_smote and self.n_classes_ > 1:
+        if self.use_smote and self.n_classes_ > 1 and sw_train is None:
             print(f"  [INFO] Applying SMOTE/ADASYN for class balancing (n_classes={self.n_classes_})")
             X_train_orig_shape = X_train.shape
             X_train, y_train = _apply_smote_if_available(X_train, y_train, self.random_state)
@@ -483,7 +523,9 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
                 print(f"  [INFO] SMOTE applied: {X_train_orig_shape[0]} → {X_train.shape[0]} samples")
             else:
                 print(f"  [INFO] SMOTE not applied (balanced or insufficient samples)")
-        
+        elif sw_train is not None and self.use_smote:
+            print("  [INFO] Skipping SMOTE due to provided sample weights.")
+
         # Compute focal class weights
         focal_weights = _compute_focal_class_weights(y_train, gamma=self.focal_gamma)
         print(f"  [INFO] Focal weights computed (gamma={self.focal_gamma}): {focal_weights}")
@@ -493,32 +535,37 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         val_predictions: List[np.ndarray] = []
 
         # TabNet
-        try:
-            tabnet = self._make_tabnet()
-            fit_kwargs = self._tabnet_fit_kwargs(X_train.shape[0])
-            tabnet.fit(
-                X_train,
-                y_train,
-                eval_set=[(X_val, y_val)],
-                **fit_kwargs,
-            )
-            models.append(tabnet)
-            names.append("tabnet")
-            val_predictions.append(self._normalise_proba(tabnet.predict_proba(X_val), self.n_classes_))
-        except Exception as exc:  # pragma: no cover - defensive
-            warnings.warn(f"TabNet training failed and will be skipped: {exc}", RuntimeWarning)
+        if sw_train is None:
+            try:
+                tabnet = self._make_tabnet()
+                fit_kwargs = self._tabnet_fit_kwargs(X_train.shape[0])
+                tabnet.fit(
+                    X_train,
+                    y_train,
+                    eval_set=[(X_val, y_val)],
+                    **fit_kwargs,
+                )
+                models.append(tabnet)
+                names.append("tabnet")
+                val_predictions.append(self._normalise_proba(tabnet.predict_proba(X_val), self.n_classes_))
+            except Exception as exc:  # pragma: no cover - defensive
+                warnings.warn(f"TabNet training failed and will be skipped: {exc}", RuntimeWarning)
+        else:
+            print("  [INFO] Skipping TabNet base learner (sample weights unsupported).")
 
         # CatBoost
         try:
             cat_model = self._make_catboost()
             if self.n_classes_ > 2:
                 cat_model.set_params(
+                    auto_class_weights=None,
                     loss_function="MultiClass",
                     eval_metric="TotalF1",
                     class_weights=list(focal_weights.values()),
                 )
             else:
                 cat_model.set_params(
+                    auto_class_weights=None,
                     loss_function="Logloss",
                     eval_metric="Logloss",
                     class_weights=list(focal_weights.values()),
@@ -529,6 +576,7 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
                 eval_set=(X_val, y_val),
                 early_stopping_rounds=100,
                 verbose=False,
+                sample_weight=sw_train,
             )
             models.append(cat_model)
             names.append("catboost")
@@ -540,7 +588,15 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         try:
             xgb_model = self._make_xgboost()
             # Compute sample weights from focal weights
-            sample_weights = np.array([focal_weights[int(label)] for label in y_train])
+            sample_weights = np.array([focal_weights[int(label)] for label in y_train], dtype=np.float32)
+            if sw_train is not None:
+                sample_weights = sample_weights * sw_train
+            eval_sample_weights = None
+            if sw_val is not None:
+                eval_sample_weights = np.array(
+                    [focal_weights[int(label)] for label in y_val],
+                    dtype=np.float32,
+                ) * sw_val
             
             if self.n_classes_ > 2:
                 xgb_model.set_params(
@@ -562,6 +618,7 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
                 sample_weight=sample_weights,
                 eval_set=[(X_val, y_val)],
                 verbose=False,
+                sample_weight_eval_set=[eval_sample_weights] if eval_sample_weights is not None else None,
             )
             models.append(xgb_model)
             names.append("xgboost")
@@ -576,7 +633,7 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         if self.calibrate_predictions:
             calibrated_models: List = []
             calibrated_predictions: List[np.ndarray] = []
-            
+
             for model, name in zip(models, names):
                 try:
                     # Create a calibrated version of the model
@@ -587,7 +644,10 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
                         ensemble=False,
                     )
                     # Use validation set for calibration
-                    cal_model.fit(X_val, y_val)
+                    if sw_val is not None:
+                        cal_model.fit(X_val, y_val, sample_weight=sw_val)
+                    else:
+                        cal_model.fit(X_val, y_val)
                     calibrated_models.append(cal_model)
                     calibrated_predictions.append(
                         self._normalise_proba(cal_model.predict_proba(X_val), self.n_classes_)
@@ -604,10 +664,10 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
             val_predictions = calibrated_predictions
         else:
             self.models_ = models
-        
+
         self.model_names_ = names
         val_stack = np.stack(val_predictions, axis=0)
-        self.weights_ = self._optimize_weights(val_stack, y_val)
+        self.weights_ = self._optimize_weights(val_stack, y_val, sample_weight=sw_val)
         return self
 
     def predict_proba(self, X):
@@ -668,37 +728,53 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         self.quantile_alpha = quantile_alpha
         self.huber_delta = huber_delta
 
-    def fit(self, X, y):
+    def fit(self, X, y, sample_weight=None):
         X_arr, y_arr = check_X_y(X, y, accept_sparse=False, y_numeric=True)
         X_arr = np.asarray(X_arr, dtype=np.float32)
         y_arr = np.asarray(y_arr, dtype=np.float32)
 
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_arr,
-            y_arr,
-            test_size=self.validation_fraction,
-            random_state=self.random_state,
-        )
+        if sample_weight is not None:
+            sample_weight = np.asarray(sample_weight, dtype=np.float32).ravel()
+            if sample_weight.shape[0] != X_arr.shape[0]:
+                raise ValueError("sample_weight must match number of samples.")
+            X_train, X_val, y_train, y_val, sw_train, sw_val = train_test_split(
+                X_arr,
+                y_arr,
+                sample_weight,
+                test_size=self.validation_fraction,
+                random_state=self.random_state,
+            )
+        else:
+            X_train, X_val, y_train, y_val = train_test_split(
+                X_arr,
+                y_arr,
+                test_size=self.validation_fraction,
+                random_state=self.random_state,
+            )
+            sw_train = sw_val = None
 
         models: List = []
         names: List[str] = []
         val_predictions: List[np.ndarray] = []
 
         # TabNet
-        try:
-            tabnet = self._make_tabnet()
-            fit_kwargs = self._tabnet_fit_kwargs(X_train.shape[0])
-            tabnet.fit(
-                X_train,
-                y_train.reshape(-1, 1),
-                eval_set=[(X_val, y_val.reshape(-1, 1))],
-                **fit_kwargs,
-            )
-            models.append(tabnet)
-            names.append("tabnet")
-            val_predictions.append(np.asarray(tabnet.predict(X_val), dtype=np.float64).ravel())
-        except Exception as exc:  # pragma: no cover - defensive
-            warnings.warn(f"TabNet training failed and will be skipped: {exc}", RuntimeWarning)
+        if sw_train is None:
+            try:
+                tabnet = self._make_tabnet()
+                fit_kwargs = self._tabnet_fit_kwargs(X_train.shape[0])
+                tabnet.fit(
+                    X_train,
+                    y_train.reshape(-1, 1),
+                    eval_set=[(X_val, y_val.reshape(-1, 1))],
+                    **fit_kwargs,
+                )
+                models.append(tabnet)
+                names.append("tabnet")
+                val_predictions.append(np.asarray(tabnet.predict(X_val), dtype=np.float64).ravel())
+            except Exception as exc:  # pragma: no cover - defensive
+                warnings.warn(f"TabNet training failed and will be skipped: {exc}", RuntimeWarning)
+        else:
+            print("  [INFO] Skipping TabNet base learner (sample weights unsupported).")
 
         # CatBoost
         try:
@@ -726,6 +802,7 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
                 eval_set=(X_val, y_val),
                 early_stopping_rounds=100,
                 verbose=False,
+                sample_weight=sw_train,
             )
             models.append(cat_model)
             names.append("catboost")
@@ -751,11 +828,14 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
                     huber_slope=self.huber_delta,
                     eval_metric="mae",
                 )
+            eval_sample_weights = [sw_val] if sw_val is not None else None
             xgb_model.fit(
                 X_train,
                 y_train,
                 eval_set=[(X_val, y_val)],
                 verbose=False,
+                sample_weight=sw_train,
+                sample_weight_eval_set=eval_sample_weights,
             )
             models.append(xgb_model)
             names.append("xgboost")
@@ -769,7 +849,7 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         self.models_ = models
         self.model_names_ = names
         val_stack = np.stack(val_predictions, axis=0)
-        self.weights_ = self._optimize_weights(val_stack, y_val)
+        self.weights_ = self._optimize_weights(val_stack, y_val, sample_weight=sw_val)
         return self
 
     def predict(self, X):

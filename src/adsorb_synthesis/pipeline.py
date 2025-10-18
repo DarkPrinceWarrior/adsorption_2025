@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator
+from sklearn.base import BaseEstimator, clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import IsolationForest
 from sklearn.impute import SimpleImputer
@@ -38,7 +39,12 @@ from .modern_models import (
     ModernTabularEnsembleClassifier,
     ModernTabularEnsembleRegressor,
 )
-from .physics_losses import combined_physics_loss
+from .physics_losses import (
+    DEFAULT_PHYSICS_EVALUATOR,
+    PhysicsConstraintEvaluator,
+    combined_physics_loss,
+    physics_violation_scores,
+)
 
 ProblemType = Literal["classification", "regression"]
 
@@ -55,6 +61,8 @@ class StageConfig:
     depends_on: Tuple[str, ...] = ()
     outlier_contamination: Optional[float] = None
     description: str = ""
+    physics_weight: float = 0.0
+    physics_evaluator: Optional[PhysicsConstraintEvaluator] = None
 
 
 @dataclass
@@ -68,16 +76,25 @@ class StageResult:
     feature_columns: List[str]
 
 
-def _default_classifier(random_state: int, enable_physics: bool = False) -> BaseEstimator:
+def _default_classifier(
+    random_state: int,
+    *,
+    enable_physics: bool = False,
+    physics_evaluator: Optional[PhysicsConstraintEvaluator] = None,
+) -> BaseEstimator:
     """Factory for classification models with optional physics-informed loss."""
     if enable_physics:
+        loss_fn = partial(
+            combined_physics_loss,
+            evaluator=physics_evaluator or DEFAULT_PHYSICS_EVALUATOR,
+        )
         return ModernTabularEnsembleClassifier(
             random_state=random_state,
             use_smote=True,
             focal_gamma=2.0,
             calibrate_predictions=True,
             calibration_method="isotonic",
-            physics_loss_fn=combined_physics_loss,
+            physics_loss_fn=loss_fn,
             physics_loss_weight=0.1,  # Initial weight: w_thermo=0.05, w_energy=0.02 inside combined_physics_loss
         )
     return ModernTabularEnsembleClassifier(
@@ -133,6 +150,8 @@ def default_stage_configs() -> List[StageConfig]:
             problem_type="classification",
             feature_columns=adsorption_features,
             estimator_factory=lambda rs: _default_classifier(rs, enable_physics=True),
+            physics_weight=0.1,
+            physics_evaluator=DEFAULT_PHYSICS_EVALUATOR,
             description="Predict metal identity from adsorption performance with physics constraints.",
         ),
         StageConfig(
@@ -142,6 +161,8 @@ def default_stage_configs() -> List[StageConfig]:
             feature_columns=ligand_features,
             estimator_factory=lambda rs: _default_classifier(rs, enable_physics=True),
             depends_on=("Металл",),
+            physics_weight=0.1,
+            physics_evaluator=DEFAULT_PHYSICS_EVALUATOR,
             description="Predict ligand conditioned on adsorption profile and metal with physics constraints.",
         ),
         # Solvent stage removed: dataset filtered to DMFA only (340/380 samples)
@@ -369,6 +390,7 @@ class InverseDesignPipeline:
                 'depends_on': stage.depends_on,
                 'outlier_contamination': stage.outlier_contamination,
                 'description': stage.description,
+                'physics_weight': stage.physics_weight,
             })
 
         if self.lookup_tables is not None:
@@ -391,7 +413,17 @@ class InverseDesignPipeline:
         stage_configs: List[StageConfig] = []
         for stage_meta in metadata.get('stages', []):
             problem_type = stage_meta['problem_type']
-            estimator_factory = _default_classifier if problem_type == 'classification' else _default_regressor
+            physics_weight = stage_meta.get('physics_weight', 0.0)
+            if problem_type == 'classification' and physics_weight > 0.0:
+                estimator_factory = lambda rs, evaluator=DEFAULT_PHYSICS_EVALUATOR: _default_classifier(
+                    rs,
+                    enable_physics=True,
+                    physics_evaluator=evaluator,
+                )
+                physics_evaluator = DEFAULT_PHYSICS_EVALUATOR
+            else:
+                estimator_factory = _default_classifier if problem_type == 'classification' else _default_regressor
+                physics_evaluator = DEFAULT_PHYSICS_EVALUATOR if problem_type == 'classification' and physics_weight > 0 else None
             stage_configs.append(StageConfig(
                 name=stage_meta['name'],
                 target=stage_meta['target'],
@@ -401,6 +433,8 @@ class InverseDesignPipeline:
                 depends_on=tuple(stage_meta.get('depends_on', ())),
                 outlier_contamination=stage_meta.get('outlier_contamination'),
                 description=stage_meta.get('description', ''),
+                physics_weight=physics_weight,
+                physics_evaluator=physics_evaluator,
             ))
 
         pipeline = cls(stage_configs=stage_configs, random_state=metadata.get('random_state', RANDOM_SEED))
@@ -487,6 +521,8 @@ class InverseDesignPipeline:
         target = stage.target
         X = data[features]
         y = data[target]
+        sample_weights: Optional[np.ndarray] = None
+        evaluator = stage.physics_evaluator or DEFAULT_PHYSICS_EVALUATOR
 
         if stage.problem_type == "classification":
             class_counts = y.value_counts()
@@ -496,15 +532,41 @@ class InverseDesignPipeline:
         else:
             stratify = None
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X,
-            y,
+        if stage.physics_weight > 0.0:
+            penalties = physics_violation_scores(X, evaluator=evaluator)
+            if penalties.size:
+                penalties = penalties - np.nanmin(penalties)
+                max_penalty = np.nanmax(penalties)
+                if max_penalty > 0:
+                    penalties = penalties / max_penalty
+                penalties = np.nan_to_num(penalties, nan=0.0, posinf=0.0, neginf=0.0)
+                sample_weights = 1.0 + stage.physics_weight * penalties
+                sample_weights = sample_weights.astype(np.float64, copy=False)
+                # Preserve overall weight mass for stability
+                sample_weights /= np.mean(sample_weights) if np.mean(sample_weights) > 0 else 1.0
+
+        split_arrays = [X, y]
+        if sample_weights is not None:
+            split_arrays.append(sample_weights)
+
+        split_result = train_test_split(
+            *split_arrays,
             test_size=TEST_SIZE,
             random_state=self.random_state,
             stratify=stratify,
         )
 
-        pipeline.fit(X_train, y_train)
+        if sample_weights is not None:
+            X_train, X_test, y_train, y_test, w_train, w_test = split_result
+        else:
+            X_train, X_test, y_train, y_test = split_result
+            w_train = w_test = None
+
+        fit_kwargs = {}
+        if w_train is not None:
+            fit_kwargs['model__sample_weight'] = w_train
+
+        pipeline.fit(X_train, y_train, **fit_kwargs)
         y_pred = pipeline.predict(X_test)
 
         metrics: Dict[str, float]
@@ -514,15 +576,13 @@ class InverseDesignPipeline:
                 'balanced_accuracy': balanced_accuracy_score(y_test, y_pred),
                 'f1_macro': f1_score(y_test, y_pred, average='macro'),
             }
-            class_counts = y.value_counts()
-            min_class = class_counts.min() if not class_counts.empty else 0
-            if min_class >= 2:
-                n_splits = min(5, int(min_class))
-                cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
-            else:
-                n_splits = max(2, min(5, len(y)))
-                cv = KFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
-            cv_scores = cross_val_score(pipeline, X, y, cv=cv, scoring='balanced_accuracy')
+            cv_scores = self._cross_validate_stage(
+                stage=stage,
+                base_pipeline=pipeline,
+                X=X,
+                y=y,
+                sample_weights=sample_weights,
+            )
         else:
             rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
             metrics = {
@@ -530,11 +590,75 @@ class InverseDesignPipeline:
                 'rmse': rmse,
                 'mae': mean_absolute_error(y_test, y_pred),
             }
-            n_splits = max(2, min(5, len(y)))
-            cv = KFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
-            cv_scores = cross_val_score(pipeline, X, y, cv=cv, scoring='neg_mean_absolute_error')
+            cv_scores = self._cross_validate_stage(
+                stage=stage,
+                base_pipeline=pipeline,
+                X=X,
+                y=y,
+                sample_weights=sample_weights,
+            )
 
         return metrics, float(np.mean(cv_scores)), float(np.std(cv_scores))
+
+    def _cross_validate_stage(
+        self,
+        *,
+        stage: StageConfig,
+        base_pipeline: Pipeline,
+        X: pd.DataFrame,
+        y: pd.Series,
+        sample_weights: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Manual cross-validation that respects sample weights."""
+        if stage.problem_type == "classification":
+            class_counts = y.value_counts()
+            min_class = class_counts.min() if not class_counts.empty else 0
+            if min_class >= 2:
+                n_splits = min(5, int(min_class))
+                splitter: Iterable = StratifiedKFold(
+                    n_splits=n_splits,
+                    shuffle=True,
+                    random_state=self.random_state,
+                )
+            else:
+                n_splits = max(2, min(5, len(y)))
+                splitter = KFold(
+                    n_splits=n_splits,
+                    shuffle=True,
+                    random_state=self.random_state,
+                )
+        else:
+            n_splits = max(2, min(5, len(y)))
+            splitter = KFold(
+                n_splits=n_splits,
+                shuffle=True,
+                random_state=self.random_state,
+            )
+
+        scores: List[float] = []
+        for train_idx, val_idx in splitter.split(X, y):
+            X_train = X.iloc[train_idx] if isinstance(X, pd.DataFrame) else X[train_idx]
+            y_train = y.iloc[train_idx] if isinstance(y, pd.Series) else y[train_idx]
+            X_val = X.iloc[val_idx] if isinstance(X, pd.DataFrame) else X[val_idx]
+            y_val = y.iloc[val_idx] if isinstance(y, pd.Series) else y[val_idx]
+
+            fit_kwargs = {}
+            if sample_weights is not None:
+                w_train = sample_weights[train_idx]
+                fit_kwargs['model__sample_weight'] = w_train
+
+            model = clone(base_pipeline)
+            model.fit(X_train, y_train, **fit_kwargs)
+            y_pred = model.predict(X_val)
+
+            if stage.problem_type == "classification":
+                score = balanced_accuracy_score(y_val, y_pred)
+            else:
+                mae = mean_absolute_error(y_val, y_pred)
+                score = -float(mae)
+            scores.append(float(score))
+
+        return np.asarray(scores, dtype=np.float64)
 
 
 def _augment_with_lookup_descriptors(df: pd.DataFrame, lookup: LookupTables) -> None:
