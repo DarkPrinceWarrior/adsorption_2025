@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -49,6 +49,8 @@ def load_dataset(csv_path: str, *, add_categories: bool = True, add_salt_feature
     
     if add_salt_features:
         add_salt_mass_features(df)
+    
+    add_thermodynamic_features(df)
 
     return df
 
@@ -72,6 +74,48 @@ def add_salt_mass_features(df: pd.DataFrame) -> None:
     # Log-transform salt mass target (handles extreme right-skew)
     if 'm (соли), г' in df.columns:
         df['log_salt_mass'] = np.log1p(df['m (соли), г'])  # log1p = log(1 + x)
+
+
+def add_thermodynamic_features(df: pd.DataFrame) -> None:
+    """Derive thermodynamic helper columns from measured K_eq and ΔG."""
+
+    temperature_col = 'Т.син., °С'
+    if temperature_col not in df.columns or 'K_equilibrium' not in df.columns:
+        return
+
+    temperature_c = pd.to_numeric(df[temperature_col], errors='coerce').to_numpy(dtype=np.float64)
+    temperature_k = temperature_c + 273.15
+    k_measured = pd.to_numeric(df['K_equilibrium'], errors='coerce').to_numpy(dtype=np.float64)
+
+    delta_g_from_k = np.full(len(df), np.nan, dtype=np.float64)
+    valid_k = np.isfinite(temperature_k) & np.isfinite(k_measured) & (k_measured > 0)
+    if np.any(valid_k):
+        delta_g_from_k[valid_k] = -(
+            R_GAS_CONSTANT * temperature_k[valid_k] * np.log(k_measured[valid_k])
+        ) / 1000.0
+    df['Delta_G_equilibrium'] = delta_g_from_k
+
+    if 'Delta_G' in df.columns:
+        delta_g = pd.to_numeric(df['Delta_G'], errors='coerce').to_numpy(dtype=np.float64)
+        k_from_delta = np.full(len(df), np.nan, dtype=np.float64)
+        valid_delta = np.isfinite(temperature_k) & np.isfinite(delta_g)
+        if np.any(valid_delta):
+            k_from_delta[valid_delta] = np.exp(
+                -(delta_g[valid_delta] * 1000.0) / (R_GAS_CONSTANT * temperature_k[valid_delta])
+            )
+        df['K_equilibrium_from_delta_G'] = k_from_delta
+
+        residual = np.full(len(df), np.nan, dtype=np.float64)
+        valid_both = valid_k & valid_delta
+        if np.any(valid_both):
+            residual[valid_both] = delta_g[valid_both] - delta_g_from_k[valid_both]
+        df['Delta_G_residual'] = residual
+        df['K_equilibrium_ratio'] = np.divide(
+            k_measured,
+            k_from_delta,
+            out=np.full(len(df), np.nan, dtype=np.float64),
+            where=np.isfinite(k_from_delta) & (k_from_delta != 0),
+        )
 
 
 def add_temperature_categories(df: pd.DataFrame) -> None:

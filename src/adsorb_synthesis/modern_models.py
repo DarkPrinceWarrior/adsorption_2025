@@ -558,14 +558,14 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
             cat_model = self._make_catboost()
             if self.n_classes_ > 2:
                 cat_model.set_params(
-                    auto_class_weights=None,
+                    auto_class_weights='None',
                     loss_function="MultiClass",
                     eval_metric="TotalF1",
                     class_weights=list(focal_weights.values()),
                 )
             else:
                 cat_model.set_params(
-                    auto_class_weights=None,
+                    auto_class_weights='None',
                     loss_function="Logloss",
                     eval_metric="Logloss",
                     class_weights=list(focal_weights.values()),

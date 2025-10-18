@@ -34,7 +34,12 @@ from .constants import (
     SOLVENT_DESCRIPTOR_FEATURES,
     TEST_SIZE,
 )
-from .data_processing import LookupTables, add_salt_mass_features, build_lookup_tables
+from .data_processing import (
+    LookupTables,
+    add_salt_mass_features,
+    add_thermodynamic_features,
+    build_lookup_tables,
+)
 from .modern_models import (
     ModernTabularEnsembleClassifier,
     ModernTabularEnsembleRegressor,
@@ -44,6 +49,7 @@ from .physics_losses import (
     PhysicsConstraintEvaluator,
     combined_physics_loss,
     physics_violation_scores,
+    project_thermodynamics,
 )
 
 ProblemType = Literal["classification", "regression"]
@@ -63,6 +69,8 @@ class StageConfig:
     description: str = ""
     physics_weight: float = 0.0
     physics_evaluator: Optional[PhysicsConstraintEvaluator] = None
+    physics_loss_kwargs: Optional[Dict[str, float]] = None
+    physics_columns: Sequence[str] = ()
 
 
 @dataclass
@@ -81,12 +89,15 @@ def _default_classifier(
     *,
     enable_physics: bool = False,
     physics_evaluator: Optional[PhysicsConstraintEvaluator] = None,
+    physics_loss_kwargs: Optional[Dict[str, float]] = None,
+    physics_weight: float = 0.1,
 ) -> BaseEstimator:
     """Factory for classification models with optional physics-informed loss."""
     if enable_physics:
         loss_fn = partial(
             combined_physics_loss,
             evaluator=physics_evaluator or DEFAULT_PHYSICS_EVALUATOR,
+            **(physics_loss_kwargs or {}),
         )
         return ModernTabularEnsembleClassifier(
             random_state=random_state,
@@ -95,7 +106,7 @@ def _default_classifier(
             calibrate_predictions=True,
             calibration_method="isotonic",
             physics_loss_fn=loss_fn,
-            physics_loss_weight=0.1,  # Initial weight: w_thermo=0.05, w_energy=0.02 inside combined_physics_loss
+            physics_loss_weight=physics_weight,
         )
     return ModernTabularEnsembleClassifier(
         random_state=random_state,
@@ -142,6 +153,9 @@ def default_stage_configs() -> List[StageConfig]:
     tsyn_predictors = sorted(set(volume_predictors + ['Vсин. (р-ля), мл', 'Vsyn_m']))
     dry_predictors = sorted(set(tsyn_predictors + ['Tsyn_Category']))
     regen_predictors = sorted(set(dry_predictors + ['Tdry_Category']))
+    thermodynamic_columns = ('Т.син., °С', 'Delta_G_equilibrium', 'K_equilibrium')
+    physics_loss_defaults = {'w_thermo': 0.175, 'w_energy': 0.061}
+    physics_weight_default = 0.017
 
     return [
         StageConfig(
@@ -149,9 +163,16 @@ def default_stage_configs() -> List[StageConfig]:
             target="Металл",
             problem_type="classification",
             feature_columns=adsorption_features,
-            estimator_factory=lambda rs: _default_classifier(rs, enable_physics=True),
-            physics_weight=0.1,
+            estimator_factory=partial(
+                _default_classifier,
+                enable_physics=True,
+                physics_loss_kwargs=dict(physics_loss_defaults),
+                physics_weight=physics_weight_default,
+            ),
+            physics_weight=physics_weight_default,
             physics_evaluator=DEFAULT_PHYSICS_EVALUATOR,
+            physics_loss_kwargs=dict(physics_loss_defaults),
+            physics_columns=thermodynamic_columns,
             description="Predict metal identity from adsorption performance with physics constraints.",
         ),
         StageConfig(
@@ -159,10 +180,17 @@ def default_stage_configs() -> List[StageConfig]:
             target="Лиганд",
             problem_type="classification",
             feature_columns=ligand_features,
-            estimator_factory=lambda rs: _default_classifier(rs, enable_physics=True),
+            estimator_factory=partial(
+                _default_classifier,
+                enable_physics=True,
+                physics_loss_kwargs=dict(physics_loss_defaults),
+                physics_weight=physics_weight_default,
+            ),
             depends_on=("Металл",),
-            physics_weight=0.1,
+            physics_weight=physics_weight_default,
             physics_evaluator=DEFAULT_PHYSICS_EVALUATOR,
+            physics_loss_kwargs=dict(physics_loss_defaults),
+            physics_columns=thermodynamic_columns,
             description="Predict ligand conditioned on adsorption profile and metal with physics constraints.",
         ),
         # Solvent stage removed: dataset filtered to DMFA only (340/380 samples)
@@ -280,6 +308,7 @@ class InverseDesignPipeline:
         _augment_with_lookup_descriptors(data, lookup_tables)
         _update_stoichiometry_features(data)
         add_salt_mass_features(data)  # Add engineered features for salt_mass
+        add_thermodynamic_features(data)
 
         rng_seed = self.random_state
         self.stage_results.clear()
@@ -320,6 +349,7 @@ class InverseDesignPipeline:
         inputs: pd.DataFrame,
         *,
         return_intermediate: bool = True,
+        enforce_physics: bool = True,
     ) -> pd.DataFrame:
         """Run sequential inference starting from adsorption descriptors."""
 
@@ -331,6 +361,7 @@ class InverseDesignPipeline:
         results = inputs.copy()
         _ensure_process_defaults(results)
         add_salt_mass_features(results)  # Add engineered features
+        add_thermodynamic_features(results)
 
         for stage in self.stage_configs:
             _augment_with_lookup_descriptors(results, self.lookup_tables)
@@ -353,8 +384,17 @@ class InverseDesignPipeline:
             else:
                 results[stage.target] = predictions
 
+        if enforce_physics:
+            results = project_thermodynamics(
+                results,
+                evaluator=DEFAULT_PHYSICS_EVALUATOR,
+                overwrite=True,
+                residual_column="K_equilibrium_residual",
+            )
+            add_thermodynamic_features(results)
+
         if not return_intermediate:
-            targets = [stage.target if stage.target != "log_salt_mass" else "m (соли), г" 
+            targets = [stage.target if stage.target != "log_salt_mass" else "m (соли), г"
                       for stage in self.stage_configs]
             return results[targets]
         return results
@@ -391,6 +431,8 @@ class InverseDesignPipeline:
                 'outlier_contamination': stage.outlier_contamination,
                 'description': stage.description,
                 'physics_weight': stage.physics_weight,
+                'physics_columns': list(stage.physics_columns),
+                'physics_loss_kwargs': dict(stage.physics_loss_kwargs) if stage.physics_loss_kwargs else None,
             })
 
         if self.lookup_tables is not None:
@@ -414,11 +456,15 @@ class InverseDesignPipeline:
         for stage_meta in metadata.get('stages', []):
             problem_type = stage_meta['problem_type']
             physics_weight = stage_meta.get('physics_weight', 0.0)
+            physics_columns = tuple(stage_meta.get('physics_columns', ()))
+            physics_loss_kwargs_meta = stage_meta.get('physics_loss_kwargs')
+            physics_loss_kwargs = dict(physics_loss_kwargs_meta) if physics_loss_kwargs_meta else None
             if problem_type == 'classification' and physics_weight > 0.0:
-                estimator_factory = lambda rs, evaluator=DEFAULT_PHYSICS_EVALUATOR: _default_classifier(
-                    rs,
+                estimator_factory = partial(
+                    _default_classifier,
                     enable_physics=True,
-                    physics_evaluator=evaluator,
+                    physics_loss_kwargs=physics_loss_kwargs,
+                    physics_weight=physics_weight,
                 )
                 physics_evaluator = DEFAULT_PHYSICS_EVALUATOR
             else:
@@ -435,6 +481,8 @@ class InverseDesignPipeline:
                 description=stage_meta.get('description', ''),
                 physics_weight=physics_weight,
                 physics_evaluator=physics_evaluator,
+                physics_loss_kwargs=physics_loss_kwargs,
+                physics_columns=physics_columns,
             ))
 
         pipeline = cls(stage_configs=stage_configs, random_state=metadata.get('random_state', RANDOM_SEED))
@@ -471,7 +519,12 @@ class InverseDesignPipeline:
         return pipeline
 
     def _prepare_stage_dataframe(self, data: pd.DataFrame, stage: StageConfig) -> pd.DataFrame:
-        cols = list(stage.feature_columns) + [stage.target]
+        cols: List[str] = list(stage.feature_columns)
+        for col in stage.physics_columns:
+            if col not in cols:
+                cols.append(col)
+        if stage.target not in cols:
+            cols.append(stage.target)
         df = data[cols].dropna()
 
         if stage.problem_type == "regression" and stage.outlier_contamination:
@@ -533,7 +586,8 @@ class InverseDesignPipeline:
             stratify = None
 
         if stage.physics_weight > 0.0:
-            penalties = physics_violation_scores(X, evaluator=evaluator)
+            physics_frame = data if stage.physics_columns else data[features]
+            penalties = physics_violation_scores(physics_frame, evaluator=evaluator)
             if penalties.size:
                 penalties = penalties - np.nanmin(penalties)
                 max_penalty = np.nanmax(penalties)

@@ -155,7 +155,12 @@ DEFAULT_PHYSICS_EVALUATOR = PhysicsConstraintEvaluator(
             upper=ADSORPTION_ENERGY_RATIO_BOUNDS[1],
         ),
     ),
-    thermodynamic=ThermodynamicConstraint(),
+    thermodynamic=ThermodynamicConstraint(
+        temperature_column="Т.син., °С",
+        delta_g_column="Delta_G_equilibrium",
+        equilibrium_column="K_equilibrium",
+        tolerance=THERMODYNAMIC_TOLERANCE,
+    ),
 )
 
 
@@ -218,3 +223,78 @@ def validate_physics_constraints(
 ) -> Dict[str, float]:
     """Return summary statistics for configured physics constraints."""
     return evaluator.summary(df, verbose=verbose)
+
+
+def project_thermodynamics(
+    df: pd.DataFrame,
+    *,
+    evaluator: PhysicsConstraintEvaluator = DEFAULT_PHYSICS_EVALUATOR,
+    overwrite: bool = False,
+    residual_column: Optional[str] = "K_equilibrium_residual",
+) -> pd.DataFrame:
+    """
+    Project thermodynamic variables onto the Gibbs equilibrium manifold.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input dataframe expected to contain temperature, Delta_G and K_equilibrium.
+    evaluator : PhysicsConstraintEvaluator
+        Evaluator providing thermodynamic configuration.
+    overwrite : bool
+        When True, replace the original ``K_equilibrium`` column with the projected values.
+        Otherwise a new ``K_equilibrium_projected`` column is added.
+    residual_column : Optional[str]
+        Name of the column that will store the difference between original and projected values.
+        Set to None to skip recording residuals.
+
+    Returns
+    -------
+    pd.DataFrame
+        Dataframe with enforced thermodynamic consistency.
+    """
+    if evaluator.thermodynamic is None or df.empty:
+        return df if overwrite else df.copy()
+
+    cfg = evaluator.thermodynamic
+    required = {cfg.temperature_column, cfg.delta_g_column, cfg.equilibrium_column}
+    if not required.issubset(df.columns):
+        return df if overwrite else df.copy()
+
+    frame = df if overwrite else df.copy()
+    temperature = pd.to_numeric(frame[cfg.temperature_column], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    delta_g = pd.to_numeric(frame[cfg.delta_g_column], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+    k_eq = pd.to_numeric(frame[cfg.equilibrium_column], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+
+    mask = np.isfinite(temperature) & np.isfinite(delta_g)
+    projected = np.full_like(temperature, np.nan, dtype=np.float64)
+    temperature_k = np.full_like(temperature, np.nan, dtype=np.float64)
+
+    if np.any(mask):
+        T_kelvin = np.clip(temperature[mask] + 273.15, 1e-3, None)
+        temperature_k[mask] = T_kelvin
+        delta_g_j = delta_g[mask] * 1000.0
+        exponent = -delta_g_j / (evaluator.gas_constant * T_kelvin)
+        exponent = np.clip(exponent, -100.0, 100.0)
+        projected[mask] = np.exp(exponent)
+
+    if residual_column is not None:
+        residual = np.full_like(projected, np.nan, dtype=np.float64)
+        valid = np.isfinite(projected) & np.isfinite(k_eq)
+        residual[valid] = k_eq[valid] - projected[valid]
+        frame[residual_column] = residual
+
+    delta_projected = np.full_like(projected, np.nan, dtype=np.float64)
+    valid_projected = np.isfinite(projected) & np.isfinite(temperature_k) & (projected > 0)
+    if np.any(valid_projected):
+        delta_projected[valid_projected] = -(
+            evaluator.gas_constant * temperature_k[valid_projected] * np.log(projected[valid_projected])
+        ) / 1000.0
+    frame[cfg.delta_g_column] = delta_projected
+
+    if overwrite:
+        frame[cfg.equilibrium_column] = projected
+    else:
+        frame[f"{cfg.equilibrium_column}_projected"] = projected
+
+    return frame
