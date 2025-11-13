@@ -29,10 +29,11 @@ from .constants import (
     ADSORPTION_FEATURES,
     LIGAND_DESCRIPTOR_FEATURES,
     METAL_DESCRIPTOR_FEATURES,
-    N_RATIO_BOUNDS,
+    DEFAULT_STOICHIOMETRY_BOUNDS,
     PROCESS_CONTEXT_FEATURES,
     RANDOM_SEED,
     SOLVENT_DESCRIPTOR_FEATURES,
+    STOICHIOMETRY_TARGETS,
     TEMPERATURE_CATEGORIES,
     TEST_SIZE,
 )
@@ -143,12 +144,32 @@ def default_stage_configs() -> List[StageConfig]:
     ligand_features = sorted(set(adsorption_features + list(METAL_DESCRIPTOR_FEATURES) + ['Металл']))
     # Removed solvent_features - now using ligand_features directly with solvent descriptors
     process_context = list(PROCESS_CONTEXT_FEATURES)
+    engineered_process_features = [
+        'C_metal',
+        'C_ligand',
+        'log_C_metal',
+        'log_C_ligand',
+        'R_mass',
+        'R_molar',
+        'T_range',
+        'T_activation',
+        'T_dry_norm',
+        'a0_calc',
+        'E_calc',
+        'Ws_W0_ratio',
+        'delta_a0',
+        'delta_E',
+        'delta_Ws',
+        'E_E0_ratio',
+        'W0_per_SBET',
+    ]
 
     # Salt features: ligand + ligand descriptors + solvent descriptors + engineered features
     salt_features = sorted(set(
         ligand_features + list(LIGAND_DESCRIPTOR_FEATURES) + 
-        list(SOLVENT_DESCRIPTOR_FEATURES) + process_context + 
-        ['Лиганд', 'Metal_Ligand_Combo', 'Log_Metal_MW', 'Is_Cu', 'Is_Zn']
+        list(SOLVENT_DESCRIPTOR_FEATURES) + process_context +
+        ['Лиганд', 'Metal_Ligand_Combo', 'Log_Metal_MW', 'Is_Cu', 'Is_Zn'] +
+        engineered_process_features
     ))
     acid_features = sorted(set(salt_features + ['m (соли), г', 'n_соли', 'log_salt_mass']))
     volume_predictors = sorted(set(acid_features + ['m(кис-ты), г', 'n_кислоты', 'n_ratio']))
@@ -769,20 +790,62 @@ def _update_stoichiometry_features(df: pd.DataFrame) -> None:
     if {'n_соли', 'n_кислоты'}.issubset(df.columns):
         denom = df['n_кислоты'].replace(0, np.nan)
         df['n_ratio'] = df['n_соли'] / denom
-        lower, upper = N_RATIO_BOUNDS
-        ratio = df['n_ratio']
-        clipped = ratio.clip(lower, upper)
-        df['n_ratio_residual'] = ratio - clipped
+        (
+            lower_bounds,
+            upper_bounds,
+            target_values,
+            mode_values,
+        ) = _compute_stoichiometry_bounds(df)
+
+        ratio_values = pd.to_numeric(df['n_ratio'], errors='coerce').to_numpy(dtype=float)
+        bounded = np.clip(ratio_values, lower_bounds, upper_bounds)
+        target_or_bounded = np.where(np.isfinite(target_values), target_values, bounded)
+        residual = ratio_values - target_or_bounded
+
+        df['n_ratio_lower'] = lower_bounds
+        df['n_ratio_upper'] = upper_bounds
+        df['n_ratio_target'] = target_values
+        df['n_ratio_mode'] = mode_values
+        df['n_ratio_residual'] = residual
 
     if {'Vсин. (р-ля), мл', 'm (соли), г'}.issubset(df.columns):
         denom = df['m (соли), г'].replace(0, np.nan)
         df['Vsyn_m'] = df['Vсин. (р-ля), мл'] / denom
 
 
+def _compute_stoichiometry_bounds(
+    df: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return lower/upper bounds and targets for each metal-ligand pair."""
+
+    size = len(df)
+    lower_default, upper_default = DEFAULT_STOICHIOMETRY_BOUNDS
+    lower_arr = np.full(size, lower_default, dtype=float)
+    upper_arr = np.full(size, upper_default, dtype=float)
+    target_arr = np.full(size, np.nan, dtype=float)
+    mode_arr = np.full(size, 'fallback', dtype=object)
+
+    if {'Металл', 'Лиганд'}.issubset(df.columns):
+        for idx, (metal, ligand) in enumerate(zip(df['Металл'], df['Лиганд'])):
+            target_info = STOICHIOMETRY_TARGETS.get((metal, ligand))
+            if not target_info:
+                continue
+            target = target_info['ratio']
+            tol = target_info.get('tolerance', 0.1)
+            lower_arr[idx] = target * (1 - tol)
+            upper_arr[idx] = target * (1 + tol)
+            target_arr[idx] = target
+            mode_arr[idx] = 'target'
+
+    return lower_arr, upper_arr, target_arr, mode_arr
+
+
 def _project_stoichiometry(df: pd.DataFrame) -> None:
-    """Adjust acid mass to keep molar ratio within physical bounds."""
+    """Adjust acid mass to keep molar ratio near material-specific targets."""
 
     required = {
+        'Металл',
+        'Лиганд',
         'm (соли), г',
         'Молярка_соли',
         'm(кис-ты), г',
@@ -794,27 +857,35 @@ def _project_stoichiometry(df: pd.DataFrame) -> None:
     if not required.issubset(df.columns):
         return
 
-    lower, upper = N_RATIO_BOUNDS
-    ratio = pd.to_numeric(df['n_ratio'], errors='coerce')
-    n_salt = pd.to_numeric(df['n_соли'], errors='coerce')
-    molar_acid = pd.to_numeric(df['Молярка_кислоты'], errors='coerce')
+    ratio = pd.to_numeric(df['n_ratio'], errors='coerce').to_numpy(dtype=float)
+    n_salt = pd.to_numeric(df['n_соли'], errors='coerce').to_numpy(dtype=float)
+    molar_acid = pd.to_numeric(df['Молярка_кислоты'], errors='coerce').to_numpy(dtype=float)
 
-    target_ratio = ratio.clip(lower, upper)
+    lower_bounds, upper_bounds, target_arr, _ = _compute_stoichiometry_bounds(df)
+
+    clip_target = np.clip(ratio, lower_bounds, upper_bounds)
+    desired_ratio = np.where(np.isfinite(target_arr), target_arr, clip_target)
+
     adjust_mask = (
-        np.isfinite(target_ratio)
+        np.isfinite(desired_ratio)
         & np.isfinite(n_salt)
         & np.isfinite(molar_acid)
         & (molar_acid > 0)
-        & (np.abs(target_ratio - ratio) > 1e-6)
+        & np.isfinite(ratio)
+        & (np.abs(desired_ratio - ratio) > 1e-6)
     )
-    if not adjust_mask.any():
+    if not np.any(adjust_mask):
         return
 
-    target_n_acid = n_salt[adjust_mask] / target_ratio[adjust_mask]
-    new_acid_mass = target_n_acid * molar_acid[adjust_mask]
-    df.loc[adjust_mask, 'm(кис-ты), г'] = new_acid_mass
+    target_n_acid = np.divide(
+        n_salt,
+        desired_ratio,
+        out=np.full_like(n_salt, np.nan),
+        where=desired_ratio > 0,
+    )
+    new_acid_mass = target_n_acid * molar_acid
+    df.loc[adjust_mask, 'm(кис-ты), г'] = new_acid_mass[adjust_mask]
 
-    # Refresh stoichiometric helpers after adjustment
     _update_stoichiometry_features(df)
 
 

@@ -85,4 +85,35 @@ TEMPERATURE_CATEGORIES = {
     },
 }
 
-N_RATIO_BOUNDS: tuple[float, float] = (0.45, 2.3)
+SOLVENT_BOILING_POINTS_C = {
+    'ДМФА': 153.0,
+    'DMF': 153.0,
+    'N,N-dimethylformamide': 153.0,
+    'Этанол': 78.0,
+    'Ethanol': 78.0,
+    'Вода': 100.0,
+    'Water': 100.0,
+    'Ацетонитрил': 82.0,
+    'Acetonitrile': 82.0,
+    'Метанол': 65.0,
+    'Methanol': 65.0,
+}
+
+STOICHIOMETRY_TARGETS = {
+    ('Cu', 'BTC'): {'ratio': 1.5, 'tolerance': 0.1},
+    ('Zn', 'BDC'): {'ratio': 2.0, 'tolerance': 0.1},
+    ('Zr', 'BDC'): {'ratio': 1.5, 'tolerance': 0.1},
+    ('Al', 'BTC'): {'ratio': 1.0, 'tolerance': 0.15},
+    ('Fe', 'BTC'): {'ratio': 1.0, 'tolerance': 0.15},
+    ('Fe', 'BDC'): {'ratio': 1.0, 'tolerance': 0.15},
+    ('Al', 'BDC'): {'ratio': 1.0, 'tolerance': 0.15},
+    ('La', 'BTC'): {'ratio': 1.0, 'tolerance': 0.15},
+    ('Zn', 'BTB'): {'ratio': 1.33, 'tolerance': 0.15},
+    ('Fe', 'NH2-BDC'): {'ratio': 1.0, 'tolerance': 0.15},
+    ('Zr', 'BTC'): {'ratio': 1.0, 'tolerance': 0.15},
+    ('Al', 'BTB'): {'ratio': 1.5, 'tolerance': 0.2},
+    ('Al', 'NH2-BDC'): {'ratio': 1.0, 'tolerance': 0.2},
+    ('Fe', 'BTB'): {'ratio': 1.5, 'tolerance': 0.2},
+}
+
+DEFAULT_STOICHIOMETRY_BOUNDS: tuple[float, float] = (0.45, 2.3)

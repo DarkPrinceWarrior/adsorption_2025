@@ -12,6 +12,7 @@ if str(SRC_DIR) not in sys.path:
 
 import pandas as pd
 
+from adsorb_synthesis.data_validation import DEFAULT_VALIDATION_MODE, validate_SEH_data
 from adsorb_synthesis.pipeline import InverseDesignPipeline
 
 
@@ -36,6 +37,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Return only the predicted synthesis targets without intermediate columns.",
     )
+    parser.add_argument(
+        "--validation-mode",
+        choices=("warn", "strict"),
+        default=DEFAULT_VALIDATION_MODE,
+        help="Validate adsorption descriptors before running inference.",
+    )
     return parser.parse_args()
 
 
@@ -48,6 +55,7 @@ def main() -> None:
     pipeline = InverseDesignPipeline.load(model_dir)
 
     df_input = pd.read_csv(args.input)
+    validate_SEH_data(df_input, mode=args.validation_mode)
     predictions = pipeline.predict(df_input, return_intermediate=not args.targets_only)
 
     if args.output:

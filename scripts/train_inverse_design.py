@@ -26,6 +26,12 @@ def parse_args() -> argparse.Namespace:
         default="artifacts",
         help="Directory where trained models and metadata will be stored.",
     )
+    parser.add_argument(
+        "--validation-mode",
+        choices=("warn", "strict"),
+        default="warn",
+        help="Strict mode raises on validation errors; warn mode logs them.",
+    )
     return parser.parse_args()
 
 
@@ -35,7 +41,7 @@ def main() -> None:
     if not data_path.exists():
         raise FileNotFoundError(f"Dataset not found: {data_path}")
 
-    df = load_dataset(str(data_path))
+    df = load_dataset(str(data_path), validation_mode=args.validation_mode)
     lookups = build_lookup_tables(df)
 
     pipeline = InverseDesignPipeline()

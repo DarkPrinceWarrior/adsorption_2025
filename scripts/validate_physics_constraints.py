@@ -27,11 +27,22 @@ def main():
         default=True,
         help="Print detailed statistics",
     )
+    parser.add_argument(
+        "--validation-mode",
+        choices=("warn", "strict"),
+        default="warn",
+        help="Strict mode raises on validation errors; warn mode logs them.",
+    )
     
     args = parser.parse_args()
     
     print(f"Loading dataset from: {args.data}")
-    df = load_dataset(args.data, add_categories=True, add_salt_features=True)
+    df = load_dataset(
+        args.data,
+        add_categories=True,
+        add_salt_features=True,
+        validation_mode=args.validation_mode,
+    )
     print(f"Dataset shape: {df.shape}")
     print()
     

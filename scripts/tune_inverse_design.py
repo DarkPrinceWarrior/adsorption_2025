@@ -44,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subset", type=int, default=0, help="Sample size for quick experiments (0 = use full dataset).")
     parser.add_argument("--timeout", type=float, default=None, help="Study timeout in seconds.")
     parser.add_argument("--n-jobs", type=int, default=1, help="Number of parallel Optuna workers (>=1).")
+    parser.add_argument(
+        "--validation-mode",
+        choices=("warn", "strict"),
+        default="warn",
+        help="Strict mode raises on validation errors; warn mode logs them.",
+    )
     return parser.parse_args()
 
 
@@ -109,7 +115,7 @@ def evaluate_trial(
 def main() -> None:
     args = parse_args()
 
-    df = load_dataset(args.data)
+    df = load_dataset(args.data, validation_mode=args.validation_mode)
     if args.subset and args.subset > 0 and args.subset < len(df):
         df = df.sample(n=args.subset, random_state=args.seed).reset_index(drop=True)
     lookups = build_lookup_tables(df)

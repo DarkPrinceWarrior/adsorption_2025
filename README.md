@@ -36,6 +36,7 @@ python -m pip install -r requirements.txt
 python scripts/train_inverse_design.py \
     --data data/SEC_SYN_with_features_DMFA_only_no_Y.csv \
     --output artifacts
+#   --validation-mode strict  # optional: fail fast on invalid rows
 
 # 3. Generate predictions for new adsorption descriptors
 python scripts/predict_inverse_design.py \
@@ -43,9 +44,12 @@ python scripts/predict_inverse_design.py \
     --input tmp_inference_input.csv \
     --output tmp_predictions.csv \
     --targets-only
+#   --validation-mode strict  # optional: validate adsorption inputs
 ```
 
 Prerequisites: CUDA is optional; the ensemble falls back to CPU. Optuna-based tuning additionally requires `optuna` (already listed in `requirements.txt`).
+
+Validation defaults to a soft `warn` mode that logs inconsistent adsorption or synthesis rows. Pass `--validation-mode strict` in any CLI (train, tune, predict, or physics checks) to abort on the first physical violation.
 
 ---
 

@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from src.adsorb_synthesis.constants import N_RATIO_BOUNDS
+from src.adsorb_synthesis.constants import DEFAULT_STOICHIOMETRY_BOUNDS
 from src.adsorb_synthesis.physics_losses import (
     DEFAULT_PHYSICS_EVALUATOR,
     project_thermodynamics,
@@ -28,22 +28,31 @@ def test_project_thermodynamics_aligns_k_and_delta_g():
     np.testing.assert_allclose(projected['K_equilibrium'], expected_k, rtol=1e-6, atol=0)
 
 
-def test_project_stoichiometry_clips_ratio():
+def test_project_stoichiometry_respects_targets_and_fallback():
+    default_lower, default_upper = DEFAULT_STOICHIOMETRY_BOUNDS
     df = pd.DataFrame({
-        'm (соли), г': [10.0, 1.0],
-        'Молярка_соли': [100.0, 50.0],
-        'm(кис-ты), г': [1.0, 10.0],
-        'Молярка_кислоты': [10.0, 20.0],
+        'Металл': ['Cu', 'Xx'],
+        'Лиганд': ['BTC', 'Unknown'],
+        'm (соли), г': [10.0, 10.0],
+        'Молярка_соли': [100.0, 100.0],
+        'm(кис-ты), г': [10.0, 25.0],
+        'Молярка_кислоты': [200.0, 500.0],
     })
     _update_stoichiometry_features(df)
-
-    assert (df['n_ratio'] > 0).all()
-
     _project_stoichiometry(df)
+    _update_stoichiometry_features(df)
 
-    lower, upper = N_RATIO_BOUNDS
-    assert df['n_ratio'].between(lower, upper).all()
-    assert np.allclose(df['n_ratio_residual'].fillna(0.0), 0.0)
+    # Row 0 should be projected to Cu-BTC target (1.5 ± tol)
+    target_ratio = df.loc[0, 'n_ratio_target']
+    assert np.isclose(target_ratio, 1.5, atol=1e-6)
+    assert abs(df.loc[0, 'n_ratio_residual']) < 1e-6
+
+    # Row 1 uses fallback bounds
+    assert np.isnan(df.loc[1, 'n_ratio_target'])
+    assert df.loc[1, 'n_ratio_lower'] <= df.loc[1, 'n_ratio'] <= df.loc[1, 'n_ratio_upper']
+    assert np.isclose(df.loc[1, 'n_ratio_lower'], default_lower)
+    assert np.isclose(df.loc[1, 'n_ratio_upper'], default_upper)
+    assert abs(df.loc[1, 'n_ratio_residual']) < 1e-6
 
 
 def test_enforce_temperature_order_monotonic():
@@ -66,5 +75,7 @@ def test_enforce_temperature_order_monotonic():
     dry_ord = order(df['Tdry_Category'], categories)
     reg_ord = order(df['Treg_Category'], reg_categories)
 
-    assert (dry_ord >= syn_ord).fillna(True).all()
-    assert (reg_ord >= dry_ord).fillna(True).all()
+    dry_ok = (dry_ord >= syn_ord) | syn_ord.isna()
+    reg_ok = (reg_ord >= dry_ord) | dry_ord.isna()
+    assert dry_ok.fillna(True).all()
+    assert reg_ok.fillna(True).all()
