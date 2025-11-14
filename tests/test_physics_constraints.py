@@ -1,9 +1,14 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.adsorb_synthesis.constants import DEFAULT_STOICHIOMETRY_BOUNDS
 from src.adsorb_synthesis.physics_losses import (
     DEFAULT_PHYSICS_EVALUATOR,
+    EqualityConstraint,
+    InequalityConstraint,
+    PhysicsConstraintEvaluator,
+    RatioConstraint,
     project_thermodynamics,
 )
 from src.adsorb_synthesis.pipeline import (
@@ -79,3 +84,30 @@ def test_enforce_temperature_order_monotonic():
     reg_ok = (reg_ord >= dry_ord) | dry_ord.isna()
     assert dry_ok.fillna(True).all()
     assert reg_ok.fillna(True).all()
+
+
+def test_physics_evaluator_enforces_new_constraint_types():
+    df = pd.DataFrame({
+        'W0, см3/г': [0.5, 0.5],
+        'а0, ммоль/г': [28.86 * 0.5, 28.86 * 0.5 * 1.2],
+        'E0, кДж/моль': [30.0, 30.0],
+        'E, кДж/моль': [10.0, 15.0],
+        'Ws, см3/г': [0.6, 0.2],
+    })
+
+    evaluator = PhysicsConstraintEvaluator(
+        equality_constraints=(
+            EqualityConstraint(column_a='а0, ммоль/г', column_b='W0, см3/г', coefficient=28.86, tolerance=0.05),
+        ),
+        ratio_constraints=(
+            RatioConstraint(column_a='E, кДж/моль', column_b='E0, кДж/моль', target_ratio=1.0 / 3.0, tolerance=0.05),
+        ),
+        inequality_constraints=(
+            InequalityConstraint(column_left='Ws, см3/г', column_right='W0, см3/г', operator='gte', tolerance=0.0),
+        ),
+    )
+
+    penalties = evaluator.penalties(df)
+    assert penalties.shape == (2,)
+    assert penalties[0] == pytest.approx(0.0)
+    assert penalties[1] > penalties[0]

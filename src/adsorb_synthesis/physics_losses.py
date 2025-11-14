@@ -9,9 +9,14 @@ import pandas as pd
 
 from .constants import (
     ADSORPTION_ENERGY_RATIO_BOUNDS,
+    A0_W0_COEFFICIENT,
+    A0_W0_REL_TOLERANCE,
+    E_E0_RATIO_TARGET,
+    E_E0_RATIO_TOLERANCE,
     E0_BOUNDS_KJ_MOL,
     R_GAS_J_MOL_K,
     THERMODYNAMIC_TOLERANCE,
+    WS_W0_TOLERANCE,
 )
 
 
@@ -40,12 +45,45 @@ class ThermodynamicConstraint:
     tolerance: float = THERMODYNAMIC_TOLERANCE
 
 
+@dataclass(frozen=True)
+class EqualityConstraint:
+    """Constraint enforcing column_a ≈ coefficient * column_b."""
+
+    column_a: str
+    column_b: str
+    coefficient: float = 1.0
+    tolerance: float = 0.05
+
+
+@dataclass(frozen=True)
+class RatioConstraint:
+    """Constraint enforcing column_a / column_b ≈ target_ratio."""
+
+    column_a: str
+    column_b: str
+    target_ratio: float
+    tolerance: float = 0.05
+
+
+@dataclass(frozen=True)
+class InequalityConstraint:
+    """Constraint enforcing simple <= or >= relationships."""
+
+    column_left: str
+    column_right: str
+    operator: str = "gte"  # supported: 'gte', 'lte'
+    tolerance: float = 0.0
+
+
 @dataclass
 class PhysicsConstraintEvaluator:
     """Evaluator that computes physics-based penalties and summary statistics."""
 
     energy_bounds: Sequence[BoundConstraint] = field(default_factory=tuple)
     thermodynamic: Optional[ThermodynamicConstraint] = None
+    equality_constraints: Sequence[EqualityConstraint] = field(default_factory=tuple)
+    ratio_constraints: Sequence[RatioConstraint] = field(default_factory=tuple)
+    inequality_constraints: Sequence[InequalityConstraint] = field(default_factory=tuple)
     gas_constant: float = R_GAS_J_MOL_K
 
     def _ensure_length(self, df: pd.DataFrame) -> np.ndarray:
@@ -96,11 +134,79 @@ class PhysicsConstraintEvaluator:
         penalties[mask] = violation
         return penalties
 
+    def equality_penalty(self, df: pd.DataFrame) -> np.ndarray:
+        if df.empty or not self.equality_constraints:
+            return np.zeros(len(df), dtype=np.float64)
+
+        penalties = np.zeros(len(df), dtype=np.float64)
+        for constraint in self.equality_constraints:
+            if constraint.column_a not in df.columns or constraint.column_b not in df.columns:
+                continue
+            col_a = pd.to_numeric(df[constraint.column_a], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+            col_b = pd.to_numeric(df[constraint.column_b], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+            mask = np.isfinite(col_a) & np.isfinite(col_b)
+            if not np.any(mask):
+                continue
+            expected = constraint.coefficient * col_b[mask]
+            observed = col_a[mask]
+            residual = np.abs(observed - expected)
+            denom = np.maximum(np.abs(expected), 1e-6)
+            relative_error = residual / denom
+            violation = np.maximum(0.0, relative_error - constraint.tolerance)
+            penalties[mask] += violation
+        return penalties
+
+    def ratio_penalty(self, df: pd.DataFrame) -> np.ndarray:
+        if df.empty or not self.ratio_constraints:
+            return np.zeros(len(df), dtype=np.float64)
+
+        penalties = np.zeros(len(df), dtype=np.float64)
+        for constraint in self.ratio_constraints:
+            if constraint.column_a not in df.columns or constraint.column_b not in df.columns:
+                continue
+            col_a = pd.to_numeric(df[constraint.column_a], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+            col_b = pd.to_numeric(df[constraint.column_b], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+            denom = np.abs(col_b)
+            mask = np.isfinite(col_a) & np.isfinite(col_b) & (denom > 1e-8)
+            if not np.any(mask):
+                continue
+            ratios = col_a[mask] / denom[mask]
+            deviation = np.abs(ratios - constraint.target_ratio)
+            violation = np.maximum(0.0, deviation - constraint.tolerance)
+            penalties[mask] += violation
+        return penalties
+
+    def inequality_penalty(self, df: pd.DataFrame) -> np.ndarray:
+        if df.empty or not self.inequality_constraints:
+            return np.zeros(len(df), dtype=np.float64)
+
+        penalties = np.zeros(len(df), dtype=np.float64)
+        for constraint in self.inequality_constraints:
+            if constraint.operator not in {"gte", "lte"}:
+                raise ValueError(f"Unsupported operator '{constraint.operator}' for inequality constraint")
+            if constraint.column_left not in df.columns or constraint.column_right not in df.columns:
+                continue
+            col_left = pd.to_numeric(df[constraint.column_left], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+            col_right = pd.to_numeric(df[constraint.column_right], errors="coerce").to_numpy(dtype=np.float64, copy=False)
+            mask = np.isfinite(col_left) & np.isfinite(col_right)
+            if not np.any(mask):
+                continue
+            if constraint.operator == "gte":
+                diff = col_right[mask] - col_left[mask]
+            else:
+                diff = col_left[mask] - col_right[mask]
+            violation = np.maximum(0.0, diff - constraint.tolerance)
+            penalties[mask] += violation
+        return penalties
+
     def penalties(self, df: pd.DataFrame) -> np.ndarray:
         if df.empty:
             return np.zeros(0, dtype=np.float64)
         penalty = self.energy_penalty(df)
         penalty += self.thermodynamic_penalty(df)
+        penalty += self.equality_penalty(df)
+        penalty += self.ratio_penalty(df)
+        penalty += self.inequality_penalty(df)
         return np.nan_to_num(penalty, nan=0.0, neginf=0.0, posinf=0.0)
 
     def summary(self, df: pd.DataFrame, *, verbose: bool = False) -> Dict[str, float]:
@@ -160,6 +266,30 @@ DEFAULT_PHYSICS_EVALUATOR = PhysicsConstraintEvaluator(
         delta_g_column="Delta_G_equilibrium",
         equilibrium_column="K_equilibrium",
         tolerance=THERMODYNAMIC_TOLERANCE,
+    ),
+    equality_constraints=(
+        EqualityConstraint(
+            column_a="а0, ммоль/г",
+            column_b="W0, см3/г",
+            coefficient=A0_W0_COEFFICIENT,
+            tolerance=A0_W0_REL_TOLERANCE,
+        ),
+    ),
+    ratio_constraints=(
+        RatioConstraint(
+            column_a="E, кДж/моль",
+            column_b="E0, кДж/моль",
+            target_ratio=E_E0_RATIO_TARGET,
+            tolerance=E_E0_RATIO_TOLERANCE,
+        ),
+    ),
+    inequality_constraints=(
+        InequalityConstraint(
+            column_left="Ws, см3/г",
+            column_right="W0, см3/г",
+            operator="gte",
+            tolerance=WS_W0_TOLERANCE,
+        ),
     ),
 )
 
