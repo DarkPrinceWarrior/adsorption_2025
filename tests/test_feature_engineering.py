@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from src.adsorb_synthesis.data_processing import add_salt_mass_features
+from src.adsorb_synthesis.data_processing import add_salt_mass_features, add_thermodynamic_features
 
 
 def test_add_salt_mass_features_populates_engineered_columns():
@@ -43,3 +43,16 @@ def test_add_salt_mass_features_populates_engineered_columns():
     assert np.isclose(df.loc[0, 'delta_E'], 0.0, atol=1e-6)
     assert np.isclose(df.loc[0, 'Ws_W0_ratio'], 1.2)
     assert np.isclose(df.loc[0, 'W0_per_SBET'], 0.0005)
+
+
+def test_add_thermodynamic_features_preserves_sources():
+    df = pd.DataFrame({
+        'Т.син., °С': [100.0, 150.0],
+        'E, кДж/моль': [10.0, 12.0],
+        'K_equilibrium': [np.nan, 2.0],
+    })
+    add_thermodynamic_features(df)
+
+    assert 'Delta_G_equilibrium' in df
+    assert df.loc[0, 'K_equilibrium'] is np.nan or np.isnan(df.loc[0, 'K_equilibrium'])
+    assert 'K_equilibrium_from_delta_G' in df

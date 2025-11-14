@@ -168,12 +168,22 @@ def add_thermodynamic_features(df: pd.DataFrame) -> None:
     """Derive thermodynamic helper columns from measured K_eq and ΔG."""
 
     temperature_col = 'Т.син., °С'
-    if temperature_col not in df.columns or 'K_equilibrium' not in df.columns:
+    if temperature_col not in df.columns:
         return
 
     temperature_c = pd.to_numeric(df[temperature_col], errors='coerce').to_numpy(dtype=np.float64)
     temperature_k = temperature_c + 273.15
-    k_measured = pd.to_numeric(df['K_equilibrium'], errors='coerce').to_numpy(dtype=np.float64)
+
+    # Fill missing K_equilibrium using E (if available) and actual temperature
+    if 'K_equilibrium' not in df.columns and 'E, кДж/моль' in df.columns:
+        E = pd.to_numeric(df['E, кДж/моль'], errors='coerce').to_numpy(dtype=np.float64)
+        fallback_k = np.full(len(df), np.nan, dtype=np.float64)
+        valid = np.isfinite(E) & np.isfinite(temperature_k)
+        if np.any(valid):
+            R_kj = R_GAS_CONSTANT / 1000.0
+            fallback_k[valid] = np.exp(E[valid] / (R_kj * temperature_k[valid]))
+        df['K_equilibrium'] = fallback_k
+    k_measured = pd.to_numeric(df.get('K_equilibrium'), errors='coerce').to_numpy(dtype=np.float64)
 
     delta_g_from_k = np.full(len(df), np.nan, dtype=np.float64)
     valid_k = np.isfinite(temperature_k) & np.isfinite(k_measured) & (k_measured > 0)
@@ -183,20 +193,26 @@ def add_thermodynamic_features(df: pd.DataFrame) -> None:
         ) / 1000.0
     df['Delta_G_equilibrium'] = delta_g_from_k
 
+    delta_g_raw = None
     if 'Delta_G' in df.columns:
-        delta_g = pd.to_numeric(df['Delta_G'], errors='coerce').to_numpy(dtype=np.float64)
+        delta_g_raw = pd.to_numeric(df['Delta_G'], errors='coerce').to_numpy(dtype=np.float64)
+    elif 'E, кДж/моль' in df.columns:
+        # fallback Delta_G estimate using adsorption energy
+        delta_g_raw = pd.to_numeric(df['E, кДж/моль'], errors='coerce').to_numpy(dtype=np.float64)
+
+    if delta_g_raw is not None:
         k_from_delta = np.full(len(df), np.nan, dtype=np.float64)
-        valid_delta = np.isfinite(temperature_k) & np.isfinite(delta_g)
+        valid_delta = np.isfinite(temperature_k) & np.isfinite(delta_g_raw)
         if np.any(valid_delta):
             k_from_delta[valid_delta] = np.exp(
-                -(delta_g[valid_delta] * 1000.0) / (R_GAS_CONSTANT * temperature_k[valid_delta])
+                -(delta_g_raw[valid_delta] * 1000.0) / (R_GAS_CONSTANT * temperature_k[valid_delta])
             )
         df['K_equilibrium_from_delta_G'] = k_from_delta
 
         residual = np.full(len(df), np.nan, dtype=np.float64)
         valid_both = valid_k & valid_delta
         if np.any(valid_both):
-            residual[valid_both] = delta_g[valid_both] - delta_g_from_k[valid_both]
+            residual[valid_both] = delta_g_raw[valid_both] - delta_g_from_k[valid_both]
         df['Delta_G_residual'] = residual
         df['K_equilibrium_ratio'] = np.divide(
             k_measured,
@@ -274,11 +290,6 @@ def _ensure_adsorption_features(df: pd.DataFrame) -> None:
         df['S_BET_E'] = df['SБЭТ, м2/г'] * df['E, кДж/моль']
     if 'x0_W0' not in df.columns:
         df['x0_W0'] = df['х0, нм'] * df['W0, см3/г']
-
-    if 'K_equilibrium' not in df.columns or 'Delta_G' not in df.columns:
-        R_kj = R_GAS_CONSTANT / 1000
-        df['K_equilibrium'] = np.exp(df['E, кДж/моль'] / (R_kj * TEMPERATURE_DEFAULT_K))
-        df['Delta_G'] = -R_kj * TEMPERATURE_DEFAULT_K * np.log(df['K_equilibrium'] + EPSILON)
 
     if 'B_micropore' not in df.columns:
         e_j_per_mol = df['E, кДж/моль'] * 1000
