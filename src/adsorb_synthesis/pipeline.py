@@ -667,8 +667,8 @@ class InverseDesignPipeline:
         else:
             stratify = None
 
+        physics_frame = data if stage.physics_columns else data[features]
         if stage.physics_weight > 0.0:
-            physics_frame = data if stage.physics_columns else data[features]
             penalties = physics_violation_scores(physics_frame, evaluator=evaluator)
             if penalties.size:
                 penalties = penalties - np.nanmin(penalties)
@@ -681,7 +681,8 @@ class InverseDesignPipeline:
                 # Preserve overall weight mass for stability
                 sample_weights /= np.mean(sample_weights) if np.mean(sample_weights) > 0 else 1.0
 
-        split_arrays = [X, y]
+        indices = np.arange(len(X))
+        split_arrays = [X, y, indices]
         if sample_weights is not None:
             split_arrays.append(sample_weights)
 
@@ -693,14 +694,18 @@ class InverseDesignPipeline:
         )
 
         if sample_weights is not None:
-            X_train, X_test, y_train, y_test, w_train, w_test = split_result
+            X_train, X_test, y_train, y_test, train_idx, test_idx, w_train, w_test = split_result
         else:
-            X_train, X_test, y_train, y_test = split_result
+            X_train, X_test, y_train, y_test, train_idx, test_idx = split_result
             w_train = w_test = None
 
         fit_kwargs = {}
         if w_train is not None:
             fit_kwargs['model__sample_weight'] = w_train
+        model_step = pipeline.named_steps.get('model')
+        if model_step is not None and hasattr(model_step, 'physics_loss_fn'):
+            physics_subset = physics_frame.iloc[train_idx].reset_index(drop=True)
+            fit_kwargs['model__physics_frame'] = physics_subset
 
         pipeline.fit(X_train, y_train, **fit_kwargs)
         y_pred = pipeline.predict(X_test)
@@ -718,6 +723,7 @@ class InverseDesignPipeline:
                 X=X,
                 y=y,
                 sample_weights=sample_weights,
+                physics_frame=physics_frame,
             )
         else:
             rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
@@ -732,6 +738,7 @@ class InverseDesignPipeline:
                 X=X,
                 y=y,
                 sample_weights=sample_weights,
+                physics_frame=physics_frame,
             )
 
         return metrics, float(np.mean(cv_scores)), float(np.std(cv_scores))
@@ -744,6 +751,7 @@ class InverseDesignPipeline:
         X: pd.DataFrame,
         y: pd.Series,
         sample_weights: Optional[np.ndarray],
+        physics_frame: Optional[pd.DataFrame],
     ) -> np.ndarray:
         """Manual cross-validation that respects sample weights."""
         if stage.problem_type == "classification":
@@ -782,6 +790,10 @@ class InverseDesignPipeline:
             if sample_weights is not None:
                 w_train = sample_weights[train_idx]
                 fit_kwargs['model__sample_weight'] = w_train
+            model_step = base_pipeline.named_steps.get('model')
+            if physics_frame is not None and model_step is not None and hasattr(model_step, 'physics_loss_fn'):
+                physics_subset = physics_frame.iloc[train_idx].reset_index(drop=True)
+                fit_kwargs['model__physics_frame'] = physics_subset
 
             model = clone(base_pipeline)
             model.fit(X_train, y_train, **fit_kwargs)

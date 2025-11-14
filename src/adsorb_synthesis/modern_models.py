@@ -6,6 +6,7 @@ import warnings
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
+import pandas as pd
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import brier_score_loss, log_loss, mean_absolute_error, mean_squared_error
@@ -247,45 +248,34 @@ class _ModernTabularEnsemble(BaseEstimator):
             virtual_batch_size=virtual_batch_size,
         )
 
-    def _compute_physics_sample_weights(self, X: np.ndarray, base_weights: np.ndarray) -> np.ndarray:
+    def _compute_physics_sample_weights(self, frames: Optional[pd.DataFrame], base_weights: np.ndarray) -> np.ndarray:
         """Compute sample weights incorporating physics violations."""
-        if self.physics_loss_fn is None or self.physics_loss_weight <= 0:
+        if (
+            self.physics_loss_fn is None
+            or self.physics_loss_weight <= 0
+            or frames is None
+            or frames.empty
+        ):
             return base_weights
-        
-        if self.feature_names is None:
-            warnings.warn(
-                "feature_names not provided; physics loss cannot be computed. Using base weights.",
-                RuntimeWarning,
-            )
-            return base_weights
-        
+
         try:
-            # Compute per-sample physics loss
-            # Note: physics_loss_fn should return per-sample losses, not mean
-            physics_violations = []
-            for i in range(X.shape[0]):
-                sample = X[i:i+1, :]
-                loss = self.physics_loss_fn(sample, self.feature_names)
-                physics_violations.append(loss)
-            
-            physics_violations = np.array(physics_violations)
-            
-            # Scale violations to [0, 1] range
-            if physics_violations.max() > 0:
-                physics_violations = physics_violations / (physics_violations.max() + 1e-6)
-            
-            # Increase weight for samples with high physics violations
-            # Interpretation: train more on "physically wrong" samples to correct them
-            physics_weights = 1.0 + self.physics_loss_weight * physics_violations
-            
-            # Combine with base weights
-            combined_weights = base_weights * physics_weights
-            
-            # Normalize to preserve total weight
-            combined_weights = combined_weights * (base_weights.sum() / combined_weights.sum())
-            
-            return combined_weights
-            
+            violations = self.physics_loss_fn(frames)
+            violations = np.asarray(violations, dtype=np.float64).reshape(-1)
+            if violations.shape[0] != base_weights.shape[0]:
+                warnings.warn(
+                    "Physics loss vector length mismatch; falling back to base weights.",
+                    RuntimeWarning,
+                )
+                return base_weights
+            # Normalise violations to [0, 1] and construct weights
+            max_violation = np.nanmax(violations)
+            normalized = violations / max(max_violation, 1e-6)
+            physics_weights = 1.0 + self.physics_loss_weight * normalized
+            combined = base_weights * physics_weights
+            total = np.sum(combined)
+            if total > 0:
+                combined = combined * (np.sum(base_weights) / total)
+            return combined
         except Exception as exc:
             warnings.warn(
                 f"Physics loss computation failed: {exc}. Using base weights.",
@@ -477,7 +467,7 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         self.calibrate_predictions = calibrate_predictions
         self.calibration_method = calibration_method
 
-    def fit(self, X, y, sample_weight=None):
+    def fit(self, X, y, sample_weight=None, physics_frame: Optional[pd.DataFrame] = None):
         X_arr, y_arr = check_X_y(X, y, accept_sparse=False, ensure_min_samples=2)
         X_arr = np.asarray(X_arr, dtype=np.float32)
         self._label_encoder = LabelEncoder()
@@ -495,24 +485,37 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         counts = np.bincount(y_encoded)
         stratify = y_encoded if self.n_classes_ > 1 and np.all(counts >= 2) else None
 
+        physics_train = physics_val = None
         if sample_weight is not None:
-            X_train, X_val, y_train, y_val, sw_train, sw_val = train_test_split(
+            X_train, X_val, y_train, y_val, sw_train, sw_val, train_idx, val_idx = train_test_split(
                 X_arr,
                 y_encoded,
                 sample_weight,
+                np.arange(X_arr.shape[0]),
                 test_size=self.validation_fraction,
                 random_state=self.random_state,
                 stratify=stratify,
             )
         else:
-            X_train, X_val, y_train, y_val = train_test_split(
+            X_train, X_val, y_train, y_val, train_idx, val_idx = train_test_split(
                 X_arr,
                 y_encoded,
+                np.arange(X_arr.shape[0]),
                 test_size=self.validation_fraction,
                 random_state=self.random_state,
                 stratify=stratify,
             )
             sw_train = sw_val = None
+
+        if physics_frame is not None:
+            physics_train = physics_frame.iloc[train_idx].reset_index(drop=True)
+            physics_val = physics_frame.iloc[val_idx].reset_index(drop=True)
+
+        if physics_train is not None and self.physics_loss_fn is not None and self.physics_loss_weight > 0:
+            base_train = sw_train.copy() if sw_train is not None else np.ones(X_train.shape[0], dtype=np.float32)
+            sw_train = self._compute_physics_sample_weights(physics_train, base_train)
+            base_val = sw_val.copy() if sw_val is not None else np.ones(X_val.shape[0], dtype=np.float32)
+            sw_val = self._compute_physics_sample_weights(physics_val, base_val)
 
         # Apply SMOTE/ADASYN to training data if enabled
         if self.use_smote and self.n_classes_ > 1 and sw_train is None:
@@ -535,23 +538,22 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         val_predictions: List[np.ndarray] = []
 
         # TabNet
-        if sw_train is None:
-            try:
-                tabnet = self._make_tabnet()
-                fit_kwargs = self._tabnet_fit_kwargs(X_train.shape[0])
-                tabnet.fit(
-                    X_train,
-                    y_train,
-                    eval_set=[(X_val, y_val)],
-                    **fit_kwargs,
-                )
-                models.append(tabnet)
-                names.append("tabnet")
-                val_predictions.append(self._normalise_proba(tabnet.predict_proba(X_val), self.n_classes_))
-            except Exception as exc:  # pragma: no cover - defensive
-                warnings.warn(f"TabNet training failed and will be skipped: {exc}", RuntimeWarning)
-        else:
-            print("  [INFO] Skipping TabNet base learner (sample weights unsupported).")
+        try:
+            tabnet = self._make_tabnet()
+            fit_kwargs = self._tabnet_fit_kwargs(X_train.shape[0])
+            if sw_train is not None:
+                fit_kwargs['weights'] = sw_train
+            tabnet.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_val, y_val)],
+                **fit_kwargs,
+            )
+            models.append(tabnet)
+            names.append("tabnet")
+            val_predictions.append(self._normalise_proba(tabnet.predict_proba(X_val), self.n_classes_))
+        except Exception as exc:  # pragma: no cover - defensive
+            warnings.warn(f"TabNet training failed and will be skipped: {exc}", RuntimeWarning)
 
         # CatBoost
         try:
@@ -728,7 +730,7 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         self.quantile_alpha = quantile_alpha
         self.huber_delta = huber_delta
 
-    def fit(self, X, y, sample_weight=None):
+    def fit(self, X, y, sample_weight=None, physics_frame: Optional[pd.DataFrame] = None):
         X_arr, y_arr = check_X_y(X, y, accept_sparse=False, y_numeric=True)
         X_arr = np.asarray(X_arr, dtype=np.float32)
         y_arr = np.asarray(y_arr, dtype=np.float32)
@@ -737,44 +739,56 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
             sample_weight = np.asarray(sample_weight, dtype=np.float32).ravel()
             if sample_weight.shape[0] != X_arr.shape[0]:
                 raise ValueError("sample_weight must match number of samples.")
-            X_train, X_val, y_train, y_val, sw_train, sw_val = train_test_split(
+            X_train, X_val, y_train, y_val, sw_train, sw_val, train_idx, val_idx = train_test_split(
                 X_arr,
                 y_arr,
                 sample_weight,
+                np.arange(X_arr.shape[0]),
                 test_size=self.validation_fraction,
                 random_state=self.random_state,
             )
         else:
-            X_train, X_val, y_train, y_val = train_test_split(
+            X_train, X_val, y_train, y_val, train_idx, val_idx = train_test_split(
                 X_arr,
                 y_arr,
+                np.arange(X_arr.shape[0]),
                 test_size=self.validation_fraction,
                 random_state=self.random_state,
             )
             sw_train = sw_val = None
+
+        physics_train = physics_val = None
+        if physics_frame is not None:
+            physics_train = physics_frame.iloc[train_idx].reset_index(drop=True)
+            physics_val = physics_frame.iloc[val_idx].reset_index(drop=True)
+
+        if physics_train is not None and self.physics_loss_fn is not None and self.physics_loss_weight > 0:
+            base_train = sw_train.copy() if sw_train is not None else np.ones(X_train.shape[0], dtype=np.float32)
+            sw_train = self._compute_physics_sample_weights(physics_train, base_train)
+            base_val = sw_val.copy() if sw_val is not None else np.ones(X_val.shape[0], dtype=np.float32)
+            sw_val = self._compute_physics_sample_weights(physics_val, base_val)
 
         models: List = []
         names: List[str] = []
         val_predictions: List[np.ndarray] = []
 
         # TabNet
-        if sw_train is None:
-            try:
-                tabnet = self._make_tabnet()
-                fit_kwargs = self._tabnet_fit_kwargs(X_train.shape[0])
-                tabnet.fit(
-                    X_train,
-                    y_train.reshape(-1, 1),
-                    eval_set=[(X_val, y_val.reshape(-1, 1))],
-                    **fit_kwargs,
-                )
-                models.append(tabnet)
-                names.append("tabnet")
-                val_predictions.append(np.asarray(tabnet.predict(X_val), dtype=np.float64).ravel())
-            except Exception as exc:  # pragma: no cover - defensive
-                warnings.warn(f"TabNet training failed and will be skipped: {exc}", RuntimeWarning)
-        else:
-            print("  [INFO] Skipping TabNet base learner (sample weights unsupported).")
+        try:
+            tabnet = self._make_tabnet()
+            fit_kwargs = self._tabnet_fit_kwargs(X_train.shape[0])
+            if sw_train is not None:
+                fit_kwargs['weights'] = sw_train
+            tabnet.fit(
+                X_train,
+                y_train.reshape(-1, 1),
+                eval_set=[(X_val, y_val.reshape(-1, 1))],
+                **fit_kwargs,
+            )
+            models.append(tabnet)
+            names.append("tabnet")
+            val_predictions.append(np.asarray(tabnet.predict(X_val), dtype=np.float64).ravel())
+        except Exception as exc:  # pragma: no cover - defensive
+            warnings.warn(f"TabNet training failed and will be skipped: {exc}", RuntimeWarning)
 
         # CatBoost
         try:
