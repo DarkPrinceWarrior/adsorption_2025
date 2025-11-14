@@ -1,198 +1,107 @@
-# Adsorb Synthesis Inverse-Design Pipeline
+# Adsorb Synthesis — конвейер инверсного проектирования сорбентов
 
-End-to-end system for inverse design of MOF adsorbents. The project ingests experimental synthesis data, engineers physico-chemical descriptors, trains a staged prediction pipeline, enforces physics constraints at inference time, and exposes reproducible CLI tooling for retraining, inference, and hyperparameter tuning.
-
----
-
-## Contents
-
-1. [Getting Started](#getting-started)
-2. [Repository Layout](#repository-layout)
-3. [Data Model](#data-model)
-   * [Raw inputs](#raw-inputs)
-   * [Engineered features](#engineered-features)
-   * [Physics-inferred fields](#physics-inferred-fields)
-4. [Model Pipeline](#model-pipeline)
-   * [Stage overview](#stage-overview)
-   * [Algorithms](#algorithms)
-   * [Physics enforcement](#physics-enforcement)
-5. [Command Line Workflows](#command-line-workflows)
-   * [Training](#training)
-   * [Inference](#inference)
-   * [Hyperparameter tuning](#hyperparameter-tuning)
-6. [Testing](#testing)
-7. [Extending the System](#extending-the-system)
-8. [Troubleshooting](#troubleshooting)
+Пайплайн обучает каскад моделей, которые по целевым адсорбционным характеристикам (W<sub>0</sub>, E<sub>0</sub>, S<sub>БЭТ</sub> и т. д.) восстанавливают параметры синтеза MOF-материала: металл, лиганд, массы прекурсоров, объём растворителя и температурные режимы. Все стадии используют общие словари дескрипторов, инженерные признаки и жёсткие физические ограничения (термодинамика, стехиометрия, температурные неравенства).
 
 ---
 
-## Getting Started
+## Быстрый старт
 
 ```bash
-# 1. Install dependencies (Python ≥ 3.10)
+# 1. Установить зависимости (Python ≥ 3.10)
 python -m pip install -r requirements.txt
 
-# 2. Train the full pipeline on supplied data
+# 2. Обучить конвейер на подготовленном датасете
 python scripts/train_inverse_design.py \
     --data data/SEC_SYN_with_features_DMFA_only_no_Y.csv \
-    --output artifacts
-#   --validation-mode strict  # optional: fail fast on invalid rows
+    --output artifacts \
+    --validation-mode strict    # строгая проверка данных (опционально)
 
-# 3. Generate predictions for new adsorption descriptors
+# 3. Получить предсказания по новым адсорбционным измерениям
 python scripts/predict_inverse_design.py \
     --model artifacts \
     --input tmp_inference_input.csv \
     --output tmp_predictions.csv \
-    --targets-only
-#   --validation-mode strict  # optional: validate adsorption inputs
+    --targets-only \
+    --validation-mode strict
 ```
 
-Prerequisites: CUDA is optional; the ensemble falls back to CPU. Optuna-based tuning additionally requires `optuna` (already listed in `requirements.txt`).
-
-Validation defaults to a soft `warn` mode that logs inconsistent adsorption or synthesis rows. Pass `--validation-mode strict` in any CLI (train, tune, predict, or physics checks) to abort on the first physical violation.
+- Все команды принимают `--validation-mode warn|strict` — в строгом режиме ошибки данных сразу приводят к остановке.
+- CUDA не требуется: ансамбль (TabNet + CatBoost + XGBoost) корректно работает на CPU.
 
 ---
 
-## Repository Layout
+## Структура репозитория
 
 ```
-adsorb_synthesis/
-├── data/                         # Raw and engineered datasets
-├── docs/                         # Supplementary analysis (if any)
-├── scripts/                      # CLI entry points
+├── scripts/                 # CLI
 │   ├── train_inverse_design.py
 │   ├── predict_inverse_design.py
 │   └── tune_inverse_design.py
 ├── src/adsorb_synthesis/
-│   ├── __init__.py
-│   ├── constants.py              # Feature lists, physics bounds, seeds
-│   ├── data_processing.py        # Loading, feature engineering, lookups
-│   ├── modern_models.py          # ModernTabular ensemble implementations
-│   ├── physics_losses.py         # Physics loss/regularisers & projectors
-│   └── pipeline.py               # Stage configs, training & inference
-├── tests/                        # Pytest-based sanity checks
-├── requirements.txt
+│   ├── constants.py         # списки признаков, физические диапазоны, seeds
+│   ├── data_processing.py   # загрузка, фичи, look-up таблицы, термодинамика
+│   ├── modern_models.py     # ансамбль TabNet/CatBoost/XGBoost с физ. весами
+│   ├── physics_losses.py    # валидатор, штрафы, проекторы
+│   └── pipeline.py          # StageConfig, обучение, инференс
+├── tests/                   # pytest
+├── data/                    # исходные и подготовленные CSV
+├── artifacts/               # модельные артефакты после обучения
 └── README.md
 ```
 
-Artifacts produced by `train_inverse_design.py` live under the configured output directory (`artifacts/` by default) and include stage pipelines, lookup tables, and metadata for reload.
+---
+
+## Данные и инженерные признаки
+
+- **Сырые входы:** `data/SEC_SYN_with_features_DMFA_only_no_Y.csv` — очищенный датасет (только растворитель ДМФА, без металла Y).
+- **Инженерные признаки (data_processing.py):**
+  - `_ensure_adsorption_features` — проверяет базовые столбцы и достраивает вторичные величины (`Adsorption_Potential`, `S_BET_E`, `x0_W0`, и др.).
+  - `add_salt_mass_features` — концентрации, лог-скейлы, стехиометрические отношения, температурные производные.
+  - `add_thermodynamic_features` — пересчёт `K_eq ↔ ΔG` при фактической температуре синтеза. Оригинальные измерения не затираются: добавляются `Delta_G_equilibrium`, `K_equilibrium_from_delta_G`, `Delta_G_residual`, `K_equilibrium_ratio`.
+  - `add_temperature_categories` — категоризация `Tsyn`, `Tdry`, `Treg`.
+  - `build_lookup_tables` — словари дескрипторов металлов, лигандов и растворителей.
 
 ---
 
-## Data Model
+## Пайплайн и физические ограничения
 
-### Raw inputs
+### Стадии `default_stage_configs()`
 
-* `data/SEC_SYN_new.csv` – raw synthesis experiments with process metadata.
-* `data/SEC_SYN_with_features_DMFA_only_no_Y.csv` – curated training/inference dataset (DMFA solvent only, Y-metal excluded) with engineered descriptors.
+1. `metal` — классификация металла по адсорбционному профилю.
+2. `ligand` — выбор лиганда с учётом предсказанного металла.
+3. `salt_mass` — регрессия log1p массы соли (StageConfig хранит `target_transform="log1p"` и `invert_target_to="m (соли), г"`).
+4. `acid_mass`, `solvent_volume` — регрессии массы кислоты и объёма растворителя.
+5. `tsyn_category`, `tdry_category`, `treg_category` — классификация температурных диапазонов.
 
-### Engineered features
+Каждая стадия описывает зависимости (`depends_on`) и набор признаков; пайплайн автоматически применяет/обращает таргет-трансформы при обучении и предсказании.
 
-`src/adsorb_synthesis/data_processing.py` is responsible for
+### Физика
 
-1. `load_dataset`: reading CSV, cloning the frame, and orchestrating feature builders.
-2. `_ensure_adsorption_features`: deriving adsorption descriptors if absent (surface/pore metrics, energy ratios, etc.).
-3. `add_temperature_categories`: binning numeric temperatures into three process-specific categories (`Tsyn`, `Tdry`, `Treg`).
-4. `add_salt_mass_features`: log transforms, categorical composites (`Metal_Ligand_Combo`), and metal flags.
-5. `build_lookup_tables`: generating descriptor lookups for metal, ligand, solvent to fill missing categorical information at inference time.
-
-Feature group constants are centralised in `src/adsorb_synthesis/constants.py`:
-
-| Group                        | Description                                                                    |
-|------------------------------|--------------------------------------------------------------------------------|
-| `ADSORPTION_FEATURES`        | Raw adsorption measurements and engineered ratios (`W0`, `E0`, `S_BET_E`, etc.) |
-| `METAL_DESCRIPTOR_FEATURES`  | Descriptor columns supplied via lookup (molar weights, ionic radius, etc.)     |
-| `LIGAND_DESCRIPTOR_FEATURES` | Structural descriptors and molar quantities for ligands                        |
-| `SOLVENT_DESCRIPTOR_FEATURES`| Basic solvent phys-chem descriptors                                            |
-| `PROCESS_CONTEXT_FEATURES`   | Currently `Mix_solv_ratio`, can be extended with process context                |
-
-### Physics-inferred fields
-
-During loading and inference the pipeline derives thermodynamic helpers:
-
-* `Delta_G_equilibrium` – Gibbs free energy inferred from measured `K_equilibrium` and actual synthesis temperature.
-* `K_equilibrium_from_delta_G` – Theoretical `K_eq` computed from dataset-provided `Delta_G`.
-* `Delta_G_residual` / `K_equilibrium_ratio` – Diagnostics showing deviation between supplied and equilibrium-consistent values.
-* `n_соли`, `n_кислоты`, `n_ratio`, `n_ratio_residual` – Stoichiometric molar quantities and deviation from the admissible range `[0.45, 2.3]`.
-
-These fields enable thermodynamic and stoichiometric enforcement during inference.
+- **Валидаторы данных (`validate_SEH_data`, `validate_synthesis_data`)** — проверяют границы адсорбции, порядок температур, `T_syn` против точки кипения растворителя.
+- **PhysicsConstraintEvaluator** — кроме диапазонов (`BoundConstraint`) использует:
+  - `EqualityConstraint` (`a0 = 28.86·W0`);
+  - `RatioConstraint` (`E/E0 = 1/3`);
+  - `InequalityConstraint` (`Ws ≥ W0`).
+- **`physics_violation_scores`** → веса выборки: теперь вычисляются векторно по подготовленному DataFrame, и TabNet получает те же веса, что CatBoost/XGBoost.
+- **Проекции после инференса:** `project_thermodynamics` (делает `K_eq = exp(-ΔG/RT)`), `_project_stoichiometry` (отдельные цели для каждой пары металл-лиганд), `_enforce_temperature_limits` (числовая проверка + точки кипения).
 
 ---
 
-## Model Pipeline
+## CLI-потоки
 
-### Stage overview
-
-`default_stage_configs()` defines the sequential inverse-design workflow:
-
-1. **`metal`** *(classification)* – Predicts the metal species from adsorption descriptors.
-2. **`ligand`** *(classification)* – Predicts the ligand conditioned on adsorption profile and predicted metal.
-3. **`salt_mass`** *(regression)* – Estimates log-transformed salt mass (Huber/IsolationForest for outliers).
-4. **`acid_mass`** *(regression)* – Predicts acid mass given salt and stoichiometry.
-5. **`solvent_volume`** *(regression)* – Recommends solvent volume.
-6. **`tsyn_category`**, **`tdry_category`**, **`treg_category`** *(classification)* – Classify temperature regimes for synthesis, drying, regeneration.
-
-Each stage records dependencies via `StageConfig.depends_on`, ensuring features predicted upstream are accessible downstream.
-
-### Algorithms
-
-The ensemble models (`modern_models.py`) combine TabNet, CatBoost, and XGBoost:
-
-* **TabNet** – 3 steps, `n_d=n_a=32`, AdamW (`lr=8e-3`), CosineAnnealingLR, sparsemax masks for classification.
-* **CatBoost** – depth 8, 1600 iterations, MAE loss for regressions, explicit class weights (no auto balancing).
-* **XGBoost** – histogram tree method, depth 5, 1600 estimators, pseudo-Huber loss for regressions.
-* Ensemble weights are optimised via SciPy SLSQP to minimise Brier score / MAE with L2 regularisation.
-
-Sampling and class imbalance handling:
-
-* Optional ADASYN/SMOTE for classification stages (skipped if sample weights are supplied by physics regularisation).
-* Focal-style class weighting to emphasise minority classes.
-* `IsolationForest` trimming for regression outliers when configured.
-
-### Physics enforcement
-
-Physics integration is woven throughout the pipeline:
-
-| Enforcement Layer      | Mechanism                                                                                           |
-|------------------------|-----------------------------------------------------------------------------------------------------|
-| **Loss regularisation**| `combined_physics_loss` penalises deviations from Gibbs equilibrium and adsorption energy bounds.   |
-| **Sample weighting**   | Physics penalty per-sample increases training weight for physically inconsistent observations.      |
-| **Thermodynamic projection** | `project_thermodynamics` overwrites `K_equilibrium` and `Delta_G_equilibrium` to satisfy `K = exp(-ΔG/RT)`. |
-| **Stoichiometry clamp**| `_project_stoichiometry` rescales acid mass to keep `n_ratio` in `[0.45, 2.3]`.                      |
-| **Temperature order**  | `_enforce_temperature_order` ensures `Tdry ≥ Tsyn` and `Treg ≥ Tdry`.                               |
-
-Physics loss defaults (from Optuna tuning):
-
-```
-physics_weight = 0.017
-w_thermo        = 0.175
-w_energy        = 0.061
-```
-
-These can be retuned with `tune_inverse_design.py` (see below).
-
----
-
-## Command Line Workflows
-
-### Training
+### Обучение
 
 ```
 python scripts/train_inverse_design.py \
     --data data/SEC_SYN_with_features_DMFA_only_no_Y.csv \
-    --output artifacts
+    --output artifacts \
+    --validation-mode strict
 ```
 
-The command:
+- После тренировки выводятся метрики по стадиям и `cv_mean/cv_std`.
+- В `artifacts/` сохраняются пайплайны, lookup-таблицы и `pipeline_metadata.joblib`, который содержит StageConfig (включая `target_transform`, `physics_weight`, зависимости).
 
-1. Loads the dataset and derives missing descriptors.
-2. Builds lookup tables for categorical augmentation.
-3. Trains every stage (with cross-validation reporting).
-4. Saves pipelines, lookup tables, and metadata into the output directory.
-
-Artifacts include `<stage>_pipeline.joblib`, lookup `joblib`s, and `pipeline_metadata.joblib` for reproducible reloads via `InverseDesignPipeline.load()`.
-
-### Inference
+### Инференс
 
 ```
 python scripts/predict_inverse_design.py \
@@ -202,79 +111,34 @@ python scripts/predict_inverse_design.py \
     --targets-only
 ```
 
-Options:
+- Параметр `--targets-only` оставляет только финальные цели; без него выдаётся полный DataFrame с промежуточными признаками и физическими диагностическими колонками.
+- Постобработка автоматически исправляет температурные и стехиометрические нарушения, а лог отображает корректировки (пример: «Adjusted Tdry_Category...»).
 
-* `--targets-only` – return only stage outputs (metal, ligand, reagent masses, temps).
-* Without `--targets-only`, the tool returns a superset including engineered features, physics diagnostics (`Delta_G_residual`, `n_ratio_residual`), and input columns.
-* By default the CLI enforces physics corrections (`thermo → stoichiometry → temperature order`). Use `--disable-physics` (flag exposed in the script) to inspect raw model predictions.
+### Тюнинг
 
-### Hyperparameter tuning
+`python scripts/tune_inverse_design.py` — запускает Optuna-эксперимент для подбора `physics_weight`, `w_thermo`, `w_energy`, гиперпараметров ансамбля. Результаты сохраняются в `artifacts/tuning/`.
 
-`scripts/tune_inverse_design.py` wraps Optuna multi-objective optimisation (maximise metal balanced accuracy, minimise physics penalty).
+---
+
+## Тесты
 
 ```
-python scripts/tune_inverse_design.py \
-    --data data/SEC_SYN_with_features_DMFA_only_no_Y.csv \
-    --trials 20 \
-    --subset 200 \
-    --n-jobs 1
+PYTHONPATH=. pytest
 ```
 
-Results include the Pareto front with associated `physics_weight`, `w_thermo`, `w_energy`, and diagnostic MAE values (`ΔG_residual`, `n_ratio_residual`). Chosen parameters can be applied by editing `default_stage_configs()`.
+Набор покрывает:
+- проверку инженерных и термодинамических колонок (`tests/test_feature_engineering.py`);
+- стехиометрию, температурные коррекции и физические ограничения (`tests/test_physics_constraints.py`);
+- корректность физ. весов в ансамбле (`tests/test_modern_models.py`);
+- валидацию и словари молярных масс.
 
 ---
 
-## Testing
+## Расширение системы
 
-Lightweight sanity checks live under `tests/`. To run them (requires `pytest`):
+- **Новые признаки** добавляйте в `constants.py` (соответствующие списки) и в `data_processing.py` — так стадии автоматически увидят их через `StageConfig.feature_columns`.
+- **Дополнительные ограничения** встраивайте в `PhysicsConstraintEvaluator`: реализованы структуры для диапазонов, равенств, отношений и неравенств.
+- **Новые стадии** добавляйте в `default_stage_configs()`, описав зависимости и (при необходимости) физические столбцы (`physics_columns`), которые нужно передавать в модель.
+- **Пакеты** — при необходимости добавляйте в `requirements.txt`, так как проект не использует `pyproject.toml`.
 
-```bash
-python -m pip install pytest
-python -m pytest tests
-```
-
-`tests/test_physics_constraints.py` currently verifies:
-
-* Thermodynamic projection aligns `K_equilibrium` with `Delta_G_equilibrium`.
-* Stoichiometry post-processing clamps `n_ratio` and zeroes residuals.
-* Temperature category ordering never violates process monotonicity.
-
-Add further tests as the pipeline evolves (e.g. CLI smoke tests, stage-specific metric assertions).
-
----
-
-## Extending the System
-
-1. **New stages** – Add to `default_stage_configs()`, supply feature lists, dependencies, and update CLI output formatting if necessary.
-2. **Alternate models** – Modify `_default_classifier` / `_default_regressor` to inject custom estimators or adjust ensemble parameters.
-3. **Additional physics** – Implement new loss components in `physics_losses.py` and include them via `PhysicsConstraintEvaluator`.
-4. **Feature engineering** – Extend `data_processing.py` with new descriptor builders or ingestion routines.
-5. **Packaging** – Adopt `pyproject.toml` or `poetry` for reproducible environments when distributing beyond a notebooks/CLI workflow.
-
----
-
-## Troubleshooting
-
-| Symptom | Possible cause & resolution |
-|---------|-----------------------------|
-| `ValueError: Missing required features …` | Input CSV lacks expected columns; run `load_dataset` on the file to auto-generate derived columns or update the dataset schema. |
-| CatBoost training skipped with class-weight warnings | Ensure `catboost` ≥ 1.2 (installed via requirements) – the project disables `auto_class_weights` when manual weights are provided. |
-| Physics penalty remains high | Inspect `Delta_G_residual` and `n_ratio_residual` in predictions; retune loss weights via Optuna or investigate data inconsistencies. |
-| Optuna run fails with CUDA messages | TabNet detects CUDA; set `CUDA_VISIBLE_DEVICES=` to disable GPU if the environment lacks a compatible GPU. |
-| Tests fail complaining about missing `pytest` | Install testing dependencies (`python -m pip install pytest`) before running `python -m pytest`. |
-
-For deeper debugging, inspect individual stage pickles (`joblib.load`) or enable verbose logging inside `ModernTabularEnsembleClassifier/Regressor`.
-
----
-
-## Changelog Snapshot
-
-* Thermodynamic projections ensure `K_equilibrium = exp(-ΔG/RT)` at inference time.
-* Stoichiometric post-processing clamps `n_ratio` and readjusts acid mass accordingly.
-* Temperature classification outputs are monotonically ordered (`Tsyn ≤ Tdry ≤ Treg`).
-* Physics loss weights initialised from Optuna search (`physics_weight=0.017`, `w_thermo=0.175`, `w_energy=0.061`).
-* Optuna tuning CLI prints ΔG/n_ratio residual MAE to evaluate physical fidelity alongside accuracy.
-
----
-
-© 2025 — Adsorb Synthesis Inverse-Design. All rights reserved.
+Любые изменения данных или моделей рекомендуется сопровождать: (1) повторным `train_inverse_design.py`, (2) `predict_inverse_design.py` на контрольной выборке и (3) прогоном `pytest`.
