@@ -12,7 +12,7 @@ from src.adsorb_synthesis.physics_losses import (
     project_thermodynamics,
 )
 from src.adsorb_synthesis.pipeline import (
-    _enforce_temperature_order,
+    _enforce_temperature_limits,
     _project_stoichiometry,
     _update_stoichiometry_features,
 )
@@ -36,54 +36,57 @@ def test_project_thermodynamics_aligns_k_and_delta_g():
 def test_project_stoichiometry_respects_targets_and_fallback():
     default_lower, default_upper = DEFAULT_STOICHIOMETRY_BOUNDS
     df = pd.DataFrame({
-        'Металл': ['Cu', 'Xx'],
-        'Лиганд': ['BTC', 'Unknown'],
-        'm (соли), г': [10.0, 10.0],
-        'Молярка_соли': [100.0, 100.0],
-        'm(кис-ты), г': [10.0, 25.0],
-        'Молярка_кислоты': [200.0, 500.0],
+        'Металл': ['Cu', 'Cu', 'Xx'],
+        'Лиганд': ['BTC', 'BTC', 'Unknown'],
+        'm (соли), г': [10.0, 10.0, 10.0],
+        'Молярка_соли': [100.0, 100.0, 100.0],
+        'm(кис-ты), г': [13.333333, 8.0, 1.0],
+        'Молярка_кислоты': [200.0, 200.0, 500.0],
     })
     _update_stoichiometry_features(df)
     _project_stoichiometry(df)
     _update_stoichiometry_features(df)
 
-    # Row 0 should be projected to Cu-BTC target (1.5 ± tol)
-    target_ratio = df.loc[0, 'n_ratio_target']
-    assert np.isclose(target_ratio, 1.5, atol=1e-6)
+    # Row 0 already within tolerance so mass stays unchanged
+    assert np.isclose(df.loc[0, 'n_ratio'], 1.5, atol=1e-6)
     assert abs(df.loc[0, 'n_ratio_residual']) < 1e-6
 
-    # Row 1 uses fallback bounds
-    assert np.isnan(df.loc[1, 'n_ratio_target'])
-    assert df.loc[1, 'n_ratio_lower'] <= df.loc[1, 'n_ratio'] <= df.loc[1, 'n_ratio_upper']
-    assert np.isclose(df.loc[1, 'n_ratio_lower'], default_lower)
-    assert np.isclose(df.loc[1, 'n_ratio_upper'], default_upper)
-    assert abs(df.loc[1, 'n_ratio_residual']) < 1e-6
+    # Row 1 is pushed to the exact Cu-BTC target ratio
+    assert np.isclose(df.loc[1, 'n_ratio_target'], 1.5, atol=1e-6)
+    assert abs(df.loc[1, 'n_ratio'] - 1.5) < 1e-6
+    assert df.loc[1, 'm(кис-ты), г'] != pytest.approx(8.0)
+
+    # Row 2 uses fallback bounds and is clipped to default upper limit
+    assert np.isnan(df.loc[2, 'n_ratio_target'])
+    assert np.isclose(df.loc[2, 'n_ratio'], default_upper, atol=1e-6)
+    assert np.isclose(df.loc[2, 'n_ratio_upper'], default_upper, atol=1e-6)
+    assert df.loc[2, 'n_ratio'] <= df.loc[2, 'n_ratio_upper']
 
 
-def test_enforce_temperature_order_monotonic():
+def test_enforce_temperature_limits_monotonic_and_boiling():
     df = pd.DataFrame({
-        'Tsyn_Category': ['Низкая (<115°C)', 'Средняя (115-135°C)', np.nan],
-        'Tdry_Category': ['Низкая (<115°C)', 'Низкая (<115°C)', 'Высокая (>135°C)'],
-        'Treg_Category': ['Высокая (>265°C)', 'Средняя (155-265°C)', 'Низкая (<155°C)'],
+        'Tsyn_Category': ['Средняя (115-135°C)', 'Высокая (>135°C)'],
+        'Tdry_Category': ['Низкая (<115°C)', 'Высокая (>135°C)'],
+        'Treg_Category': ['Низкая (<155°C)', 'Низкая (<155°C)'],
+        'Растворитель': ['ДМФА', 'Метанол'],
+        'Т.син., °С': [np.nan, np.nan],
+        'Т суш., °С': [np.nan, np.nan],
+        'Tрег, ᵒС': [np.nan, np.nan],
     })
 
-    _enforce_temperature_order(df)
+    _enforce_temperature_limits(df)
 
-    categories = ['Низкая (<115°C)', 'Средняя (115-135°C)', 'Высокая (>135°C)']
-    reg_categories = ['Низкая (<155°C)', 'Средняя (155-265°C)', 'Высокая (>265°C)']
+    # Row 0: drying/regeneration cannot be below synthesis category
+    assert df.loc[0, 'Tdry_Category'] != 'Низкая (<115°C)'
+    assert df.loc[0, 'Т суш., °С'] >= df.loc[0, 'Т.син., °С']
+    assert df.loc[0, 'Tрег, ᵒС'] >= df.loc[0, 'Т суш., °С']
 
-    def order(series, order_list):
-        mapping = {label: idx for idx, label in enumerate(order_list)}
-        return series.map(mapping)
-
-    syn_ord = order(df['Tsyn_Category'], categories)
-    dry_ord = order(df['Tdry_Category'], categories)
-    reg_ord = order(df['Treg_Category'], reg_categories)
-
-    dry_ok = (dry_ord >= syn_ord) | syn_ord.isna()
-    reg_ok = (reg_ord >= dry_ord) | dry_ord.isna()
-    assert dry_ok.fillna(True).all()
-    assert reg_ok.fillna(True).all()
+    # Row 1: synthesis temperature must stay below methanol boiling point (~65°C)
+    assert df.loc[1, 'Tsyn_Category'] == 'Низкая (<115°C)'
+    assert df.loc[1, 'Т.син., °С'] < 65.0
+    assert df.loc[1, 'Т суш., °С'] >= df.loc[1, 'Т.син., °С']
+    assert df.loc[1, 'Tрег, ᵒС'] >= df.loc[1, 'Т суш., °С']
+    assert df.loc[1, 'Treg_Category'] != 'Низкая (<155°C)'
 
 
 def test_physics_evaluator_enforces_new_constraint_types():

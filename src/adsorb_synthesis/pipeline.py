@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
+import logging
 
 import joblib
 import numpy as np
@@ -32,6 +33,7 @@ from .constants import (
     DEFAULT_STOICHIOMETRY_BOUNDS,
     PROCESS_CONTEXT_FEATURES,
     RANDOM_SEED,
+    SOLVENT_BOILING_POINTS_C,
     SOLVENT_DESCRIPTOR_FEATURES,
     STOICHIOMETRY_TARGETS,
     TEMPERATURE_CATEGORIES,
@@ -74,6 +76,8 @@ class StageConfig:
     physics_evaluator: Optional[PhysicsConstraintEvaluator] = None
     physics_loss_kwargs: Optional[Dict[str, float]] = None
     physics_columns: Sequence[str] = ()
+    target_transform: Optional[str] = None
+    invert_target_to: Optional[str] = None
 
 
 @dataclass
@@ -85,6 +89,51 @@ class StageResult:
     cv_mean: float
     cv_std: float
     feature_columns: List[str]
+
+
+logger = logging.getLogger(__name__)
+
+
+def _apply_target_transform(values: pd.Series, transform: Optional[str]) -> pd.Series:
+    """Apply configured transform to a Series."""
+
+    if transform is None:
+        return pd.to_numeric(values, errors='coerce')
+    numeric = pd.to_numeric(values, errors='coerce').to_numpy(dtype=np.float64, copy=False)
+    if transform == "log1p":
+        with np.errstate(divide="ignore", invalid="ignore"):
+            transformed = np.log1p(numeric)
+    else:
+        raise ValueError(f"Unsupported target transform '{transform}'")
+    return pd.Series(transformed, index=values.index)
+
+
+def _invert_target_transform(values: pd.Series, transform: Optional[str]) -> pd.Series:
+    """Invert a transformed Series back to its physical scale."""
+
+    numeric = pd.to_numeric(values, errors='coerce').to_numpy(dtype=np.float64, copy=False)
+    if transform is None:
+        inverted = numeric
+    elif transform == "log1p":
+        with np.errstate(divide="ignore", invalid="ignore"):
+            inverted = np.expm1(numeric)
+    else:
+        raise ValueError(f"Unsupported target transform '{transform}'")
+    return pd.Series(inverted, index=values.index)
+
+
+def _ensure_stage_target_column(df: pd.DataFrame, stage: StageConfig) -> None:
+    """Guarantee that the transformed target column exists when needed."""
+
+    if stage.target in df.columns:
+        return
+    source = stage.invert_target_to
+    if source is None or source not in df.columns:
+        return
+    if stage.target_transform:
+        df[stage.target] = _apply_target_transform(df[source], stage.target_transform)
+    else:
+        df[stage.target] = pd.to_numeric(df[source], errors='coerce')
 
 
 def _default_classifier(
@@ -226,6 +275,8 @@ def default_stage_configs() -> List[StageConfig]:
             estimator_factory=_default_regressor,  # Back to Huber - log-space is linear-friendly
             depends_on=("Металл", "Лиганд"),
             outlier_contamination=0.02,  # Reduced from 0.05 - keep more data
+            target_transform="log1p",
+            invert_target_to="m (соли), г",
             description="Estimate required salt mass (log-transformed) for synthesis stage.",
         ),
         StageConfig(
@@ -337,6 +388,7 @@ class InverseDesignPipeline:
         self.stage_results.clear()
 
         for stage in self.stage_configs:
+            _ensure_stage_target_column(data, stage)
             stage_data = self._prepare_stage_dataframe(data, stage)
             if stage_data.empty:
                 raise ValueError(f"Stage '{stage.name}' has no data after preprocessing")
@@ -358,12 +410,11 @@ class InverseDesignPipeline:
                 feature_columns=list(stage.feature_columns),
             )
 
-            # Store predictions, inverse-transform log_salt_mass if needed
-            if stage.target == "log_salt_mass":
-                data["m (соли), г"] = np.expm1(stage_data[stage.target])  # Transform back to original
-                data[stage.target] = stage_data[stage.target]  # Keep log version too
-            else:
-                data[stage.target] = stage_data[stage.target]
+            # Persist transformed and inverted targets for downstream stages
+            data.loc[stage_data.index, stage.target] = stage_data[stage.target]
+            if stage.invert_target_to:
+                inverted = _invert_target_transform(stage_data[stage.target], stage.target_transform)
+                data.loc[stage_data.index, stage.invert_target_to] = inverted
 
         self._trained = True
 
@@ -399,13 +450,12 @@ class InverseDesignPipeline:
 
             stage_result = self.stage_results[stage.name]
             predictions = stage_result.pipeline.predict(results[features])
-            
-            # Inverse-transform log_salt_mass predictions
-            if stage.target == "log_salt_mass":
-                results["m (соли), г"] = np.expm1(predictions)  # Transform back
-                results[stage.target] = predictions  # Keep log version
-            else:
-                results[stage.target] = predictions
+
+            pred_series = pd.Series(predictions, index=results.index, name=stage.target)
+            results[stage.target] = pred_series
+            if stage.invert_target_to:
+                inversed = _invert_target_transform(pred_series, stage.target_transform)
+                results[stage.invert_target_to] = inversed
 
         if enforce_physics:
             results = project_thermodynamics(
@@ -416,11 +466,14 @@ class InverseDesignPipeline:
             )
             add_thermodynamic_features(results)
             _project_stoichiometry(results)
-            _enforce_temperature_order(results)
+            _enforce_temperature_limits(results)
+            add_thermodynamic_features(results)
 
         if not return_intermediate:
-            targets = [stage.target if stage.target != "log_salt_mass" else "m (соли), г"
-                      for stage in self.stage_configs]
+            targets = [
+                stage.invert_target_to or stage.target
+                for stage in self.stage_configs
+            ]
             return results[targets]
         return results
 
@@ -458,6 +511,8 @@ class InverseDesignPipeline:
                 'physics_weight': stage.physics_weight,
                 'physics_columns': list(stage.physics_columns),
                 'physics_loss_kwargs': dict(stage.physics_loss_kwargs) if stage.physics_loss_kwargs else None,
+                'target_transform': stage.target_transform,
+                'invert_target_to': stage.invert_target_to,
             })
 
         if self.lookup_tables is not None:
@@ -508,6 +563,8 @@ class InverseDesignPipeline:
                 physics_evaluator=physics_evaluator,
                 physics_loss_kwargs=physics_loss_kwargs,
                 physics_columns=physics_columns,
+                target_transform=stage_meta.get('target_transform'),
+                invert_target_to=stage_meta.get('invert_target_to'),
             ))
 
         pipeline = cls(stage_configs=stage_configs, random_state=metadata.get('random_state', RANDOM_SEED))
@@ -863,8 +920,22 @@ def _project_stoichiometry(df: pd.DataFrame) -> None:
 
     lower_bounds, upper_bounds, target_arr, _ = _compute_stoichiometry_bounds(df)
 
-    clip_target = np.clip(ratio, lower_bounds, upper_bounds)
-    desired_ratio = np.where(np.isfinite(target_arr), target_arr, clip_target)
+    desired_ratio = np.array(ratio, copy=True)
+    fallback_mask = ~np.isfinite(target_arr)
+    if np.any(fallback_mask):
+        desired_ratio[fallback_mask] = np.clip(
+            ratio[fallback_mask],
+            lower_bounds[fallback_mask],
+            upper_bounds[fallback_mask],
+        )
+
+    target_mask = np.isfinite(target_arr)
+    if np.any(target_mask):
+        within_tolerance = (
+            (ratio >= lower_bounds) & (ratio <= upper_bounds)
+        )
+        target_adjust = target_mask & ~within_tolerance
+        desired_ratio[target_adjust] = target_arr[target_adjust]
 
     adjust_mask = (
         np.isfinite(desired_ratio)
@@ -884,46 +955,148 @@ def _project_stoichiometry(df: pd.DataFrame) -> None:
         where=desired_ratio > 0,
     )
     new_acid_mass = target_n_acid * molar_acid
-    df.loc[adjust_mask, 'm(кис-ты), г'] = new_acid_mass[adjust_mask]
+
+    values = new_acid_mass[adjust_mask]
+    column_dtype = df['m(кис-ты), г'].dtype
+    if np.issubdtype(column_dtype, np.floating):
+        values = values.astype(column_dtype, copy=False)
+    df.loc[adjust_mask, 'm(кис-ты), г'] = values
 
     _update_stoichiometry_features(df)
 
 
-def _enforce_temperature_order(df: pd.DataFrame) -> None:
-    """Ensure drying and regeneration categories are not below synthesis category."""
+_TEMPERATURE_SEQUENCE = (
+    ('Tsyn_Category', 'Т.син., °С'),
+    ('Tdry_Category', 'Т суш., °С'),
+    ('Treg_Category', 'Tрег, ᵒС'),
+)
 
-    sequence = ['Tsyn_Category', 'Tdry_Category', 'Treg_Category']
-    order_maps = {
-        name: {label: idx for idx, label in enumerate(TEMPERATURE_CATEGORIES[name]['labels'])}
-        for name in sequence
-        if name in TEMPERATURE_CATEGORIES
-    }
-    inverse_maps = {
-        name: {idx: label for idx, label in enumerate(TEMPERATURE_CATEGORIES[name]['labels'])}
-        for name in sequence
-        if name in TEMPERATURE_CATEGORIES
+
+def _temperature_midpoints(name: str) -> Dict[str, float]:
+    spec = TEMPERATURE_CATEGORIES.get(name)
+    if spec is None:
+        return {}
+    bins = spec['bins']
+    labels = spec['labels']
+    return {
+        label: float((bins[idx] + bins[idx + 1]) / 2.0)
+        for idx, label in enumerate(labels)
     }
 
-    prev_numeric: Optional[np.ndarray] = None
-    for name in sequence:
-        if name not in df.columns or name not in order_maps:
-            prev_numeric = None
+
+def _numeric_to_temperature_category(values: np.ndarray, name: str, index: pd.Index) -> pd.Series:
+    spec = TEMPERATURE_CATEGORIES.get(name)
+    if spec is None:
+        return pd.Series(np.nan, index=index, dtype=object)
+    bins = np.asarray(spec['bins'], dtype=float)
+    labels = spec['labels']
+    series = pd.Series(values, index=index, dtype=float)
+    upper = bins[-1] - 1e-6
+    series = series.clip(lower=bins[0], upper=upper)
+    categories = pd.cut(series, bins=bins, labels=labels, include_lowest=True, right=False)
+    return categories.astype(object)
+
+
+def _max_temperature_below(limit: float, category_name: str) -> float:
+    spec = TEMPERATURE_CATEGORIES.get(category_name)
+    if spec is None or not np.isfinite(limit):
+        return limit
+    bins = np.asarray(spec['bins'], dtype=float)
+    midpoints = np.array([(bins[i] + bins[i + 1]) / 2.0 for i in range(len(bins) - 1)], dtype=float)
+    candidates = midpoints[midpoints < limit]
+    if candidates.size > 0:
+        return float(np.max(candidates))
+    return float(max(limit - 1.0, bins[0]))
+
+
+def _enforce_temperature_limits(df: pd.DataFrame) -> None:
+    """Enforce monotonic temperatures and solvent boiling constraints."""
+
+    if df.empty:
+        return
+
+    numeric_values: Dict[str, np.ndarray] = {}
+
+    for category, numeric_col in _TEMPERATURE_SEQUENCE:
+        spec = TEMPERATURE_CATEGORIES.get(category)
+        if spec is None:
             continue
 
-        mapping = order_maps[name]
-        inverse = inverse_maps[name]
-        arr = df[name].map(mapping).to_numpy(dtype=float, copy=True)
-        max_index = len(mapping) - 1
+        midpoint_map = _temperature_midpoints(category)
 
-        valid = np.isfinite(arr)
-        arr[valid] = np.clip(arr[valid], 0, max_index)
+        numeric_series = pd.Series(np.nan, index=df.index, dtype=float)
+        if numeric_col in df.columns:
+            numeric_series = pd.to_numeric(df[numeric_col], errors='coerce')
+        if category in df.columns:
+            numeric_from_category = df[category].map(midpoint_map)
+            numeric_series = numeric_series.fillna(numeric_from_category)
+        else:
+            df[category] = np.nan
 
-        if prev_numeric is not None:
-            valid_both = valid & np.isfinite(prev_numeric)
-            arr[valid_both] = np.maximum(arr[valid_both], prev_numeric[valid_both])
+        values = numeric_series.to_numpy(dtype=float, copy=True)
+        numeric_values[category] = values
 
-        # Update column with corrected category labels
-        updated = pd.Series(arr, index=df.index)
-        df[name] = updated.map(inverse).where(~updated.isna(), np.nan)
+    # Enforce solvent boiling constraint for synthesis temperature
+    syn_values = numeric_values.get('Tsyn_Category')
+    if syn_values is not None and 'Растворитель' in df.columns:
+        lookup = {str(k).strip().lower(): v for k, v in SOLVENT_BOILING_POINTS_C.items()}
+        solvents = df['Растворитель'].astype(str).str.strip().str.lower()
+        boiling = solvents.map(lookup).to_numpy(dtype=float, copy=False)
+        violation_mask = (
+            np.isfinite(syn_values)
+            & np.isfinite(boiling)
+            & (syn_values >= boiling)
+        )
+        if np.any(violation_mask):
+            indices = np.where(violation_mask)[0]
+            for idx in indices:
+                row = df.index[idx]
+                solvent = df.at[row, 'Растворитель']
+                limit = boiling[idx]
+                previous = syn_values[idx]
+                new_value = min(_max_temperature_below(limit, 'Tsyn_Category'), limit - 1.0)
+                new_value = max(new_value, 0.0)
+                syn_values[idx] = new_value
+                logger.warning(
+                    "Adjusted Tsyn_Category at row %s: %.1f°C exceeds boiling point of %s (%.1f°C). "
+                    "Projected to %.1f°C.",
+                    row,
+                    previous,
+                    solvent,
+                    limit,
+                    new_value,
+                )
+            numeric_values['Tsyn_Category'] = syn_values
 
-        prev_numeric = arr
+    prev_values: Optional[np.ndarray] = None
+    for category, numeric_col in _TEMPERATURE_SEQUENCE:
+        values = numeric_values.get(category)
+        if values is None:
+            prev_values = None
+            continue
+
+        spec = TEMPERATURE_CATEGORIES.get(category)
+        bins = np.asarray(spec['bins'], dtype=float)
+        finite_mask = np.isfinite(values)
+        values[finite_mask] = np.clip(values[finite_mask], bins[0], bins[-1] - 1e-6)
+
+        if prev_values is not None:
+            mask = finite_mask & np.isfinite(prev_values)
+            adjust_mask = mask & (values < prev_values)
+            if np.any(adjust_mask):
+                old_vals = values[adjust_mask].copy()
+                new_vals = prev_values[adjust_mask]
+                rows = df.index[np.where(adjust_mask)[0]]
+                for row, previous, new_value in zip(rows, old_vals, new_vals):
+                    logger.warning(
+                        "Adjusted %s at row %s to maintain thermal order (%.1f°C -> %.1f°C).",
+                        category,
+                        row,
+                        previous,
+                        new_value,
+                    )
+                values[adjust_mask] = new_vals
+
+        df[numeric_col] = values
+        df[category] = _numeric_to_temperature_category(values, category, df.index)
+        prev_values = values.copy()
