@@ -371,14 +371,31 @@ class InverseDesignPipeline:
         self.lookup_tables: Optional[LookupTables] = None
         self._trained = False
 
-    def fit(self, dataset: pd.DataFrame, lookup_tables: Optional[LookupTables] = None) -> None:
-        """Train models for every stage."""
+    def fit(
+        self,
+        dataset: pd.DataFrame,
+        lookup_tables: Optional[LookupTables] = None,
+        *,
+        copy_dataset: bool = True,
+    ) -> None:
+        """Train models for every stage.
+
+        Parameters
+        ----------
+        dataset : pd.DataFrame
+            Training dataframe containing adsorption descriptors and synthesis context.
+        lookup_tables : Optional[LookupTables]
+            Pre-built lookup tables. When omitted they are reconstructed from ``dataset``.
+        copy_dataset : bool, default True
+            When False, the fit procedure mutates ``dataset`` in place instead of working
+            on a defensive copy. Use with care to avoid side effects.
+        """
 
         if lookup_tables is None:
             lookup_tables = build_lookup_tables(dataset)
         self.lookup_tables = lookup_tables
 
-        data = dataset.copy()
+        data = dataset.copy() if copy_dataset else dataset
         _ensure_process_defaults(data)
         _augment_with_lookup_descriptors(data, lookup_tables)
         _update_stoichiometry_features(data)
@@ -829,6 +846,10 @@ def _apply_lookup(df: pd.DataFrame, key_column: str, lookup_table: pd.DataFrame)
     if key_column not in df.columns:
         return
 
+    for column in lookup_table.columns:
+        if column not in df.columns:
+            df[column] = np.nan
+
     for key, row in lookup_table.iterrows():
         mask = df[key_column] == key
         if not mask.any():
@@ -836,7 +857,7 @@ def _apply_lookup(df: pd.DataFrame, key_column: str, lookup_table: pd.DataFrame)
         for column, value in row.items():
             if column not in df.columns:
                 df[column] = np.nan
-            df.loc[mask, column] = df.loc[mask, column].fillna(value)
+            df.loc[mask, column] = value
 
 
 def _ensure_process_defaults(df: pd.DataFrame) -> None:

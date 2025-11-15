@@ -16,6 +16,11 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
 
+from .config import (
+    CATBOOST_MODEL_CONFIG,
+    TABNET_MODEL_CONFIG,
+    XGBOOST_MODEL_CONFIG,
+)
 from .constants import HUBER_DELTA_DEFAULT
 
 
@@ -111,76 +116,15 @@ def _import_xgboost(problem_type: str):
 
 
 def _default_tabnet_params(problem_type: str, random_state: int) -> Dict:
-    import torch
-
-    params = dict(
-        n_d=32,
-        n_a=32,
-        n_steps=3,
-        gamma=1.25,
-        lambda_sparse=1e-5,
-        n_independent=1,
-        n_shared=1,
-        momentum=0.02,
-        clip_value=2.0,
-        optimizer_fn=torch.optim.AdamW,
-        optimizer_params=dict(lr=8e-3, weight_decay=1e-4),
-        scheduler_params=dict(T_max=200, eta_min=1e-4),
-        scheduler_fn=torch.optim.lr_scheduler.CosineAnnealingLR,
-        seed=random_state,
-    )
-    if problem_type == "classification":
-        params["mask_type"] = "sparsemax"
-    return params
+    return TABNET_MODEL_CONFIG.to_params(problem_type, random_state)
 
 
 def _default_catboost_params(problem_type: str, random_state: int) -> Dict:
-    base = dict(
-        iterations=1600,
-        learning_rate=0.03,
-        depth=8,
-        l2_leaf_reg=6.0,
-        min_data_in_leaf=5,
-        bagging_temperature=0.2,
-        random_strength=0.8,
-        border_count=254,
-        random_seed=random_state,
-        verbose=False,
-    )
-    if problem_type == "classification":
-        base.setdefault("loss_function", "Logloss")
-    else:
-        # Use MAE for robustness to outliers
-        base.setdefault("loss_function", "MAE")
-    return base
+    return CATBOOST_MODEL_CONFIG.to_params(problem_type, random_state)
 
 
 def _default_xgboost_params(problem_type: str, random_state: int) -> Dict:
-    base = dict(
-        n_estimators=1600,
-        learning_rate=0.03,
-        max_depth=5,
-        min_child_weight=4,
-        subsample=0.85,
-        colsample_bytree=0.8,
-        colsample_bylevel=0.7,
-        gamma=0.2,
-        reg_alpha=0.1,
-        reg_lambda=2.0,
-        random_state=random_state,
-        tree_method="hist",
-        n_jobs=-1,
-        verbosity=0,
-    )
-    if problem_type == "classification":
-        base["objective"] = "binary:logistic"
-        base["use_label_encoder"] = False
-        base["eval_metric"] = "logloss"
-    else:
-        # Use pseudo-Huber loss for robustness to outliers
-        base["objective"] = "reg:pseudohubererror"
-        base["huber_slope"] = HUBER_DELTA_DEFAULT
-    return base
+    return XGBOOST_MODEL_CONFIG.to_params(problem_type, random_state)
 
 
 class _ModernTabularEnsemble(BaseEstimator):

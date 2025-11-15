@@ -145,12 +145,20 @@ def add_salt_mass_features(df: pd.DataFrame) -> None:
 
     # Adsorption sanity-check features
     required_ads_cols = {'W0, см3/г', 'а0, ммоль/г', 'E0, кДж/моль', 'E, кДж/моль', 'Ws, см3/г'}
+    numeric_candidates = required_ads_cols | {'SБЭТ, м2/г'}
+    available_numeric = [col for col in numeric_candidates if col in df.columns]
+    numeric_adsorption: Dict[str, np.ndarray] = {}
+    if available_numeric:
+        numeric_block = df[available_numeric].apply(pd.to_numeric, errors='coerce')
+        for column in available_numeric:
+            numeric_adsorption[column] = numeric_block[column].to_numpy(dtype=np.float64, copy=False)
+
     if required_ads_cols.issubset(df.columns):
-        W0 = pd.to_numeric(df['W0, см3/г'], errors='coerce')
-        a0 = pd.to_numeric(df['а0, ммоль/г'], errors='coerce')
-        E0 = pd.to_numeric(df['E0, кДж/моль'], errors='coerce')
-        E = pd.to_numeric(df['E, кДж/моль'], errors='coerce')
-        Ws = pd.to_numeric(df['Ws, см3/г'], errors='coerce')
+        W0 = numeric_adsorption['W0, см3/г']
+        a0 = numeric_adsorption['а0, ммоль/г']
+        E0 = numeric_adsorption['E0, кДж/моль']
+        E = numeric_adsorption['E, кДж/моль']
+        Ws = numeric_adsorption['Ws, см3/г']
         df['a0_calc'] = 28.86 * W0
         df['E_calc'] = E0 / 3.0
         df['Ws_W0_ratio'] = np.divide(Ws, W0, out=np.full_like(Ws, np.nan), where=W0 != 0)
@@ -160,8 +168,8 @@ def add_salt_mass_features(df: pd.DataFrame) -> None:
         df['E_E0_ratio'] = np.divide(E, E0, out=np.full_like(E, np.nan), where=E0 != 0)
 
     if {'W0, см3/г', 'SБЭТ, м2/г'}.issubset(df.columns):
-        SBET = pd.to_numeric(df['SБЭТ, м2/г'], errors='coerce')
-        W0 = pd.to_numeric(df['W0, см3/г'], errors='coerce')
+        SBET = numeric_adsorption['SБЭТ, м2/г']
+        W0 = numeric_adsorption['W0, см3/г']
         df['W0_per_SBET'] = np.divide(W0, SBET, out=np.full_like(W0, np.nan), where=SBET != 0)
 
 
