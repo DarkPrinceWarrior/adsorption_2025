@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import warnings
 from typing import Callable, Dict, List, Optional
 
@@ -14,6 +15,11 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
+
+from .constants import HUBER_DELTA_DEFAULT
+
+
+logger = logging.getLogger(__name__)
 
 
 def _try_import_smote():
@@ -173,7 +179,7 @@ def _default_xgboost_params(problem_type: str, random_state: int) -> Dict:
     else:
         # Use pseudo-Huber loss for robustness to outliers
         base["objective"] = "reg:pseudohubererror"
-        base["huber_slope"] = 5.0  # Adjusted to match typical data scale
+        base["huber_slope"] = HUBER_DELTA_DEFAULT
     return base
 
 
@@ -237,7 +243,7 @@ class _ModernTabularEnsemble(BaseEstimator):
         fit_params = self.tabnet_fit_params or {}
         max_epochs = int(fit_params.get("max_epochs", 400))
         patience = int(fit_params.get("patience", 60))
-        batch_size = int(min(fit_params.get("batch_size", 128), max(n_samples, 16)))
+        batch_size = int(min(fit_params.get("batch_size", 128), n_samples))
         batch_size = max(batch_size, 16)
         virtual_batch_size = int(min(fit_params.get("virtual_batch_size", 64), batch_size))
         virtual_batch_size = max(virtual_batch_size, 16)
@@ -259,7 +265,17 @@ class _ModernTabularEnsemble(BaseEstimator):
             return base_weights
 
         try:
-            violations = self.physics_loss_fn(frames)
+            if isinstance(frames, pd.DataFrame):
+                feature_names = list(frames.columns)
+                frame_values = frames.to_numpy(dtype=np.float64, copy=False)
+            else:
+                frame_values = np.asarray(frames, dtype=np.float64)
+                feature_names = self.feature_names
+
+            if feature_names is None:
+                raise ValueError("feature names are required for physics loss computation")
+
+            violations = self.physics_loss_fn(frame_values, feature_names=feature_names)
             violations = np.asarray(violations, dtype=np.float64).reshape(-1)
             if violations.shape[0] != base_weights.shape[0]:
                 warnings.warn(
@@ -268,14 +284,18 @@ class _ModernTabularEnsemble(BaseEstimator):
                 )
                 return base_weights
             # Normalise violations to [0, 1] and construct weights
-            max_violation = np.nanmax(violations)
-            normalized = violations / max(max_violation, 1e-6)
+            violations = np.nan_to_num(violations, nan=0.0, posinf=0.0, neginf=0.0)
+            finite = violations[np.isfinite(violations)]
+            if not finite.size:
+                return base_weights
+            scale = np.nanpercentile(finite, 95)
+            if not np.isfinite(scale) or scale <= 1e-6:
+                scale = np.nanmax(finite)
+            if scale <= 0:
+                return base_weights
+            normalized = np.clip(violations / scale, 0.0, None)
             physics_weights = 1.0 + self.physics_loss_weight * normalized
-            combined = base_weights * physics_weights
-            total = np.sum(combined)
-            if total > 0:
-                combined = combined * (np.sum(base_weights) / total)
-            return combined
+            return base_weights * physics_weights
         except Exception as exc:
             warnings.warn(
                 f"Physics loss computation failed: {exc}. Using base weights.",
@@ -519,19 +539,19 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
 
         # Apply SMOTE/ADASYN to training data if enabled
         if self.use_smote and self.n_classes_ > 1 and sw_train is None:
-            print(f"  [INFO] Applying SMOTE/ADASYN for class balancing (n_classes={self.n_classes_})")
+            logger.info("Applying SMOTE/ADASYN for class balancing (n_classes=%s)", self.n_classes_)
             X_train_orig_shape = X_train.shape
             X_train, y_train = _apply_smote_if_available(X_train, y_train, self.random_state)
             if X_train.shape[0] != X_train_orig_shape[0]:
-                print(f"  [INFO] SMOTE applied: {X_train_orig_shape[0]} → {X_train.shape[0]} samples")
+                logger.info("SMOTE applied: %s -> %s samples", X_train_orig_shape[0], X_train.shape[0])
             else:
-                print(f"  [INFO] SMOTE not applied (balanced or insufficient samples)")
+                logger.info("SMOTE not applied (balanced or insufficient samples)")
         elif sw_train is not None and self.use_smote:
-            print("  [INFO] Skipping SMOTE due to provided sample weights.")
+            logger.info("Skipping SMOTE due to provided sample weights.")
 
         # Compute focal class weights
         focal_weights = _compute_focal_class_weights(y_train, gamma=self.focal_gamma)
-        print(f"  [INFO] Focal weights computed (gamma={self.focal_gamma}): {focal_weights}")
+        logger.info("Focal weights computed (gamma=%s): %s", self.focal_gamma, focal_weights)
 
         models: List = []
         names: List[str] = []
@@ -705,7 +725,7 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         weight_opt_params: Optional[Dict] = None,
         use_quantile: bool = False,
         quantile_alpha: float = 0.5,
-        huber_delta: float = 1.0,
+        huber_delta: float = HUBER_DELTA_DEFAULT,
         random_state: int = 42,
         physics_loss_fn: Optional[Callable] = None,
         physics_loss_weight: float = 0.0,
@@ -794,7 +814,7 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         try:
             cat_model = self._make_catboost()
             if self.use_quantile:
-                print(f"  [INFO] Using Quantile Regression (alpha={self.quantile_alpha})")
+                logger.info("Using Quantile Regression (alpha=%s) for CatBoost", self.quantile_alpha)
                 cat_model.set_params(
                     loss_function=f"Quantile:alpha={self.quantile_alpha}",
                     eval_metric="MAE",
@@ -803,7 +823,7 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
                 )
             else:
                 # Use MAE for robustness (CatBoost Huber doesn't support delta parameter)
-                print(f"  [INFO] Using MAE loss for regression (CatBoost)")
+                logger.info("Using MAE loss for regression (CatBoost)")
                 cat_model.set_params(
                     loss_function="MAE",
                     eval_metric="MAE",
@@ -828,7 +848,7 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         try:
             xgb_model = self._make_xgboost()
             if self.use_quantile:
-                print(f"  [INFO] Using Quantile Regression (alpha={self.quantile_alpha}) for XGBoost")
+                logger.info("Using Quantile Regression (alpha=%s) for XGBoost", self.quantile_alpha)
                 xgb_model.set_params(
                     objective=f"reg:quantileerror",
                     quantile_alpha=self.quantile_alpha,
@@ -836,7 +856,7 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
                 )
             else:
                 # Use pseudo-Huber (reg:pseudohubererror) for robustness
-                print(f"  [INFO] Using Pseudo-Huber loss (delta={self.huber_delta}) for XGBoost")
+                logger.info("Using Pseudo-Huber loss (delta=%s) for XGBoost", self.huber_delta)
                 xgb_model.set_params(
                     objective="reg:pseudohubererror",
                     huber_slope=self.huber_delta,

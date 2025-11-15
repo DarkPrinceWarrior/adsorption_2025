@@ -1,11 +1,13 @@
 """Physics-informed loss utilities with structured constraint configuration."""
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from pandas.util import hash_pandas_object
 
 from .constants import (
     ADSORPTION_ENERGY_RATIO_BOUNDS,
@@ -85,6 +87,16 @@ class PhysicsConstraintEvaluator:
     ratio_constraints: Sequence[RatioConstraint] = field(default_factory=tuple)
     inequality_constraints: Sequence[InequalityConstraint] = field(default_factory=tuple)
     gas_constant: float = R_GAS_J_MOL_K
+    penalty_cache_size: int = 16
+    _penalty_cache: OrderedDict = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._penalty_cache = OrderedDict()
+
+    @staticmethod
+    def _cache_key(df: pd.DataFrame) -> Tuple[Tuple[str, ...], Tuple[int, ...]]:
+        hashed = hash_pandas_object(df, index=True, categorize=False).to_numpy(dtype=np.uint64, copy=False)
+        return tuple(df.columns), tuple(int(value) for value in hashed)
 
     def _ensure_length(self, df: pd.DataFrame) -> np.ndarray:
         return np.zeros(len(df), dtype=np.float64)
@@ -202,12 +214,25 @@ class PhysicsConstraintEvaluator:
     def penalties(self, df: pd.DataFrame) -> np.ndarray:
         if df.empty:
             return np.zeros(0, dtype=np.float64)
+
+        if self.penalty_cache_size > 0:
+            cache_key = self._cache_key(df)
+            cached = self._penalty_cache.get(cache_key)
+            if cached is not None:
+                return cached.copy()
+        else:
+            cache_key = None
         penalty = self.energy_penalty(df)
         penalty += self.thermodynamic_penalty(df)
         penalty += self.equality_penalty(df)
         penalty += self.ratio_penalty(df)
         penalty += self.inequality_penalty(df)
-        return np.nan_to_num(penalty, nan=0.0, neginf=0.0, posinf=0.0)
+        penalty = np.nan_to_num(penalty, nan=0.0, neginf=0.0, posinf=0.0)
+        if cache_key is not None:
+            self._penalty_cache[cache_key] = penalty.copy()
+            while len(self._penalty_cache) > self.penalty_cache_size:
+                self._penalty_cache.popitem(last=False)
+        return penalty
 
     def summary(self, df: pd.DataFrame, *, verbose: bool = False) -> Dict[str, float]:
         stats: Dict[str, float] = {}

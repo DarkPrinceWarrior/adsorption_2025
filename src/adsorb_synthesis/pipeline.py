@@ -38,6 +38,7 @@ from .constants import (
     STOICHIOMETRY_TARGETS,
     TEMPERATURE_CATEGORIES,
     TEST_SIZE,
+    HUBER_DELTA_DEFAULT,
 )
 from .data_processing import (
     LookupTables,
@@ -173,7 +174,7 @@ def _default_regressor(random_state: int) -> BaseEstimator:
     return ModernTabularEnsembleRegressor(
         random_state=random_state,
         use_quantile=False,
-        huber_delta=5.0,  # Increased from 1.0 to match data scale (std~29)
+        huber_delta=HUBER_DELTA_DEFAULT,
     )
 
 
@@ -397,7 +398,11 @@ class InverseDesignPipeline:
             
             # Pass feature names to physics-informed models
             if hasattr(model, 'feature_names') and model.feature_names is None:
-                model.feature_names = list(stage.feature_columns)
+                feature_names = list(stage.feature_columns)
+                for column in stage.physics_columns:
+                    if column not in feature_names:
+                        feature_names.append(column)
+                model.feature_names = feature_names
             
             pipeline = self._build_pipeline(stage_data, stage.feature_columns, model)
             metrics, cv_mean, cv_std = self._train_and_evaluate(stage, pipeline, stage_data)
@@ -671,15 +676,18 @@ class InverseDesignPipeline:
         if stage.physics_weight > 0.0:
             penalties = physics_violation_scores(physics_frame, evaluator=evaluator)
             if penalties.size:
-                penalties = penalties - np.nanmin(penalties)
-                max_penalty = np.nanmax(penalties)
-                if max_penalty > 0:
-                    penalties = penalties / max_penalty
                 penalties = np.nan_to_num(penalties, nan=0.0, posinf=0.0, neginf=0.0)
+                finite_mask = np.isfinite(penalties)
+                finite_values = penalties[finite_mask]
+                if finite_values.size:
+                    scale = np.nanpercentile(finite_values, 95)
+                    if not np.isfinite(scale) or scale <= 1e-6:
+                        scale = np.nanmax(finite_values)
+                    if scale > 0:
+                        penalties = penalties / scale
+                penalties = np.clip(penalties, 0.0, None)
                 sample_weights = 1.0 + stage.physics_weight * penalties
                 sample_weights = sample_weights.astype(np.float64, copy=False)
-                # Preserve overall weight mass for stability
-                sample_weights /= np.mean(sample_weights) if np.mean(sample_weights) > 0 else 1.0
 
         indices = np.arange(len(X))
         split_arrays = [X, y, indices]

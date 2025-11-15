@@ -6,6 +6,7 @@ TEST_SIZE: float = 0.25
 CV_FOLDS_CLASSIFICATION: int = 5
 CV_FOLDS_REGRESSION: int = 5
 OUTLIER_CONTAMINATION: float = 0.05
+HUBER_DELTA_DEFAULT: float = 5.0  # Tuned to match salt-mass scale (std ~29 g)
 
 # Physics-informed loss constants
 R_GAS_J_MOL_K: float = 8.314  # Gas constant in J/(mol·K)
