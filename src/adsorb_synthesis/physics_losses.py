@@ -94,9 +94,9 @@ class PhysicsConstraintEvaluator:
         self._penalty_cache = OrderedDict()
 
     @staticmethod
-    def _cache_key(df: pd.DataFrame) -> Tuple[Tuple[str, ...], Tuple[int, ...]]:
+    def _cache_key(df: pd.DataFrame) -> Tuple[int, ...]:
         hashed = hash_pandas_object(df, index=True, categorize=False).to_numpy(dtype=np.uint64, copy=False)
-        return tuple(df.columns), tuple(int(value) for value in hashed)
+        return tuple(int(value) for value in hashed)
 
     def _ensure_length(self, df: pd.DataFrame) -> np.ndarray:
         return np.zeros(len(df), dtype=np.float64)

@@ -846,18 +846,20 @@ def _apply_lookup(df: pd.DataFrame, key_column: str, lookup_table: pd.DataFrame)
     if key_column not in df.columns:
         return
 
-    for column in lookup_table.columns:
-        if column not in df.columns:
-            df[column] = np.nan
+    df_columns = set(df.columns)
+    lookup_cols = [col for col in lookup_table.columns if col not in df_columns]
+    if lookup_cols:
+        for col in lookup_cols:
+            df[col] = np.nan
 
-    for key, row in lookup_table.iterrows():
-        mask = df[key_column] == key
-        if not mask.any():
-            continue
-        for column, value in row.items():
-            if column not in df.columns:
-                df[column] = np.nan
-            df.loc[mask, column] = value
+    # Align lookup table with dataframe columns and index
+    aligned = lookup_table.reindex(columns=[col for col in df.columns if col in lookup_table.columns])
+    aligned = aligned.add_suffix("_lookup")
+    merged = df[[key_column]].join(aligned, on=key_column)
+
+    for lookup_col in aligned.columns:
+        target_col = lookup_col.removesuffix("_lookup")
+        df[target_col] = merged[lookup_col].combine_first(df[target_col])
 
 
 def _ensure_process_defaults(df: pd.DataFrame) -> None:
@@ -1012,17 +1014,24 @@ _TEMPERATURE_SEQUENCE = (
     ('Treg_Category', 'Tрег, ᵒС'),
 )
 
+_CATEGORY_MIDPOINT_CACHE: Dict[str, Dict[str, float]] = {}
+
 
 def _temperature_midpoints(name: str) -> Dict[str, float]:
+    if name in _CATEGORY_MIDPOINT_CACHE:
+        return _CATEGORY_MIDPOINT_CACHE[name]
     spec = TEMPERATURE_CATEGORIES.get(name)
     if spec is None:
+        _CATEGORY_MIDPOINT_CACHE[name] = {}
         return {}
     bins = spec['bins']
     labels = spec['labels']
-    return {
+    mapping = {
         label: float((bins[idx] + bins[idx + 1]) / 2.0)
         for idx, label in enumerate(labels)
     }
+    _CATEGORY_MIDPOINT_CACHE[name] = mapping
+    return mapping
 
 
 def _numeric_to_temperature_category(values: np.ndarray, name: str, index: pd.Index) -> pd.Series:
