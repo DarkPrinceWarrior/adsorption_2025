@@ -14,6 +14,8 @@ from .constants import (
     SOLVENT_DESCRIPTOR_FEATURES,
     SOLVENT_BOILING_POINTS_C,
     TEMPERATURE_CATEGORIES,
+    FORWARD_MODEL_INPUTS,
+    FORWARD_MODEL_TARGETS,
 )
 from .data_validation import (
     DEFAULT_VALIDATION_MODE,
@@ -41,6 +43,84 @@ class LookupTables:
             "ligand": self.ligand.copy(),
             "solvent": self.solvent.copy(),
         }
+
+
+def prepare_forward_dataset(
+    df: pd.DataFrame,
+    lookup_tables: Optional[LookupTables] = None,
+    drop_missing_targets: bool = True
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Prepare features (X) and targets (y) for the Forward Model (Recipe -> Properties).
+    
+    This function implements 'Stage 1: Data Flip' from the Bayesian Optimization plan.
+    
+    Args:
+        df: The loaded dataset containing synthesis parameters and properties.
+        lookup_tables: Optional tables to enrich X with physical descriptors of ingredients.
+        drop_missing_targets: If True, rows with missing values in ANY target column are dropped.
+        
+    Returns:
+        X: DataFrame of input features (Recipe parameters + optional descriptors).
+        y: DataFrame of target properties (W0, E0, S_BET, x0).
+    """
+    df = df.copy()
+    
+    # 1. Basic Input Features
+    # Ensure we have all required inputs
+    missing_inputs = [col for col in FORWARD_MODEL_INPUTS if col not in df.columns]
+    if missing_inputs:
+        raise ValueError(f"Dataset missing required forward model inputs: {missing_inputs}")
+        
+    X = df[FORWARD_MODEL_INPUTS].copy()
+    
+    # 2. Feature Engineering (Log transforms for skewed continuous variables)
+    # As suggested in the plan: masses and volumes usually follow log-normal distributions
+    continuous_vars_to_log = [
+        'm (соли), г',
+        'm(кис-ты), г',
+        'Vсин. (р-ля), мл'
+    ]
+    
+    for col in continuous_vars_to_log:
+        if col in X.columns:
+            # log1p is safer for zeros (though mass shouldn't be zero)
+            X[f'log_{col}'] = np.log1p(pd.to_numeric(X[col], errors='coerce').clip(lower=0))
+            
+    # 3. Enrich with Descriptors (if provided)
+    # This adds 'Total molecular weight', 'polarizability', etc. to X
+    if lookup_tables:
+        # Merge Metal Descriptors
+        if 'Металл' in X.columns:
+            X = X.merge(lookup_tables.metal, on='Металл', how='left')
+            
+        # Merge Ligand Descriptors
+        if 'Лиганд' in X.columns:
+            X = X.merge(lookup_tables.ligand, on='Лиганд', how='left')
+            
+        # Merge Solvent Descriptors
+        if 'Растворитель' in X.columns:
+            X = X.merge(lookup_tables.solvent, on='Растворитель', how='left')
+            
+    # 4. Prepare Targets
+    missing_targets = [col for col in FORWARD_MODEL_TARGETS if col not in df.columns]
+    if missing_targets:
+        raise ValueError(f"Dataset missing required targets: {missing_targets}")
+        
+    y = df[FORWARD_MODEL_TARGETS].copy()
+    
+    # Convert targets to numeric, coercing errors to NaN
+    for col in y.columns:
+        y[col] = pd.to_numeric(y[col], errors='coerce')
+    
+    # 5. Clean up
+    if drop_missing_targets:
+        # Align X and y indices after dropping NaNs in y
+        valid_indices = y.dropna().index
+        X = X.loc[valid_indices]
+        y = y.loc[valid_indices]
+        
+    return X, y
 
 
 def load_dataset(

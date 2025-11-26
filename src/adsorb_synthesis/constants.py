@@ -122,4 +122,34 @@ STOICHIOMETRY_TARGETS = {
     ('Fe', 'BTB'): {'ratio': 1.5, 'tolerance': 0.2},
 }
 
+
 DEFAULT_STOICHIOMETRY_BOUNDS: tuple[float, float] = (0.45, 2.3)
+
+
+# --- Forward Model (Bayesian Optimization) Constants ---
+
+FORWARD_MODEL_INPUTS = [
+    # Categorical Inputs (The "Ingredients")
+    'Металл',
+    'Лиганд',
+    'Растворитель',
+    
+    # Continuous Inputs (The "Recipe")
+    'm (соли), г',
+    'm(кис-ты), г',
+    'Vсин. (р-ля), мл',
+    'Т.син., °С',
+    'Т суш., °С',
+    'Tрег, ᵒС',  # T activation
+]
+
+FORWARD_MODEL_TARGETS = [
+    'W0, см3/г',
+    'E0, кДж/моль',
+    'SБЭТ, м2/г',
+    'х0, нм',
+]
+
+# Features derived from inputs that are safe to use in Forward Model
+# (Physical descriptors of ingredients known BEFORE synthesis)
+FORWARD_MODEL_AUGMENTED_FEATURES = METAL_DESCRIPTOR_FEATURES + LIGAND_DESCRIPTOR_FEATURES + SOLVENT_DESCRIPTOR_FEATURES
