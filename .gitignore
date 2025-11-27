@@ -16,8 +16,10 @@ catboost_info/
 
 # Data science helpers
 *.ipynb_checkpoints
-tmp_inference_input.csv
-predictions.csv
+tmp_*.csv
+predictions*.csv
+recipes.csv
+test_*.csv
 
 # OS clutter
 .DS_Store

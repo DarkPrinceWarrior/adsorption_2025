@@ -303,10 +303,11 @@ def main():
     parser = argparse.ArgumentParser(description="Inverse Design Inference via Bayesian Optimization")
     
     # Target arguments
-    parser.add_argument("--W0", type=float, help="Target W0 (cm3/g)")
-    parser.add_argument("--E0", type=float, help="Target E0 (kJ/mol)")
-    parser.add_argument("--SBET", type=float, help="Target S_BET (m2/g)")
-    parser.add_argument("--x0", type=float, help="Target x0 (nm)")
+    parser.add_argument("--W0", type=float, help="Target W0 micropore volume (cm3/g)")
+    parser.add_argument("--E0", type=float, help="Target E0 characteristic energy (kJ/mol)")
+    parser.add_argument("--SBET", type=float, help="Target S_BET surface area (m2/g)")
+    parser.add_argument("--x0", type=float, help="Target x0 pore half-width (nm)")
+    parser.add_argument("--Sme", type=float, help="Target Sme mesopore surface area (m2/g)")
     
     parser.add_argument("--trials", type=int, default=200, help="Number of optimization trials")
     parser.add_argument("--output", type=str, default="predictions_bo.csv", help="Output CSV file")
@@ -320,14 +321,15 @@ def main():
     if args.E0: targets['E0, кДж/моль'] = args.E0
     if args.SBET: targets['SБЭТ, м2/г'] = args.SBET
     if args.x0: targets['х0, нм'] = args.x0
+    if args.Sme: targets['Sme, м2/г'] = args.Sme
     
     if not targets:
-        print("Error: No targets specified! Use --W0, --E0, --SBET, or --x0.")
+        print("Error: No targets specified! Use --W0, --E0, --SBET, --x0, or --Sme.")
         return
 
     optimizer = AdsorbentOptimizer(
         models_dir=args.models,
-        data_path="data/SEC_SYN_with_features_DMFA_only_no_Y.csv",
+        data_path="data/SEC_SYN_with_features_DMFA_only.csv",
         n_trials=args.trials
     )
     

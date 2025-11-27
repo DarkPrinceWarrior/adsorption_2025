@@ -148,6 +148,7 @@ FORWARD_MODEL_TARGETS = [
     'E0, кДж/моль',
     'SБЭТ, м2/г',
     'х0, нм',
+    'Sme, м2/г',
 ]
 
 # Features derived from inputs that are safe to use in Forward Model
