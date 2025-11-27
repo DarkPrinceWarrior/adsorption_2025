@@ -841,6 +841,37 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         weights = self.weights_ / self.weights_.sum()
         return np.dot(weights, pred_stack).astype(np.float32)
 
+    def predict_with_uncertainty(self, X) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Predict mean and standard deviation (uncertainty).
+        
+        Uncertainty is estimated as the weighted standard deviation of the 
+        predictions from the ensemble members (TabNet, CatBoost, XGBoost).
+        This captures epistemic uncertainty (model disagreement).
+        """
+        check_is_fitted(self, "weights_")
+        X_arr = check_array(X, accept_sparse=False)
+        X_arr = np.asarray(X_arr, dtype=np.float32)
+        
+        # Get predictions from all base models
+        preds: List[np.ndarray] = []
+        for model in self.models_:
+            preds.append(np.asarray(model.predict(X_arr), dtype=np.float64).ravel())
+        
+        # Shape: (n_models, n_samples)
+        pred_stack = np.vstack(preds)
+        
+        # Weighted Mean
+        weights = self.weights_ / self.weights_.sum()
+        mean_pred = np.dot(weights, pred_stack)
+        
+        # Weighted Standard Deviation
+        # sigma^2 = sum(w_i * (x_i - mu)^2)
+        variance = np.dot(weights, (pred_stack - mean_pred) ** 2)
+        std_pred = np.sqrt(variance)
+        
+        return mean_pred.astype(np.float32), std_pred.astype(np.float32)
+
 
 __all__ = [
     "ModernTabularEnsembleClassifier",

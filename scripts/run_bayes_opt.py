@@ -52,26 +52,48 @@ class AdsorbentOptimizer:
         # Define Search Space based on available data
         self.search_space = self._define_search_space()
         
-    def _load_models(self) -> Dict[str, CatBoostRegressor]:
+    def _load_models(self) -> Dict[str, List[CatBoostRegressor]]:
         models = {}
         self._feature_order = None  # Will be set from first loaded model
         
         for target in FORWARD_MODEL_TARGETS:
-            # Filename convention from training script
-            filename = f"catboost_{target.replace('/', '_').replace(' ', '_')}.cbm"
-            path = os.path.join(self.models_dir, filename)
+            target_models = []
+            # Try to load ensemble members
+            safe_target = target.replace('/', '_').replace(' ', '_')
             
-            if os.path.exists(path):
-                model = CatBoostRegressor()
-                model.load_model(path)
-                models[target] = model
-                
-                # Store feature order from first model (all models have same features)
-                if self._feature_order is None:
-                    self._feature_order = model.feature_names_
-                    print(f"Feature order loaded: {len(self._feature_order)} features")
+            # Check for ensemble first
+            ensemble_found = False
+            for i in range(5): # Assume max 5 members
+                path = os.path.join(self.models_dir, f"catboost_{safe_target}_ens{i}.cbm")
+                if os.path.exists(path):
+                    ensemble_found = True
+                    model = CatBoostRegressor()
+                    model.load_model(path)
+                    target_models.append(model)
+                    
+                    # Store feature order from first model
+                    if self._feature_order is None:
+                        self._feature_order = model.feature_names_
+                        print(f"Feature order loaded: {len(self._feature_order)} features")
+            
+            # Fallback to single model if no ensemble found
+            if not ensemble_found:
+                path = os.path.join(self.models_dir, f"catboost_{safe_target}.cbm")
+                if os.path.exists(path):
+                    print(f"Warning: Loading single model for {target} (No ensemble found)")
+                    model = CatBoostRegressor()
+                    model.load_model(path)
+                    target_models.append(model)
+                    
+                    if self._feature_order is None:
+                        self._feature_order = model.feature_names_
+                else:
+                    print(f"Warning: Model for {target} not found at {path}")
             else:
-                print(f"Warning: Model for {target} not found at {path}")
+                print(f"Loaded ensemble of {len(target_models)} models for {target}")
+
+            if target_models:
+                models[target] = target_models
         
         if not models:
             raise RuntimeError("No models found! Please run train_forward_model.py first.")
@@ -244,33 +266,42 @@ class AdsorbentOptimizer:
                 return 1e9
             df_input = df_input[self._feature_order]
         
-        # --- 4. Predict Properties ---
+        # --- 4. Predict Properties with Uncertainty ---
         loss = 0.0
         predictions = {}
+        uncertainties = {}
         
         for target_name, target_val in targets.items():
             if target_name in self.models:
                 try:
-                    pred = self.models[target_name].predict(df_input)[0]
+                    ensemble = self.models[target_name]
+                    preds = [model.predict(df_input)[0] for model in ensemble]
+                    
+                    mean_pred = np.mean(preds)
+                    std_pred = np.std(preds)
+                    
                 except Exception as e:
                     # Feature mismatch or other error
                     print(f"Prediction error for {target_name}: {e}")
                     return 1e9
                 
-                predictions[target_name] = pred
+                predictions[target_name] = mean_pred
+                uncertainties[target_name] = std_pred
                 
                 # Normalized MSE Loss component
                 # (pred - target)^2 / target^2  <- relative percentage error
                 if target_val != 0:
-                    term = weights.get(target_name, 1.0) * ((pred - target_val) / target_val) ** 2
+                    term = weights.get(target_name, 1.0) * ((mean_pred - target_val) / target_val) ** 2
                 else:
-                    term = weights.get(target_name, 1.0) * (pred - target_val) ** 2
+                    term = weights.get(target_name, 1.0) * (mean_pred - target_val) ** 2
                     
                 loss += term
         
         # --- 5. Store predictions for later retrieval ---
         for k, v in predictions.items():
             trial.set_user_attr(k, float(v))
+        for k, v in uncertainties.items():
+            trial.set_user_attr(f"Uncertainty_{k}", float(v))
             
         return loss
 
@@ -337,7 +368,20 @@ def main():
     
     print("\nTop 5 Recipes Found:")
     # Select columns to display cleanly
-    display_cols = ['Loss'] + [c for c in df_results.columns if 'Pred_' in c] + ['Металл', 'Лиганд', 'Т.син., °С']
+    pred_cols = [c for c in df_results.columns if 'Pred_' in c]
+    unc_cols = [c for c in df_results.columns if 'Uncertainty_' in c]
+    
+    # Interleave Pred and Uncertainty for readability
+    val_cols = []
+    for p in pred_cols:
+        val_cols.append(p)
+        # Find matching uncertainty column
+        base_name = p.replace('Pred_', '')
+        u_name = f"Uncertainty_{base_name}"
+        if u_name in df_results.columns:
+            val_cols.append(u_name)
+            
+    display_cols = ['Loss'] + val_cols + ['Металл', 'Лиганд', 'Т.син., °С']
     print(df_results[display_cols].head(5).to_string(index=False))
     
     df_results.to_csv(args.output, index=False)

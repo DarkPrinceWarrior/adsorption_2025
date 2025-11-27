@@ -10,8 +10,12 @@ Recipe (Inputs) -> Physical Properties (Outputs).
 import argparse
 import json
 import os
+import sys
 from typing import Dict
 import numpy as np
+
+# Add src to path to import project modules
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import joblib
 import pandas as pd
@@ -57,9 +61,11 @@ def train_forward_models(
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # Train a separate model for each target property
+    # Train a separate ENSEMBLE of models for each target property
+    n_ensemble = 5
+    
     for target in FORWARD_MODEL_TARGETS:
-        print(f"\n=== Training model for target: {target} ===")
+        print(f"\n=== Training ENSEMBLE for target: {target} ===")
         
         if target not in y_train.columns:
             print(f"Skipping {target}: not found in targets.")
@@ -68,55 +74,105 @@ def train_forward_models(
         y_train_target = y_train[target]
         y_test_target = y_test[target]
         
-        # Initialize CatBoost with balanced regularization
-        # Dataset: 380 samples, 37 features
-        model = CatBoostRegressor(
-            iterations=iterations,
-            learning_rate=0.03,
-            depth=4,
-            l2_leaf_reg=3.0,
-            min_data_in_leaf=5,
-            subsample=0.8,
-            colsample_bylevel=0.8,
+        # --- Feature Selection Step ---
+        print(f"  Performing Feature Selection for {target}...")
+        
+        # Train a temporary model to find best features
+        fs_model = CatBoostRegressor(
+            iterations=500,
+            learning_rate=0.05,
+            depth=6,
             loss_function='RMSE',
             random_seed=RANDOM_SEED,
-            verbose=100,
+            verbose=False,
             allow_writing_files=False,
             cat_features=cat_features
         )
         
-        # Fit model
-        model.fit(
-            X_train, y_train_target,
-            eval_set=(X_test, y_test_target),
-            early_stopping_rounds=100,
-            use_best_model=True
-        )
+        fs_model.fit(X_train, y_train_target, verbose=False)
         
-        # Evaluate
-        preds_test = model.predict(X_test)
-        preds_train = model.predict(X_train)
+        # Get feature importance
+        importance = fs_model.get_feature_importance(type='PredictionValuesChange')
+        feature_imp = pd.DataFrame({'feature': X_train.columns, 'importance': importance})
+        feature_imp = feature_imp.sort_values('importance', ascending=False)
         
-        r2_test = r2_score(y_test_target, preds_test)
-        r2_train = r2_score(y_train_target, preds_train)
-        rmse_test = np.sqrt(mean_squared_error(y_test_target, preds_test))
-        mae_test = mean_absolute_error(y_test_target, preds_test)
+        # Select top 15 features
+        selected_features = feature_imp['feature'].head(15).tolist()
+        print(f"  Selected {len(selected_features)} features: {selected_features}")
         
-        print(f"Results for {target}:")
+        # Filter datasets to selected features only
+        X_train_sel = X_train[selected_features]
+        X_test_sel = X_test[selected_features]
+        
+        # Update cat_features for the selected subset
+        cat_features_sel = [c for c in selected_features if c in cat_features]
+
+        model_paths = []
+        ensemble_preds_test = []
+        ensemble_preds_train = []
+        
+        for i in range(n_ensemble):
+            seed = RANDOM_SEED + i
+            print(f"  Training member {i+1}/{n_ensemble} (seed={seed})...")
+            
+            # Initialize CatBoost with balanced regularization
+            model = CatBoostRegressor(
+                iterations=iterations,
+                learning_rate=0.05, # Increased from 0.03
+                depth=6,            # Increased from 4
+                l2_leaf_reg=1.0,    # Decreased from 3.0 (less regularization)
+                min_data_in_leaf=1, # Allow smaller leaves
+                subsample=0.8,
+                colsample_bylevel=0.8,
+                loss_function='RMSE',
+                random_seed=seed,
+                verbose=False, # Less verbose
+                allow_writing_files=False,
+                cat_features=cat_features_sel # Use updated cat_features
+            )
+            
+            # Fit model on SELECTED features
+            model.fit(
+                X_train_sel, y_train_target,
+                eval_set=(X_test_sel, y_test_target),
+                early_stopping_rounds=100,
+                use_best_model=True
+            )
+            
+            # Save individual model
+            safe_target = target.replace('/', '_').replace(' ', '_')
+            model_path = os.path.join(output_dir, f"catboost_{safe_target}_ens{i}.cbm")
+            model.save_model(model_path)
+            model_paths.append(model_path)
+            
+            # Collect predictions
+            ensemble_preds_test.append(model.predict(X_test_sel))
+            ensemble_preds_train.append(model.predict(X_train_sel))
+
+        # Aggregate predictions (Mean of Ensemble)
+        mean_preds_test = np.mean(ensemble_preds_test, axis=0)
+        std_preds_test = np.std(ensemble_preds_test, axis=0)
+        mean_preds_train = np.mean(ensemble_preds_train, axis=0)
+        
+        r2_test = r2_score(y_test_target, mean_preds_test)
+        r2_train = r2_score(y_train_target, mean_preds_train)
+        rmse_test = np.sqrt(mean_squared_error(y_test_target, mean_preds_test))
+        mae_test = mean_absolute_error(y_test_target, mean_preds_test)
+        
+        print(f"Ensemble Results for {target}:")
         print(f"  R2 (Test):  {r2_test:.4f}")
         print(f"  R2 (Train): {r2_train:.4f}")
         print(f"  RMSE:       {rmse_test:.4f}")
+        print(f"  Avg Uncertainty (StdDev): {np.mean(std_preds_test):.4f}")
         
-        # Save model and metrics
-        model_path = os.path.join(output_dir, f"catboost_{target.replace('/', '_').replace(' ', '_')}.cbm")
-        model.save_model(model_path)
-        models[target] = model_path
+        models[target] = model_paths # Store list of paths
         
         metrics[target] = {
             "R2_test": r2_test,
             "R2_train": r2_train,
             "RMSE": rmse_test,
-            "MAE": mae_test
+            "MAE": mae_test,
+            "Uncertainty_Mean": float(np.mean(std_preds_test))
         }
 
     # Save metrics summary
