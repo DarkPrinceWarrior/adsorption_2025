@@ -6,6 +6,7 @@ pytorch-tabnet
 catboost
 xgboost
 optuna
+seaborn
 imbalanced-learn
 scipy
 pytest
