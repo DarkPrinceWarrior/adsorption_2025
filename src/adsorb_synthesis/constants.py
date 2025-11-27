@@ -157,9 +157,26 @@ FORWARD_MODEL_AUGMENTED_FEATURES = METAL_DESCRIPTOR_FEATURES + LIGAND_DESCRIPTOR
 # Engineered features computed from synthesis parameters (known BEFORE synthesis)
 # These capture stoichiometry and concentration - critical for W0 prediction
 FORWARD_MODEL_ENGINEERED_FEATURES = [
-    'R_molar',      # Molar ratio: (m_salt / MW_salt) / (m_acid / MW_acid)
-    'R_mass',       # Mass ratio: m_salt / m_acid
-    'C_metal',      # Metal concentration: m_salt / V_solvent
-    'C_ligand',     # Ligand concentration: m_acid / V_solvent
-    'T_range',      # Temperature range: T_activation - T_synthesis
+    # Stoichiometry (from add_salt_mass_features)
+    'R_molar',          # Molar ratio: n_salt / n_acid
+    'R_mass',           # Mass ratio: m_salt / m_acid
+    
+    # Concentrations
+    'C_metal',          # Metal concentration: m_salt / V_solvent
+    'C_ligand',         # Ligand concentration: m_acid / V_solvent
+    'log_C_metal',      # Log-transformed concentration
+    'log_C_ligand',     # Log-transformed concentration
+    
+    # From CSV (pre-computed)
+    'n_соли',           # Moles of salt
+    'n_кислоты',        # Moles of acid
+    'Vsyn_m',           # V_synthesis / m_salt (inverse concentration)
+    
+    # Temperature features
+    'T_range',          # T_activation - T_synthesis
+    'T_activation',     # T_reg - 100
+    'T_dry_norm',       # Normalized drying temperature
+    
+    # Interaction
+    'Metal_Ligand_Combo',  # Categorical: metal-ligand pair
 ]
