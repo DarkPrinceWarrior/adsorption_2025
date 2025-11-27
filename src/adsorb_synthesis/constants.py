@@ -153,3 +153,13 @@ FORWARD_MODEL_TARGETS = [
 # Features derived from inputs that are safe to use in Forward Model
 # (Physical descriptors of ingredients known BEFORE synthesis)
 FORWARD_MODEL_AUGMENTED_FEATURES = METAL_DESCRIPTOR_FEATURES + LIGAND_DESCRIPTOR_FEATURES + SOLVENT_DESCRIPTOR_FEATURES
+
+# Engineered features computed from synthesis parameters (known BEFORE synthesis)
+# These capture stoichiometry and concentration - critical for W0 prediction
+FORWARD_MODEL_ENGINEERED_FEATURES = [
+    'R_molar',      # Molar ratio: (m_salt / MW_salt) / (m_acid / MW_acid)
+    'R_mass',       # Mass ratio: m_salt / m_acid
+    'C_metal',      # Metal concentration: m_salt / V_solvent
+    'C_ligand',     # Ligand concentration: m_acid / V_solvent
+    'T_range',      # Temperature range: T_activation - T_synthesis
+]

@@ -16,6 +16,7 @@ from .constants import (
     TEMPERATURE_CATEGORIES,
     FORWARD_MODEL_INPUTS,
     FORWARD_MODEL_TARGETS,
+    FORWARD_MODEL_ENGINEERED_FEATURES,
 )
 from .data_validation import (
     DEFAULT_VALIDATION_MODE,
@@ -101,8 +102,14 @@ def prepare_forward_dataset(
         # Merge Solvent Descriptors
         if 'Растворитель' in X.columns:
             X = X.merge(lookup_tables.solvent, on='Растворитель', how='left')
+    
+    # 4. Copy Engineered Features from df (already computed by add_salt_mass_features)
+    # These are critical for W0 prediction - CatBoost struggles to learn ratios
+    for col in FORWARD_MODEL_ENGINEERED_FEATURES:
+        if col in df.columns:
+            X[col] = df.loc[X.index, col]
             
-    # 4. Prepare Targets
+    # 5. Prepare Targets
     missing_targets = [col for col in FORWARD_MODEL_TARGETS if col not in df.columns]
     if missing_targets:
         raise ValueError(f"Dataset missing required targets: {missing_targets}")

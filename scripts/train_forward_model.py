@@ -68,12 +68,16 @@ def train_forward_models(
         y_train_target = y_train[target]
         y_test_target = y_test[target]
         
-        # Initialize CatBoost
-        # Using RMSE as loss, but we can tune this later
+        # Initialize CatBoost with balanced regularization
+        # Dataset: 380 samples, 37 features
         model = CatBoostRegressor(
             iterations=iterations,
-            learning_rate=0.05,
-            depth=6,
+            learning_rate=0.03,
+            depth=4,
+            l2_leaf_reg=3.0,
+            min_data_in_leaf=5,
+            subsample=0.8,
+            colsample_bylevel=0.8,
             loss_function='RMSE',
             random_seed=RANDOM_SEED,
             verbose=100,
@@ -85,7 +89,7 @@ def train_forward_models(
         model.fit(
             X_train, y_train_target,
             eval_set=(X_test, y_test_target),
-            early_stopping_rounds=50,
+            early_stopping_rounds=100,
             use_best_model=True
         )
         
