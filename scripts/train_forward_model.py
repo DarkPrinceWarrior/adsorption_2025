@@ -47,18 +47,11 @@ def train_forward_models(
     print(f"Features in X: {list(X.columns)}")
     
     # Identify categorical features for CatBoost
-    # These are columns with object/category dtype in X
     cat_features = [col for col in X.columns if X[col].dtype.name in ['object', 'category']]
     print(f"Categorical features found: {cat_features}")
     
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=RANDOM_SEED
-    )
-    
-    models = {}
     metrics = {}
-    
+    models = {} # Initialize models dict
     os.makedirs(output_dir, exist_ok=True)
     
     # Train a separate ENSEMBLE of models for each target property
@@ -67,12 +60,54 @@ def train_forward_models(
     for target in FORWARD_MODEL_TARGETS:
         print(f"\n=== Training ENSEMBLE for target: {target} ===")
         
-        if target not in y_train.columns:
+        # Check for target presence
+        if target not in y.columns: # Check in full y, not y_train
             print(f"Skipping {target}: not found in targets.")
             continue
+
+        # --- TARGET-BASED STRATIFICATION ---
+        # We split separately for EACH target to ensure its distribution is preserved
+        y_target = y[target]
+        
+        # Create bins for stratification (5 quantiles)
+        # qcut handles continuous variables well
+        try:
+            bins = pd.qcut(y_target, q=5, labels=False, duplicates='drop')
+        except ValueError:
+            # Fallback if too few unique values (e.g. discrete target)
+            bins = y_target
             
-        y_train_target = y_train[target]
-        y_test_target = y_test[target]
+        # Handle singletons in bins (classes with < 2 samples)
+        bin_counts = bins.value_counts()
+        singletons = bin_counts[bin_counts < 2].index
+        
+        if len(singletons) > 0:
+            # Mask non-singletons for splitting
+            mask_strat = ~bins.isin(singletons)
+            X_strat = X[mask_strat]
+            y_strat = y_target[mask_strat]
+            bins_strat = bins[mask_strat]
+            
+            X_train, X_test, y_train_target, y_test_target = train_test_split(
+                X_strat, y_strat,
+                test_size=test_size,
+                random_state=RANDOM_SEED,
+                stratify=bins_strat
+            )
+            
+            # Add singletons to TRAIN
+            X_train = pd.concat([X_train, X[~mask_strat]])
+            y_train_target = pd.concat([y_train_target, y_target[~mask_strat]])
+        else:
+            # Standard stratified split
+            X_train, X_test, y_train_target, y_test_target = train_test_split(
+                X, y_target,
+                test_size=test_size,
+                random_state=RANDOM_SEED,
+                stratify=bins
+            )
+            
+        print(f"  Split for {target}: Train={len(X_train)}, Test={len(X_test)}")
         
         # --- Feature Selection Step ---
         print(f"  Performing Feature Selection for {target}...")

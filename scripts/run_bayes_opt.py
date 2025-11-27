@@ -15,7 +15,7 @@ import optuna
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from catboost import CatBoostRegressor
+from catboost import CatBoostRegressor, Pool
 
 # Add src to path to import project modules
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -256,16 +256,6 @@ class AdsorbentOptimizer:
             if col in df_input.columns:
                 df_input[col] = df_input[col].astype(str)
         
-        # Reorder columns to match training order (CatBoost is sensitive to this)
-        # Get expected column order from first model
-        if hasattr(self, '_feature_order') and self._feature_order is not None:
-            # Reorder df_input to match training feature order
-            missing_cols = set(self._feature_order) - set(df_input.columns)
-            if missing_cols:
-                print(f"Warning: Missing columns: {missing_cols}")
-                return 1e9
-            df_input = df_input[self._feature_order]
-        
         # --- 4. Predict Properties with Uncertainty ---
         loss = 0.0
         predictions = {}
@@ -275,7 +265,27 @@ class AdsorbentOptimizer:
             if target_name in self.models:
                 try:
                     ensemble = self.models[target_name]
-                    preds = [model.predict(df_input)[0] for model in ensemble]
+                    # Get expected features from the first model in the ensemble
+                    model_features = ensemble[0].feature_names_
+                    
+                    # Check if we have all needed features
+                    missing = set(model_features) - set(df_input.columns)
+                    if missing:
+                        # print(f"Missing features for {target_name}: {missing}")
+                        return 1e9
+                        
+                    # Prepare input slice for this specific model
+                    df_slice = df_input[model_features]
+                    
+                    # Prepare Pool just for this target
+                    # Identify present categorical features
+                    known_cats = ['Металл', 'Лиганд', 'Растворитель', 'Metal_Ligand_Combo']
+                    present_cats = [c for c in df_slice.columns if c in known_cats]
+                    
+                    predict_pool = Pool(df_slice, cat_features=present_cats)
+                    
+                    # Predict using Pool
+                    preds = [model.predict(predict_pool)[0] for model in ensemble]
                     
                     mean_pred = np.mean(preds)
                     std_pred = np.std(preds)
