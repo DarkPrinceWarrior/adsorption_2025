@@ -24,9 +24,12 @@ from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.model_selection import train_test_split
 
 from adsorb_synthesis.data_processing import load_dataset, build_lookup_tables, prepare_forward_dataset
-from adsorb_synthesis.constants import (
-    RANDOM_SEED, FORWARD_MODEL_TARGETS,
-    METAL_COORD_FEATURES, LIGAND_3D_FEATURES, LIGAND_2D_FEATURES, INTERACTION_FEATURES
+from adsorb_synthesis.constants import RANDOM_SEED, FORWARD_MODEL_TARGETS
+from adsorb_synthesis.feature_selection import (
+    select_features_advanced,
+    get_curated_features,
+    remove_highly_correlated,
+    FEATURE_GROUPS
 )
 
 def train_forward_models(
@@ -112,39 +115,35 @@ def train_forward_models(
             
         print(f"  Split for {target}: Train={len(X_train)}, Test={len(X_test)}")
         
-        # --- Feature Selection Step ---
-        print(f"  Performing Feature Selection for {target}...")
+        # --- Advanced Feature Selection with Multicollinearity Removal ---
+        print(f"  Advanced Feature Selection for {target}...")
         
-        # Train a temporary model to find best features
-        fs_model = CatBoostRegressor(
-            iterations=500,
-            learning_rate=0.05,
-            depth=6,
-            loss_function='RMSE',
-            random_seed=RANDOM_SEED,
-            verbose=False,
-            allow_writing_files=False,
-            cat_features=cat_features
+        # Step 1: Use curated features (domain knowledge) to pre-filter
+        keep_features, drop_features = get_curated_features()
+        
+        # Filter X_train to only curated + categorical features
+        available_keep = [f for f in keep_features if f in X_train.columns]
+        available_drop = [f for f in drop_features if f in X_train.columns]
+        
+        # Start with categorical + curated numeric features
+        numeric_cols = [c for c in X_train.columns if c not in cat_features]
+        curated_numeric = [c for c in numeric_cols if c not in available_drop]
+        
+        # Use advanced selection on curated features
+        selected_features, selection_report = select_features_advanced(
+            X_train[cat_features + curated_numeric],
+            y_train_target,
+            categorical_cols=cat_features,
+            corr_threshold=0.85,
+            vif_threshold=10.0,
+            max_features=15,
+            verbose=False  # Less verbose in training
         )
         
-        fs_model.fit(X_train, y_train_target, verbose=False)
-        
-        # Get feature importance
-        importance = fs_model.get_feature_importance(type='PredictionValuesChange')
-        feature_imp = pd.DataFrame({'feature': X_train.columns, 'importance': importance})
-        feature_imp = feature_imp.sort_values('importance', ascending=False)
-        
-        # Select top 20 features from importance ranking
-        # With smart feature selection (only ~11 new physics features), no forcing needed
-        n_features = 20
-        selected_features = feature_imp['feature'].head(n_features).tolist()
-        
-        # Report which new physics features made it
-        new_physics = [f for f in selected_features if any(x in f for x in ['metal_coord', 'ligand_3d', 'ligand_2d', 'Size_Ratio', 'Electronegativity_Diff', 'Jahn_Teller'])]
-        print(f"  Selected {len(selected_features)} features ({len(new_physics)} new physics):")
-        print(f"    Top 5: {selected_features[:5]}")
-        if new_physics:
-            print(f"    Physics: {new_physics}")
+        # Report results
+        n_removed = len(selection_report['removed_correlation']) + len(selection_report['removed_vif'])
+        print(f"    Removed {n_removed} multicollinear features")
+        print(f"    Selected {len(selected_features)} features: {selected_features[:5]}...")
         
         # Filter datasets to selected features only
         X_train_sel = X_train[selected_features]
@@ -213,11 +212,18 @@ def train_forward_models(
         
         models[target] = model_paths # Store list of paths
         
+        # Identify physics features in selection
+        physics_features = [f for f in selected_features if any(x in f for x in 
+            ['metal_coord', 'ligand_3d', 'ligand_2d', 'Size_Ratio', 'Electronegativity_Diff', 'Jahn_Teller'])]
+        
         metrics[target] = {
             "R2_test": r2_test,
             "R2_train": r2_train,
             "RMSE": rmse_test,
             "MAE": mae_test,
+            "selected_features": selected_features,
+            "physics_features": physics_features,
+            "n_removed_multicollinear": n_removed,
             "Uncertainty_Mean": float(np.mean(std_preds_test))
         }
 
