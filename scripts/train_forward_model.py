@@ -24,7 +24,10 @@ from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.model_selection import train_test_split
 
 from adsorb_synthesis.data_processing import load_dataset, build_lookup_tables, prepare_forward_dataset
-from adsorb_synthesis.constants import RANDOM_SEED, FORWARD_MODEL_TARGETS
+from adsorb_synthesis.constants import (
+    RANDOM_SEED, FORWARD_MODEL_TARGETS,
+    METAL_COORD_FEATURES, LIGAND_3D_FEATURES, LIGAND_2D_FEATURES, INTERACTION_FEATURES
+)
 
 def train_forward_models(
     data_path: str,
@@ -131,9 +134,17 @@ def train_forward_models(
         feature_imp = pd.DataFrame({'feature': X_train.columns, 'importance': importance})
         feature_imp = feature_imp.sort_values('importance', ascending=False)
         
-        # Select top 15 features
-        selected_features = feature_imp['feature'].head(15).tolist()
-        print(f"  Selected {len(selected_features)} features: {selected_features}")
+        # Select top 20 features from importance ranking
+        # With smart feature selection (only ~11 new physics features), no forcing needed
+        n_features = 20
+        selected_features = feature_imp['feature'].head(n_features).tolist()
+        
+        # Report which new physics features made it
+        new_physics = [f for f in selected_features if any(x in f for x in ['metal_coord', 'ligand_3d', 'ligand_2d', 'Size_Ratio', 'Electronegativity_Diff', 'Jahn_Teller'])]
+        print(f"  Selected {len(selected_features)} features ({len(new_physics)} new physics):")
+        print(f"    Top 5: {selected_features[:5]}")
+        if new_physics:
+            print(f"    Physics: {new_physics}")
         
         # Filter datasets to selected features only
         X_train_sel = X_train[selected_features]
@@ -229,6 +240,7 @@ if __name__ == "__main__":
     parser.add_argument("--data", type=str, default="data/SEC_SYN_with_features.csv", help="Path to input CSV")
     parser.add_argument("--output", type=str, default="artifacts/forward_models", help="Directory to save models")
     parser.add_argument("--iterations", type=int, default=1000, help="CatBoost iterations")
+    parser.add_argument("--no-feature-selection", action="store_true", help="Disable feature selection, use all features")
     
     args = parser.parse_args()
     

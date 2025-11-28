@@ -17,6 +17,10 @@ from .constants import (
     FORWARD_MODEL_INPUTS,
     FORWARD_MODEL_TARGETS,
     FORWARD_MODEL_ENGINEERED_FEATURES,
+    METAL_COORD_FEATURES,
+    LIGAND_3D_FEATURES,
+    LIGAND_2D_FEATURES,
+    INTERACTION_FEATURES,
 )
 from .data_validation import (
     DEFAULT_VALIDATION_MODE,
@@ -107,6 +111,13 @@ def prepare_forward_dataset(
     # These are critical for W0 prediction - CatBoost struggles to learn ratios
     for col in FORWARD_MODEL_ENGINEERED_FEATURES:
         if col in df.columns:
+            X[col] = df.loc[X.index, col]
+    
+    # 4b. Copy NEW physicochemical descriptors if present in df
+    # These are computed by scripts/enrich_descriptors.py
+    new_descriptor_cols = METAL_COORD_FEATURES + LIGAND_3D_FEATURES + LIGAND_2D_FEATURES + INTERACTION_FEATURES
+    for col in new_descriptor_cols:
+        if col in df.columns and col not in X.columns:
             X[col] = df.loc[X.index, col]
             
     # 5. Prepare Targets
