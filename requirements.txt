@@ -10,3 +10,4 @@ seaborn
 imbalanced-learn
 scipy
 pytest
+statsmodels
