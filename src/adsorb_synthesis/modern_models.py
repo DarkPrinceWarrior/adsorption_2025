@@ -1,4 +1,4 @@
-﻿"""Modern ensemble models for tabular data (2025)."""
+"""Modern ensemble models for tabular data (2025)."""
 
 from __future__ import annotations
 
@@ -16,11 +16,7 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
 
-from .config import (
-    CATBOOST_MODEL_CONFIG,
-    TABNET_MODEL_CONFIG,
-    XGBOOST_MODEL_CONFIG,
-)
+from .config import CATBOOST_MODEL_CONFIG
 from .constants import HUBER_DELTA_DEFAULT
 
 
@@ -79,20 +75,6 @@ def _apply_smote_if_available(X: np.ndarray, y: np.ndarray, random_state: int) -
         return X, y
 
 
-def _import_tabnet(problem_type: str):
-    try:
-        if problem_type == "classification":
-            from pytorch_tabnet.tab_model import TabNetClassifier as TabNetModel
-        else:
-            from pytorch_tabnet.tab_model import TabNetRegressor as TabNetModel
-    except ImportError as exc:
-        raise ImportError(
-            "pytorch-tabnet is required for ModernTabularEnsemble. "
-            "Install it with `pip install pytorch-tabnet`."
-        ) from exc
-    return TabNetModel
-
-
 def _import_catboost(problem_type: str):
     try:
         import catboost as cb
@@ -104,37 +86,16 @@ def _import_catboost(problem_type: str):
     return cb.CatBoostClassifier if problem_type == "classification" else cb.CatBoostRegressor
 
 
-def _import_xgboost(problem_type: str):
-    try:
-        from xgboost import XGBClassifier, XGBRegressor
-    except ImportError as exc:
-        raise ImportError(
-            "xgboost is required for ModernTabularEnsemble. "
-            "Install it with `pip install xgboost`."
-        ) from exc
-    return XGBClassifier if problem_type == "classification" else XGBRegressor
-
-
-def _default_tabnet_params(problem_type: str, random_state: int) -> Dict:
-    return TABNET_MODEL_CONFIG.to_params(problem_type, random_state)
-
-
 def _default_catboost_params(problem_type: str, random_state: int) -> Dict:
     return CATBOOST_MODEL_CONFIG.to_params(problem_type, random_state)
-
-
-def _default_xgboost_params(problem_type: str, random_state: int) -> Dict:
-    return XGBOOST_MODEL_CONFIG.to_params(problem_type, random_state)
 
 
 class _ModernTabularEnsemble(BaseEstimator):
     def __init__(
         self,
         problem_type: str,
-        tabnet_params: Optional[Dict] = None,
-        tabnet_fit_params: Optional[Dict] = None,
         catboost_params: Optional[Dict] = None,
-        xgb_params: Optional[Dict] = None,
+        n_estimators: int = 5,
         validation_fraction: float = 0.2,
         optimize_weights: bool = True,
         weight_opt_params: Optional[Dict] = None,
@@ -148,10 +109,8 @@ class _ModernTabularEnsemble(BaseEstimator):
         if not 0.0 < validation_fraction < 1.0:
             raise ValueError("validation_fraction must be between 0 and 1.")
         self.problem_type = problem_type
-        self.tabnet_params = tabnet_params
-        self.tabnet_fit_params = tabnet_fit_params
         self.catboost_params = catboost_params
-        self.xgb_params = xgb_params
+        self.n_estimators = n_estimators
         self.validation_fraction = validation_fraction
         self.optimize_weights = optimize_weights
         self.weight_opt_params = weight_opt_params
@@ -162,41 +121,13 @@ class _ModernTabularEnsemble(BaseEstimator):
         self.physics_loss_weight = physics_loss_weight
         self.feature_names = feature_names
 
-    def _make_tabnet(self):
-        TabNet = _import_tabnet(self.problem_type)
-        params = _default_tabnet_params(self.problem_type, self.random_state)
-        if self.tabnet_params:
-            params.update(dict(self.tabnet_params))
-        return TabNet(**params)
-
-    def _make_catboost(self):
+    def _make_catboost(self, seed: int):
         cls = _import_catboost(self.problem_type)
-        params = _default_catboost_params(self.problem_type, self.random_state)
+        params = _default_catboost_params(self.problem_type, seed)
         if self.catboost_params:
             params.update(dict(self.catboost_params))
+        params['random_seed'] = seed
         return cls(**params)
-
-    def _make_xgboost(self):
-        cls = _import_xgboost(self.problem_type)
-        params = _default_xgboost_params(self.problem_type, self.random_state)
-        if self.xgb_params:
-            params.update(dict(self.xgb_params))
-        return cls(**params)
-
-    def _tabnet_fit_kwargs(self, n_samples: int) -> Dict:
-        fit_params = self.tabnet_fit_params or {}
-        max_epochs = int(fit_params.get("max_epochs", 400))
-        patience = int(fit_params.get("patience", 60))
-        batch_size = int(min(fit_params.get("batch_size", 128), n_samples))
-        batch_size = max(batch_size, 16)
-        virtual_batch_size = int(min(fit_params.get("virtual_batch_size", 64), batch_size))
-        virtual_batch_size = max(virtual_batch_size, 16)
-        return dict(
-            max_epochs=max_epochs,
-            patience=patience,
-            batch_size=batch_size,
-            virtual_batch_size=virtual_batch_size,
-        )
 
     def _compute_physics_sample_weights(self, frames: Optional[pd.DataFrame], base_weights: np.ndarray) -> np.ndarray:
         """Compute sample weights incorporating physics violations."""
@@ -374,12 +305,9 @@ class _ModernTabularEnsemble(BaseEstimator):
         importances: List[np.ndarray] = []
         weights: List[float] = []
 
-        for weight, name, model in zip(self.weights_, self.model_names_, self.models_):
-            if name == "catboost" and hasattr(model, "get_feature_importance"):
+        for weight, model in zip(self.weights_, self.models_):
+            if hasattr(model, "get_feature_importance"):
                 importances.append(np.asarray(model.get_feature_importance(), dtype=np.float64))
-                weights.append(weight)
-            elif name == "xgboost" and hasattr(model, "feature_importances_"):
-                importances.append(np.asarray(model.feature_importances_, dtype=np.float64))
                 weights.append(weight)
 
         if not importances:
@@ -392,14 +320,12 @@ class _ModernTabularEnsemble(BaseEstimator):
 
 
 class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
-    """Ensemble of TabNet, CatBoost and XGBoost for classification with calibration."""
+    """Ensemble of 5 CatBoost models for classification with calibration."""
 
     def __init__(
         self,
-        tabnet_params: Optional[Dict] = None,
-        tabnet_fit_params: Optional[Dict] = None,
         catboost_params: Optional[Dict] = None,
-        xgb_params: Optional[Dict] = None,
+        n_estimators: int = 5,
         validation_fraction: float = 0.2,
         optimize_weights: bool = True,
         weight_opt_params: Optional[Dict] = None,
@@ -414,10 +340,8 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
     ) -> None:
         super().__init__(
             problem_type="classification",
-            tabnet_params=tabnet_params,
-            tabnet_fit_params=tabnet_fit_params,
             catboost_params=catboost_params,
-            xgb_params=xgb_params,
+            n_estimators=n_estimators,
             validation_fraction=validation_fraction,
             optimize_weights=optimize_weights,
             weight_opt_params=weight_opt_params,
@@ -501,96 +425,38 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         names: List[str] = []
         val_predictions: List[np.ndarray] = []
 
-        # TabNet
-        try:
-            tabnet = self._make_tabnet()
-            fit_kwargs = self._tabnet_fit_kwargs(X_train.shape[0])
-            if sw_train is not None:
-                fit_kwargs['weights'] = sw_train
-            tabnet.fit(
-                X_train,
-                y_train,
-                eval_set=[(X_val, y_val)],
-                **fit_kwargs,
-            )
-            models.append(tabnet)
-            names.append("tabnet")
-            val_predictions.append(self._normalise_proba(tabnet.predict_proba(X_val), self.n_classes_))
-        except Exception as exc:  # pragma: no cover - defensive
-            warnings.warn(f"TabNet training failed and will be skipped: {exc}", RuntimeWarning)
-
-        # CatBoost
-        try:
-            cat_model = self._make_catboost()
-            if self.n_classes_ > 2:
-                cat_model.set_params(
-                    auto_class_weights='None',
-                    loss_function="MultiClass",
-                    eval_metric="TotalF1",
-                    class_weights=list(focal_weights.values()),
+        for i in range(self.n_estimators):
+            seed = self.random_state + i
+            # CatBoost
+            try:
+                cat_model = self._make_catboost(seed=seed)
+                if self.n_classes_ > 2:
+                    cat_model.set_params(
+                        auto_class_weights='None',
+                        loss_function="MultiClass",
+                        eval_metric="TotalF1",
+                        class_weights=list(focal_weights.values()),
+                    )
+                else:
+                    cat_model.set_params(
+                        auto_class_weights='None',
+                        loss_function="Logloss",
+                        eval_metric="Logloss",
+                        class_weights=list(focal_weights.values()),
+                    )
+                cat_model.fit(
+                    X_train,
+                    y_train,
+                    eval_set=(X_val, y_val),
+                    early_stopping_rounds=100,
+                    verbose=False,
+                    sample_weight=sw_train,
                 )
-            else:
-                cat_model.set_params(
-                    auto_class_weights='None',
-                    loss_function="Logloss",
-                    eval_metric="Logloss",
-                    class_weights=list(focal_weights.values()),
-                )
-            cat_model.fit(
-                X_train,
-                y_train,
-                eval_set=(X_val, y_val),
-                early_stopping_rounds=100,
-                verbose=False,
-                sample_weight=sw_train,
-            )
-            models.append(cat_model)
-            names.append("catboost")
-            val_predictions.append(self._normalise_proba(cat_model.predict_proba(X_val), self.n_classes_))
-        except Exception as exc:  # pragma: no cover - defensive
-            warnings.warn(f"CatBoost training failed and will be skipped: {exc}", RuntimeWarning)
-
-        # XGBoost
-        try:
-            xgb_model = self._make_xgboost()
-            # Compute sample weights from focal weights
-            sample_weights = np.array([focal_weights[int(label)] for label in y_train], dtype=np.float32)
-            if sw_train is not None:
-                sample_weights = sample_weights * sw_train
-            eval_sample_weights = None
-            if sw_val is not None:
-                eval_sample_weights = np.array(
-                    [focal_weights[int(label)] for label in y_val],
-                    dtype=np.float32,
-                ) * sw_val
-            
-            if self.n_classes_ > 2:
-                xgb_model.set_params(
-                    objective="multi:softprob",
-                    num_class=self.n_classes_,
-                    eval_metric="mlogloss",
-                    max_delta_step=1,
-                )
-            else:
-                # For binary, use focal weights via sample_weight
-                xgb_model.set_params(
-                    objective="binary:logistic",
-                    eval_metric=["logloss", "auc"],
-                    max_delta_step=1,
-                )
-            xgb_model.fit(
-                X_train,
-                y_train,
-                sample_weight=sample_weights,
-                eval_set=[(X_val, y_val)],
-                verbose=False,
-                sample_weight_eval_set=[eval_sample_weights] if eval_sample_weights is not None else None,
-            )
-            models.append(xgb_model)
-            names.append("xgboost")
-            val_predictions.append(self._normalise_proba(xgb_model.predict_proba(X_val), self.n_classes_))
-        except Exception as exc:  # pragma: no cover - defensive
-            warnings.warn(f"XGBoost training failed and will be skipped: {exc}", RuntimeWarning)
+                models.append(cat_model)
+                names.append(f"catboost_{i}")
+                val_predictions.append(self._normalise_proba(cat_model.predict_proba(X_val), self.n_classes_))
+            except Exception as exc:  # pragma: no cover - defensive
+                warnings.warn(f"CatBoost training failed for seed {seed} and will be skipped: {exc}", RuntimeWarning)
 
         if not models:
             raise RuntimeError("All base models failed to train; cannot fit ensemble.")
@@ -641,7 +507,7 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
         X_arr = check_array(X, accept_sparse=False)
         X_arr = np.asarray(X_arr, dtype=np.float32)
         probs: List[np.ndarray] = []
-        for name, model in zip(self.model_names_, self.models_):
+        for model in self.models_:
             model_proba = model.predict_proba(X_arr)
             probs.append(self._normalise_proba(model_proba, self.n_classes_))
         prob_stack = np.stack(probs, axis=0)
@@ -656,14 +522,12 @@ class ModernTabularEnsembleClassifier(_ModernTabularEnsemble, ClassifierMixin):
 
 
 class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
-    """Ensemble of TabNet, CatBoost and XGBoost for regression with robust losses."""
+    """Ensemble of 5 CatBoost models for regression with robust losses."""
 
     def __init__(
         self,
-        tabnet_params: Optional[Dict] = None,
-        tabnet_fit_params: Optional[Dict] = None,
         catboost_params: Optional[Dict] = None,
-        xgb_params: Optional[Dict] = None,
+        n_estimators: int = 5,
         validation_fraction: float = 0.2,
         optimize_weights: bool = True,
         weight_opt_params: Optional[Dict] = None,
@@ -677,10 +541,8 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
     ) -> None:
         super().__init__(
             problem_type="regression",
-            tabnet_params=tabnet_params,
-            tabnet_fit_params=tabnet_fit_params,
             catboost_params=catboost_params,
-            xgb_params=xgb_params,
+            n_estimators=n_estimators,
             validation_fraction=validation_fraction,
             optimize_weights=optimize_weights,
             weight_opt_params=weight_opt_params,
@@ -736,90 +598,41 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         names: List[str] = []
         val_predictions: List[np.ndarray] = []
 
-        # TabNet
-        try:
-            tabnet = self._make_tabnet()
-            fit_kwargs = self._tabnet_fit_kwargs(X_train.shape[0])
-            if sw_train is not None:
-                fit_kwargs['weights'] = sw_train
-            tabnet.fit(
-                X_train,
-                y_train.reshape(-1, 1),
-                eval_set=[(X_val, y_val.reshape(-1, 1))],
-                **fit_kwargs,
-            )
-            models.append(tabnet)
-            names.append("tabnet")
-            val_predictions.append(np.asarray(tabnet.predict(X_val), dtype=np.float64).ravel())
-        except Exception as exc:  # pragma: no cover - defensive
-            warnings.warn(f"TabNet training failed and will be skipped: {exc}", RuntimeWarning)
-
-        # CatBoost
-        try:
-            cat_model = self._make_catboost()
-            if self.use_quantile:
-                logger.info("Using Quantile Regression (alpha=%s) for CatBoost", self.quantile_alpha)
-                cat_model.set_params(
-                    loss_function=f"Quantile:alpha={self.quantile_alpha}",
-                    eval_metric="MAE",
-                    subsample=0.85,
-                    rsm=0.85,
+        for i in range(self.n_estimators):
+            seed = self.random_state + i
+            # CatBoost
+            try:
+                cat_model = self._make_catboost(seed=seed)
+                if self.use_quantile:
+                    logger.info("Using Quantile Regression (alpha=%s) for CatBoost", self.quantile_alpha)
+                    cat_model.set_params(
+                        loss_function=f"Quantile:alpha={self.quantile_alpha}",
+                        eval_metric="MAE",
+                        subsample=0.85,
+                        rsm=0.85,
+                    )
+                else:
+                    # Use MAE for robustness
+                    logger.info("Using MAE loss for regression (CatBoost)")
+                    cat_model.set_params(
+                        loss_function="MAE",
+                        eval_metric="MAE",
+                        subsample=0.85,
+                        rsm=0.85,
+                    )
+                cat_model.fit(
+                    X_train,
+                    y_train,
+                    eval_set=(X_val, y_val),
+                    early_stopping_rounds=100,
+                    verbose=False,
+                    sample_weight=sw_train,
                 )
-            else:
-                # Use MAE for robustness (CatBoost Huber doesn't support delta parameter)
-                logger.info("Using MAE loss for regression (CatBoost)")
-                cat_model.set_params(
-                    loss_function="MAE",
-                    eval_metric="MAE",
-                    subsample=0.85,
-                    rsm=0.85,
-                )
-            cat_model.fit(
-                X_train,
-                y_train,
-                eval_set=(X_val, y_val),
-                early_stopping_rounds=100,
-                verbose=False,
-                sample_weight=sw_train,
-            )
-            models.append(cat_model)
-            names.append("catboost")
-            val_predictions.append(np.asarray(cat_model.predict(X_val), dtype=np.float64).ravel())
-        except Exception as exc:  # pragma: no cover - defensive
-            warnings.warn(f"CatBoost training failed and will be skipped: {exc}", RuntimeWarning)
-
-        # XGBoost
-        try:
-            xgb_model = self._make_xgboost()
-            if self.use_quantile:
-                logger.info("Using Quantile Regression (alpha=%s) for XGBoost", self.quantile_alpha)
-                xgb_model.set_params(
-                    objective=f"reg:quantileerror",
-                    quantile_alpha=self.quantile_alpha,
-                    eval_metric="mae",
-                )
-            else:
-                # Use pseudo-Huber (reg:pseudohubererror) for robustness
-                logger.info("Using Pseudo-Huber loss (delta=%s) for XGBoost", self.huber_delta)
-                xgb_model.set_params(
-                    objective="reg:pseudohubererror",
-                    huber_slope=self.huber_delta,
-                    eval_metric="mae",
-                )
-            eval_sample_weights = [sw_val] if sw_val is not None else None
-            xgb_model.fit(
-                X_train,
-                y_train,
-                eval_set=[(X_val, y_val)],
-                verbose=False,
-                sample_weight=sw_train,
-                sample_weight_eval_set=eval_sample_weights,
-            )
-            models.append(xgb_model)
-            names.append("xgboost")
-            val_predictions.append(np.asarray(xgb_model.predict(X_val), dtype=np.float64).ravel())
-        except Exception as exc:  # pragma: no cover - defensive
-            warnings.warn(f"XGBoost training failed and will be skipped: {exc}", RuntimeWarning)
+                models.append(cat_model)
+                names.append(f"catboost_{i}")
+                val_predictions.append(np.asarray(cat_model.predict(X_val), dtype=np.float64).ravel())
+            except Exception as exc:  # pragma: no cover - defensive
+                warnings.warn(f"CatBoost training failed for seed {seed} and will be skipped: {exc}", RuntimeWarning)
 
         if not models:
             raise RuntimeError("All base models failed to train; cannot fit ensemble.")
@@ -846,7 +659,7 @@ class ModernTabularEnsembleRegressor(_ModernTabularEnsemble, RegressorMixin):
         Predict mean and standard deviation (uncertainty).
         
         Uncertainty is estimated as the weighted standard deviation of the 
-        predictions from the ensemble members (TabNet, CatBoost, XGBoost).
+        predictions from the ensemble members.
         This captures epistemic uncertainty (model disagreement).
         """
         check_is_fitted(self, "weights_")

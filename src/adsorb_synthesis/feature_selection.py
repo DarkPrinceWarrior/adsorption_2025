@@ -388,6 +388,15 @@ FEATURE_GROUPS = {
     'interaction_primary': [
         'Metal_Ligand_Size_Ratio',            # Geometric matching
     ],
+    'physicochemical_primary': [
+        'n_water_hidden',                     # Hydration effect
+        'Ratio_H2O_Metal',                    # Hydration stoichiometry
+        'Molarity_Metal',                     # True molarity
+        'Molarity_Ligand',                    # True molarity
+        'Molarity_H2O_Hidden',                # Water concentration
+        'Supersaturation_Index',              # Nucleation proxy
+        'Reactor_Loading_g_mL',               # Density
+    ],
 }
 
 

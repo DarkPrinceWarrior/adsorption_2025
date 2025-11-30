@@ -220,6 +220,20 @@ STOICHIOMETRY_TARGETS = {
     ('Fe', 'BTB'): {'ratio': 1.5, 'tolerance': 0.2},
 }
 
+HYDRATION_MAP = {
+    'Cu': 3.0,  # Cu(NO3)2 * 3H2O
+    'Zn': 6.0,  # Zn(NO3)2 * 6H2O
+    'Al': 9.0,  # Al(NO3)3 * 9H2O
+    'Fe': 9.0,  # Fe(NO3)3 * 9H2O
+    'Co': 6.0,  # Co(NO3)2 * 6H2O
+    'Ni': 6.0,  # Ni(NO3)2 * 6H2O
+    'Zr': 0.0,  # Zirconium chloride is often anhydrous
+    'La': 6.0,  # La(NO3)3 * 6H2O
+    'Ce': 6.0,  # Ce(NO3)3 * 6H2O
+    'Cr': 9.0,  # Cr(NO3)3 * 9H2O
+    'In': 0.0,  # Indium is variable, default to 0
+}
+
 
 DEFAULT_STOICHIOMETRY_BOUNDS: tuple[float, float] = (0.45, 2.3)
 
@@ -286,4 +300,13 @@ FORWARD_MODEL_ENGINEERED_FEATURES = [
     
     # Interaction
     'Metal_Ligand_Combo',  # Categorical: metal-ligand pair
+    
+    # Physicochemical Descriptors (New)
+    'n_water_hidden',
+    'Ratio_H2O_Metal',
+    'Molarity_Metal',
+    'Molarity_Ligand',
+    'Molarity_H2O_Hidden',
+    'Supersaturation_Index',
+    'Reactor_Loading_g_mL'
 ]

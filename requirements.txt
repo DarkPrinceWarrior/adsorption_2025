@@ -11,3 +11,4 @@ imbalanced-learn
 scipy
 pytest
 statsmodels
+rdkit

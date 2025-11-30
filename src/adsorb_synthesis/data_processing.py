@@ -21,6 +21,7 @@ from .constants import (
     LIGAND_3D_FEATURES,
     LIGAND_2D_FEATURES,
     INTERACTION_FEATURES,
+    HYDRATION_MAP,
 )
 from .data_validation import (
     DEFAULT_VALIDATION_MODE,
@@ -164,6 +165,8 @@ def load_dataset(
         add_salt_mass_features(df)
     
     add_thermodynamic_features(df)
+    
+    add_physicochemical_descriptors(df)
 
     validate_SEH_data(df, mode=validation_mode)
     validate_synthesis_data(df, boiling_points=SOLVENT_BOILING_POINTS_C, mode=validation_mode)
@@ -409,6 +412,87 @@ def _ensure_adsorption_features(df: pd.DataFrame) -> None:
             "Missing engineered adsorption features after processing: "
             f"{sorted(missing_after)}"
         )
+
+
+def add_physicochemical_descriptors(df: pd.DataFrame) -> None:
+    """
+    Add physicochemical descriptors based on 'Hidden Water' and True Molarity.
+    
+    Algorithms:
+    1. Calculate Moles (n) if missing.
+    2. Calculate Hidden Water using HYDRATION_MAP.
+    3. Calculate True Molarity (Molarity_Metal, Molarity_Ligand, Molarity_H2O_Hidden).
+    4. Calculate Supersaturation Index and Reactor Loading.
+    """
+    # Constants
+    EPSILON = 1e-9
+    
+    # 1. Calculate Moles (n)
+    # Note: 'm (соли), г' is hydrate mass
+    if 'n_соли' not in df.columns and {'m (соли), г', 'Молярка_соли'}.issubset(df.columns):
+        df['n_соли'] = pd.to_numeric(df['m (соли), г'], errors='coerce') / \
+                       pd.to_numeric(df['Молярка_соли'], errors='coerce').replace(0, np.nan)
+                       
+    if 'n_кислоты' not in df.columns and {'m(кис-ты), г', 'Молярка_кислоты'}.issubset(df.columns):
+        df['n_кислоты'] = pd.to_numeric(df['m(кис-ты), г'], errors='coerce') / \
+                          pd.to_numeric(df['Молярка_кислоты'], errors='coerce').replace(0, np.nan)
+
+    # 2. Hidden Water Calculations
+    if 'Металл' in df.columns and 'n_соли' in df.columns:
+        # Map hydration coefficient
+        # Use 0.0 for unknown metals to avoid NaNs, or keep NaNs if critical? 
+        # Prompt says "fill NaNs... with zeros" later, so we can use map and fillna(0)
+        df['hydration_coeff'] = df['Металл'].map(HYDRATION_MAP).fillna(0.0)
+        
+        n_salt = pd.to_numeric(df['n_соли'], errors='coerce').fillna(0.0)
+        
+        # n_water_hidden = n_salt * hydration_coeff
+        df['n_water_hidden'] = n_salt * df['hydration_coeff']
+        
+        # Ratio_H2O_Metal
+        df['Ratio_H2O_Metal'] = df['hydration_coeff']
+        
+    # 3. True Molarity Calculations
+    if 'Vсин. (р-ля), мл' in df.columns:
+        vol_ml = pd.to_numeric(df['Vсин. (р-ля), мл'], errors='coerce').fillna(0.0)
+        vol_L = vol_ml / 1000.0
+        # Avoid division by zero
+        vol_L_safe = vol_L.replace(0, np.nan)
+        
+        if 'n_соли' in df.columns:
+            n_salt = pd.to_numeric(df['n_соли'], errors='coerce').fillna(0.0)
+            df['Molarity_Metal'] = n_salt / vol_L_safe
+            
+        if 'n_кислоты' in df.columns:
+            n_acid = pd.to_numeric(df['n_кислоты'], errors='coerce').fillna(0.0)
+            df['Molarity_Ligand'] = n_acid / vol_L_safe
+            
+        if 'n_water_hidden' in df.columns:
+            n_water = pd.to_numeric(df['n_water_hidden'], errors='coerce').fillna(0.0)
+            df['Molarity_H2O_Hidden'] = n_water / vol_L_safe
+            
+    # 4. Supersaturation & Reactor Loading
+    if 'Molarity_Metal' in df.columns and 'Molarity_Ligand' in df.columns:
+        df['Supersaturation_Index'] = df['Molarity_Metal'].fillna(0.0) * df['Molarity_Ligand'].fillna(0.0)
+        
+    if {'m (соли), г', 'm(кис-ты), г', 'Vсин. (р-ля), мл'}.issubset(df.columns):
+        m_salt = pd.to_numeric(df['m (соли), г'], errors='coerce').fillna(0.0)
+        m_acid = pd.to_numeric(df['m(кис-ты), г'], errors='coerce').fillna(0.0)
+        vol_ml = pd.to_numeric(df['Vсин. (р-ля), мл'], errors='coerce').replace(0, np.nan)
+        
+        df['Reactor_Loading_g_mL'] = (m_salt + m_acid) / vol_ml
+
+    # Fill NaNs with 0 for the new columns as requested
+    new_cols = [
+        'n_water_hidden', 'Ratio_H2O_Metal', 
+        'Molarity_Metal', 'Molarity_Ligand', 'Molarity_H2O_Hidden',
+        'Supersaturation_Index', 'Reactor_Loading_g_mL'
+    ]
+    
+    for col in new_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0.0)
+
 
 def _missing_columns(df: pd.DataFrame, columns: Iterable[str]) -> Iterable[str]:
     return [col for col in columns if col not in df.columns]
