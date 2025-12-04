@@ -96,31 +96,41 @@ def prepare_forward_dataset(
             
     # 3. Enrich with Descriptors (if provided)
     # This adds 'Total molecular weight', 'polarizability', etc. to X
+    # Save original index before merge (merge resets index and may duplicate rows)
+    X['_orig_idx'] = X.index
+    
     if lookup_tables:
-        # Merge Metal Descriptors
+        # Merge Metal Descriptors (reset_index as lookup tables use entity as index)
         if 'Металл' in X.columns:
-            X = X.merge(lookup_tables.metal, on='Металл', how='left')
+            metal_lookup = lookup_tables.metal.reset_index().drop_duplicates(subset=['Металл'])
+            X = X.merge(metal_lookup, on='Металл', how='left')
             
         # Merge Ligand Descriptors
         if 'Лиганд' in X.columns:
-            X = X.merge(lookup_tables.ligand, on='Лиганд', how='left')
+            ligand_lookup = lookup_tables.ligand.reset_index().drop_duplicates(subset=['Лиганд'])
+            X = X.merge(ligand_lookup, on='Лиганд', how='left')
             
         # Merge Solvent Descriptors
         if 'Растворитель' in X.columns:
-            X = X.merge(lookup_tables.solvent, on='Растворитель', how='left')
+            solvent_lookup = lookup_tables.solvent.reset_index().drop_duplicates(subset=['Растворитель'])
+            X = X.merge(solvent_lookup, on='Растворитель', how='left')
+    
+    # Restore original index after merge
+    X.index = X['_orig_idx']
+    X = X.drop(columns=['_orig_idx'])
     
     # 4. Copy Engineered Features from df (already computed by add_salt_mass_features)
     # These are critical for W0 prediction - CatBoost struggles to learn ratios
     for col in FORWARD_MODEL_ENGINEERED_FEATURES:
         if col in df.columns:
-            X[col] = df.loc[X.index, col]
+            X[col] = df.loc[X.index, col].values
     
     # 4b. Copy NEW physicochemical descriptors if present in df
     # These are computed by scripts/enrich_descriptors.py
     new_descriptor_cols = METAL_COORD_FEATURES + LIGAND_3D_FEATURES + LIGAND_2D_FEATURES + INTERACTION_FEATURES
     for col in new_descriptor_cols:
         if col in df.columns and col not in X.columns:
-            X[col] = df.loc[X.index, col]
+            X[col] = df.loc[X.index, col].values
             
     # 5. Prepare Targets
     missing_targets = [col for col in FORWARD_MODEL_TARGETS if col not in df.columns]

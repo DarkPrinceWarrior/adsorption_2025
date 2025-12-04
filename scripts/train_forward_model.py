@@ -222,6 +222,17 @@ def train_forward_models(
         
         models[target] = model_paths # Store list of paths
         
+        # Save predictions for parity plots
+        safe_target = target.replace('/', '_').replace(' ', '_')
+        predictions_df = pd.DataFrame({
+            'y_actual': y_test_target.values,
+            'y_pred': mean_preds_test,
+            'y_std': std_preds_test
+        })
+        predictions_path = os.path.join(output_dir, f"predictions_{safe_target}.csv")
+        predictions_df.to_csv(predictions_path, index=False)
+        print(f"  Saved predictions: {predictions_path}")
+        
         # Identify physics features in selection
         physics_features = [f for f in selected_features if any(x in f for x in 
             ['metal_coord', 'ligand_3d', 'ligand_2d', 'Size_Ratio', 'Electronegativity_Diff', 'Jahn_Teller'])]
