@@ -15,7 +15,6 @@ import optuna
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from catboost import CatBoostRegressor, Pool
 
 # Add src to path to import project modules
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -28,6 +27,7 @@ from adsorb_synthesis.constants import (
     FORWARD_MODEL_ENGINEERED_FEATURES,
     HYDRATION_MAP,
 )
+from adsorb_synthesis.neural_model import DeepEnsemble
 
 # Suppress Optuna logging to keep output clean
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -53,48 +53,31 @@ class AdsorbentOptimizer:
         # Define Search Space based on available data
         self.search_space = self._define_search_space()
         
-    def _load_models(self) -> Dict[str, List[CatBoostRegressor]]:
+    def _load_models(self) -> Dict[str, DeepEnsemble]:
+        """Load Deep Ensemble models for each target."""
         models = {}
-        self._feature_order = None  # Will be set from first loaded model
+        self._feature_orders = {}  # Feature order per target
         
         for target in FORWARD_MODEL_TARGETS:
-            target_models = []
-            # Try to load ensemble members
             safe_target = target.replace('/', '_').replace(' ', '_')
             
-            # Check for ensemble first
-            ensemble_found = False
-            for i in range(5): # Assume max 5 members
-                path = os.path.join(self.models_dir, f"catboost_{safe_target}_ens{i}.cbm")
-                if os.path.exists(path):
-                    ensemble_found = True
-                    model = CatBoostRegressor()
-                    model.load_model(path)
-                    target_models.append(model)
-                    
-                    # Store feature order from first model
-                    if self._feature_order is None:
-                        self._feature_order = model.feature_names_
-                        print(f"Feature order loaded: {len(self._feature_order)} features")
+            # Check for neural network ensemble
+            preprocessor_path = os.path.join(self.models_dir, f"preprocessor_{safe_target}.joblib")
+            nn_model_path = os.path.join(self.models_dir, f"nn_{safe_target}_ens0.pt")
             
-            # Fallback to single model if no ensemble found
-            if not ensemble_found:
-                path = os.path.join(self.models_dir, f"catboost_{safe_target}.cbm")
-                if os.path.exists(path):
-                    print(f"Warning: Loading single model for {target} (No ensemble found)")
-                    model = CatBoostRegressor()
-                    model.load_model(path)
-                    target_models.append(model)
-                    
-                    if self._feature_order is None:
-                        self._feature_order = model.feature_names_
-                else:
-                    print(f"Warning: Model for {target} not found at {path}")
+            if os.path.exists(preprocessor_path) and os.path.exists(nn_model_path):
+                print(f"Loading Deep Ensemble for {target}...")
+                ensemble = DeepEnsemble.load(self.models_dir, target)
+                models[target] = ensemble
+                
+                # Store feature order
+                self._feature_orders[target] = (
+                    ensemble.preprocessor.numeric_cols + 
+                    ensemble.preprocessor.categorical_cols
+                )
+                print(f"  Loaded {ensemble.n_models} models, {len(self._feature_orders[target])} features")
             else:
-                print(f"Loaded ensemble of {len(target_models)} models for {target}")
-
-            if target_models:
-                models[target] = target_models
+                print(f"Warning: Neural Network model for {target} not found")
         
         if not models:
             raise RuntimeError("No models found! Please run train_forward_model.py first.")
@@ -293,8 +276,9 @@ class AdsorbentOptimizer:
             if target_name in self.models:
                 try:
                     ensemble = self.models[target_name]
-                    # Get expected features from the first model in the ensemble
-                    model_features = ensemble[0].feature_names_
+                    
+                    # Get expected features for this target's model
+                    model_features = self._feature_orders[target_name]
                     
                     # Check if we have all needed features
                     missing = set(model_features) - set(df_input.columns)
@@ -306,22 +290,15 @@ class AdsorbentOptimizer:
                     # Prepare input slice for this specific model
                     df_slice = df_input[model_features]
                     
-                    # Prepare Pool just for this target
-                    # Identify present categorical features
-                    known_cats = ['Металл', 'Лиганд', 'Растворитель', 'Metal_Ligand_Combo']
-                    present_cats = [c for c in df_slice.columns if c in known_cats]
-                    
-                    predict_pool = Pool(df_slice, cat_features=present_cats)
-                    
-                    # Predict using Pool
-                    preds = [model.predict(predict_pool)[0] for model in ensemble]
-                    
-                    mean_pred = np.mean(preds)
-                    std_pred = np.std(preds)
+                    # Predict using Deep Ensemble
+                    mean_pred, std_pred = ensemble.predict(df_slice, return_std=True)
+                    mean_pred = mean_pred[0]  # Single sample
+                    std_pred = std_pred[0]
                     
                 except Exception as e:
                     # Feature mismatch or other error
-                    print(f"Prediction error for {target_name}: {e}")
+                    if trial.number == 0:
+                        print(f"Prediction error for {target_name}: {e}")
                     return 1e9
                 
                 predictions[target_name] = mean_pred

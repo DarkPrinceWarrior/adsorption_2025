@@ -3,8 +3,13 @@
 Train the Forward Model (Simulator) for Bayesian Optimization.
 
 This script implements 'Stage 2: Forward Model Creation' from the BO plan.
-It trains separate CatBoost regressors for each target property:
+It trains separate Deep Neural Network ensembles for each target property:
 Recipe (Inputs) -> Physical Properties (Outputs).
+
+Architecture:
+- Entity Embeddings for categorical features
+- Residual MLP blocks with BatchNorm and Dropout
+- Deep Ensemble (5 models) for uncertainty quantification
 """
 
 import argparse
@@ -19,9 +24,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 import joblib
 import pandas as pd
-from catboost import CatBoostRegressor
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.model_selection import train_test_split
+
+from adsorb_synthesis.neural_model import DeepEnsemble
 
 from adsorb_synthesis.data_processing import load_dataset, build_lookup_tables, prepare_forward_dataset
 from adsorb_synthesis.constants import RANDOM_SEED, FORWARD_MODEL_TARGETS, RARE_METALS_THRESHOLD
@@ -36,7 +42,10 @@ def train_forward_models(
     data_path: str,
     output_dir: str,
     test_size: float = 0.2,
-    iterations: int = 1000
+    epochs: int = 300,
+    hidden_dim: int = 256,
+    n_blocks: int = 4,
+    n_ensemble: int = 5
 ):
     print(f"Loading dataset from {data_path}...")
     # Load raw data with standard enrichment
@@ -57,11 +66,11 @@ def train_forward_models(
     print(f"Categorical features found: {cat_features}")
     
     metrics = {}
-    models = {} # Initialize models dict
+    models = {}  # Initialize models dict
     os.makedirs(output_dir, exist_ok=True)
     
-    # Train a separate ENSEMBLE of models for each target property
-    n_ensemble = 5
+    # Neural network hyperparameters
+    print(f"\nNeural Network Config: hidden_dim={hidden_dim}, n_blocks={n_blocks}, epochs={epochs}, ensemble={n_ensemble}")
     
     for target in FORWARD_MODEL_TARGETS:
         print(f"\n=== Training ENSEMBLE for target: {target} ===")
@@ -132,7 +141,6 @@ def train_forward_models(
         keep_features, drop_features = get_curated_features()
         
         # Filter X_train to only curated + categorical features
-        available_keep = [f for f in keep_features if f in X_train.columns]
         available_drop = [f for f in drop_features if f in X_train.columns]
         
         # Start with categorical + curated numeric features
@@ -146,8 +154,8 @@ def train_forward_models(
             categorical_cols=cat_features,
             corr_threshold=0.85,
             vif_threshold=10.0,
-            max_features=15,
-            verbose=False  # Less verbose in training
+            max_features=20,  # More features for neural net
+            verbose=False
         )
         
         # Report results
@@ -161,66 +169,50 @@ def train_forward_models(
         
         # Update cat_features for the selected subset
         cat_features_sel = [c for c in selected_features if c in cat_features]
-
-        model_paths = []
-        ensemble_preds_test = []
-        ensemble_preds_train = []
         
-        for i in range(n_ensemble):
-            seed = RANDOM_SEED + i
-            print(f"  Training member {i+1}/{n_ensemble} (seed={seed})...")
-            
-            # Initialize CatBoost with balanced regularization
-            model = CatBoostRegressor(
-                iterations=iterations,
-                learning_rate=0.05, # Increased from 0.03
-                depth=6,            # Increased from 4
-                l2_leaf_reg=1.0,    # Decreased from 3.0 (less regularization)
-                min_data_in_leaf=1, # Allow smaller leaves
-                subsample=0.8,
-                colsample_bylevel=0.8,
-                loss_function='RMSE',
-                random_seed=seed,
-                verbose=False, # Less verbose
-                allow_writing_files=False,
-                cat_features=cat_features_sel # Use updated cat_features
-            )
-            
-            # Fit model on SELECTED features
-            model.fit(
-                X_train_sel, y_train_target,
-                eval_set=(X_test_sel, y_test_target),
-                early_stopping_rounds=100,
-                use_best_model=True
-            )
-            
-            # Save individual model
-            safe_target = target.replace('/', '_').replace(' ', '_')
-            model_path = os.path.join(output_dir, f"catboost_{safe_target}_ens{i}.cbm")
-            model.save_model(model_path)
-            model_paths.append(model_path)
-            
-            # Collect predictions
-            ensemble_preds_test.append(model.predict(X_test_sel))
-            ensemble_preds_train.append(model.predict(X_train_sel))
-
-        # Aggregate predictions (Mean of Ensemble)
-        mean_preds_test = np.mean(ensemble_preds_test, axis=0)
-        std_preds_test = np.std(ensemble_preds_test, axis=0)
-        mean_preds_train = np.mean(ensemble_preds_train, axis=0)
+        # --- Train Deep Ensemble ---
+        print(f"  Training Deep Neural Network Ensemble...")
+        
+        ensemble = DeepEnsemble(
+            n_models=n_ensemble,
+            hidden_dim=hidden_dim,
+            n_blocks=n_blocks,
+            dropout=0.3,
+            lr=1e-3,
+            weight_decay=1e-4,
+            batch_size=32,
+            epochs=epochs,
+            patience=30
+        )
+        
+        ensemble.fit(
+            X_train_sel,
+            y_train_target,
+            X_val=X_test_sel,
+            y_val=y_test_target,
+            categorical_cols=cat_features_sel,
+            verbose=True
+        )
+        
+        # Get predictions
+        mean_preds_test, std_preds_test = ensemble.predict(X_test_sel, return_std=True)
+        mean_preds_train, _ = ensemble.predict(X_train_sel, return_std=True)
+        
+        # Save ensemble
+        model_paths = ensemble.save(output_dir, target)
         
         r2_test = r2_score(y_test_target, mean_preds_test)
         r2_train = r2_score(y_train_target, mean_preds_train)
         rmse_test = np.sqrt(mean_squared_error(y_test_target, mean_preds_test))
         mae_test = mean_absolute_error(y_test_target, mean_preds_test)
         
-        print(f"Ensemble Results for {target}:")
-        print(f"  R2 (Test):  {r2_test:.4f}")
-        print(f"  R2 (Train): {r2_train:.4f}")
-        print(f"  RMSE:       {rmse_test:.4f}")
-        print(f"  Avg Uncertainty (StdDev): {np.mean(std_preds_test):.4f}")
+        print(f"\n  Deep Ensemble Results for {target}:")
+        print(f"    R2 (Test):  {r2_test:.4f}")
+        print(f"    R2 (Train): {r2_train:.4f}")
+        print(f"    RMSE:       {rmse_test:.4f}")
+        print(f"    Avg Uncertainty (StdDev): {np.mean(std_preds_test):.4f}")
         
-        models[target] = model_paths # Store list of paths
+        models[target] = model_paths  # Store list of paths
         
         # Save predictions for parity plots
         safe_target = target.replace('/', '_').replace(' ', '_')
@@ -263,12 +255,22 @@ def train_forward_models(
     joblib.dump(feature_meta, os.path.join(output_dir, "feature_meta.joblib"))
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Forward Models for Adsorbent Synthesis")
+    parser = argparse.ArgumentParser(description="Train Deep Neural Network Forward Models for Adsorbent Synthesis")
     parser.add_argument("--data", type=str, default="data/SEC_SYN_with_features.csv", help="Path to input CSV")
     parser.add_argument("--output", type=str, default="artifacts/forward_models", help="Directory to save models")
-    parser.add_argument("--iterations", type=int, default=1000, help="CatBoost iterations")
+    parser.add_argument("--epochs", type=int, default=300, help="Training epochs per model")
+    parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden dimension of neural network")
+    parser.add_argument("--n-blocks", type=int, default=4, help="Number of residual blocks")
+    parser.add_argument("--n-ensemble", type=int, default=5, help="Number of models in ensemble")
     parser.add_argument("--no-feature-selection", action="store_true", help="Disable feature selection, use all features")
     
     args = parser.parse_args()
     
-    train_forward_models(args.data, args.output, iterations=args.iterations)
+    train_forward_models(
+        args.data,
+        args.output,
+        epochs=args.epochs,
+        hidden_dim=args.hidden_dim,
+        n_blocks=args.n_blocks,
+        n_ensemble=args.n_ensemble
+    )
