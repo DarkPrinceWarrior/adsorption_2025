@@ -26,6 +26,7 @@ from adsorb_synthesis.constants import (
     FORWARD_MODEL_TARGETS,
     FORWARD_MODEL_AUGMENTED_FEATURES,
     FORWARD_MODEL_ENGINEERED_FEATURES,
+    HYDRATION_MAP,
 )
 
 # Suppress Optuna logging to keep output clean
@@ -110,7 +111,8 @@ class AdsorbentOptimizer:
             # Ranges (min, max) for continuous vars
             "m_salt_range": (self.df_ref['m (соли), г'].min(), self.df_ref['m (соли), г'].max()),
             "m_acid_range": (self.df_ref['m(кис-ты), г'].min(), self.df_ref['m(кис-ты), г'].max()),
-            "v_solv_range": (self.df_ref['Vсин. (р-ля), мл'].min(), self.df_ref['Vсин. (р-ля), мл'].max()),
+            # Round to nearest 5 to avoid Optuna step warnings
+            "v_solv_range": (10.0, 180.0),  # Rounded from actual data range
             "t_syn_range": (80, 220), # Reasonable synthesis bounds
             "t_dry_range": (25, 150),
             "t_act_range": (100, 400),
@@ -153,12 +155,29 @@ class AdsorbentOptimizer:
         
         # 2.2. Stoichiometry constraints
         # Get molar masses from lookup tables
-        metal_desc = self.lookup_tables.metal.loc[metal]
-        ligand_desc = self.lookup_tables.ligand.loc[ligand]
-        solvent_desc = self.lookup_tables.solvent.loc[solvent]
+        try:
+            metal_desc = self.lookup_tables.metal.loc[metal]
+            ligand_desc = self.lookup_tables.ligand.loc[ligand]
+            solvent_desc = self.lookup_tables.solvent.loc[solvent]
+        except KeyError:
+            return 1e9  # Metal/ligand/solvent not found in lookup
+        
+        # Handle case where lookup returns DataFrame (multiple rows) vs Series (single row)
+        if isinstance(metal_desc, pd.DataFrame):
+            metal_desc = metal_desc.iloc[0]
+        if isinstance(ligand_desc, pd.DataFrame):
+            ligand_desc = ligand_desc.iloc[0]
+        if isinstance(solvent_desc, pd.DataFrame):
+            solvent_desc = solvent_desc.iloc[0]
         
         mw_salt = metal_desc.get('Молярка_соли', np.nan)
         mw_acid = ligand_desc.get('Молярка_кислоты', np.nan)
+        
+        # Ensure we have scalar values
+        if hasattr(mw_salt, 'item'):
+            mw_salt = mw_salt.item()
+        if hasattr(mw_acid, 'item'):
+            mw_acid = mw_acid.item()
         
         if pd.isna(mw_salt) or pd.isna(mw_acid) or mw_salt == 0 or mw_acid == 0:
             return 1e9  # Missing data, cannot proceed
@@ -234,6 +253,15 @@ class AdsorbentOptimizer:
             
             # Interaction feature
             "Metal_Ligand_Combo": f"{metal}_{ligand}",
+            
+            # Physicochemical descriptors (Hidden Water)
+            "n_water_hidden": n_salt * HYDRATION_MAP.get(metal, 0.0),
+            "Ratio_H2O_Metal": HYDRATION_MAP.get(metal, 0.0),
+            "Molarity_Metal": n_salt / (v_solv / 1000.0) if v_solv > 0 else 0.0,
+            "Molarity_Ligand": n_acid / (v_solv / 1000.0) if v_solv > 0 else 0.0,
+            "Molarity_H2O_Hidden": (n_salt * HYDRATION_MAP.get(metal, 0.0)) / (v_solv / 1000.0) if v_solv > 0 else 0.0,
+            "Supersaturation_Index": (n_salt * HYDRATION_MAP.get(metal, 0.0) * n_acid) / (v_solv / 1000.0 + 1e-9),
+            "Reactor_Loading_g_mL": (m_salt + m_acid) / v_solv if v_solv > 0 else 0.0,
         }
         
         # Convert to DataFrame
@@ -271,7 +299,8 @@ class AdsorbentOptimizer:
                     # Check if we have all needed features
                     missing = set(model_features) - set(df_input.columns)
                     if missing:
-                        # print(f"Missing features for {target_name}: {missing}")
+                        if trial.number == 0:  # Only print once
+                            print(f"Missing features for {target_name}: {missing}")
                         return 1e9
                         
                     # Prepare input slice for this specific model
@@ -370,7 +399,7 @@ def main():
 
     optimizer = AdsorbentOptimizer(
         models_dir=args.models,
-        data_path="data/SEC_SYN_with_features_DMFA_only.csv",
+        data_path="data/SEC_SYN_with_features_enriched.csv",
         n_trials=args.trials
     )
     

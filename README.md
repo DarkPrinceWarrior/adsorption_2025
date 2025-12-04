@@ -60,7 +60,7 @@ PYTHONPATH=src python -m pytest tests/ -q
 
 ```bash
 PYTHONPATH=src python scripts/train_forward_model.py \
-    --data data/SEC_SYN_with_features_DMFA_only_enriched.csv \
+    --data data/SEC_SYN_with_features_enriched.csv \
     --iterations 1000
 ```
 *Результат:* В папке `artifacts/forward_models` создаются 5 ансамблей (по одному на каждое целевое свойство).

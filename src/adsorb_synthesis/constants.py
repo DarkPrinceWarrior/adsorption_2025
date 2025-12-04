@@ -236,6 +236,7 @@ HYDRATION_MAP = {
     'Ce': 6.0,  # Ce(NO3)3 * 6H2O
     'Cr': 9.0,  # Cr(NO3)3 * 9H2O
     'In': 0.0,  # Indium is variable, default to 0
+    'Y': 6.0,   # Y(NO3)3 * 6H2O (Yttrium nitrate hexahydrate)
 }
 
 

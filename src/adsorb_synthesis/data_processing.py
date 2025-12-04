@@ -405,8 +405,43 @@ def add_temperature_categories(df: pd.DataFrame, *, inplace: bool = True) -> Opt
     return None
 
 
-def build_lookup_tables(df: pd.DataFrame) -> LookupTables:
-    """Create lookup tables for descriptor features used during inference."""
+def build_lookup_tables(df: pd.DataFrame, include_extended: bool = True) -> LookupTables:
+    """Create lookup tables for descriptor features used during inference.
+    
+    Args:
+        df: Dataset with all descriptor columns.
+        include_extended: If True, include advanced features (METAL_COORD_FEATURES,
+            LIGAND_3D_FEATURES, LIGAND_2D_FEATURES, INTERACTION_FEATURES).
+            These are required for forward model inference.
+    
+    Returns:
+        LookupTables with metal, ligand, and solvent descriptors.
+    """
+    # Base features (always required)
+    metal_features = list(METAL_DESCRIPTOR_FEATURES)
+    ligand_features = list(LIGAND_DESCRIPTOR_FEATURES)
+    solvent_features = list(SOLVENT_DESCRIPTOR_FEATURES)
+    
+    # Extended features (for forward model)
+    if include_extended:
+        # Add advanced metal features if present
+        for feat in METAL_COORD_FEATURES:
+            if feat in df.columns:
+                metal_features.append(feat)
+        # Add ligand geometry features if present
+        for feat in LIGAND_3D_FEATURES + LIGAND_2D_FEATURES:
+            if feat in df.columns:
+                ligand_features.append(feat)
+        # Add interaction features (need both metal and ligand for context)
+        for feat in INTERACTION_FEATURES:
+            if feat in df.columns:
+                # Interaction features go to metal table (primary key)
+                metal_features.append(feat)
+    
+    # Remove duplicates while preserving order
+    metal_features = list(dict.fromkeys(metal_features))
+    ligand_features = list(dict.fromkeys(ligand_features))
+    solvent_features = list(dict.fromkeys(solvent_features))
 
     missing_cols: Dict[str, Iterable[str]] = {
         "metal": _missing_columns(df, METAL_DESCRIPTOR_FEATURES + ["Металл"]),
@@ -418,13 +453,13 @@ def build_lookup_tables(df: pd.DataFrame) -> LookupTables:
             raise ValueError(f"Dataset is missing required columns {sorted(cols)} for {entity} lookup")
 
     metal_table = (
-        df[["Металл", *METAL_DESCRIPTOR_FEATURES]].drop_duplicates().set_index("Металл").sort_index()
+        df[["Металл", *metal_features]].drop_duplicates().set_index("Металл").sort_index()
     )
     ligand_table = (
-        df[["Лиганд", *LIGAND_DESCRIPTOR_FEATURES]].drop_duplicates().set_index("Лиганд").sort_index()
+        df[["Лиганд", *ligand_features]].drop_duplicates().set_index("Лиганд").sort_index()
     )
     solvent_table = (
-        df[["Растворитель", *SOLVENT_DESCRIPTOR_FEATURES]].drop_duplicates().set_index("Растворитель").sort_index()
+        df[["Растворитель", *solvent_features]].drop_duplicates().set_index("Растворитель").sort_index()
     )
 
     return LookupTables(metal=metal_table, ligand=ligand_table, solvent=solvent_table)

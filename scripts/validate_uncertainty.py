@@ -162,7 +162,7 @@ def validate_uncertainty(data_path: str, models_dir: str, output_dir: str):
 
 if __name__ == "__main__":
     validate_uncertainty(
-        data_path="data/SEC_SYN_with_features_DMFA_only.csv",
+        data_path="data/SEC_SYN_with_features_enriched.csv",
         models_dir="artifacts/forward_models",
         output_dir="artifacts/plots"
     )
