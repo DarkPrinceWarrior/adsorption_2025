@@ -8,6 +8,9 @@ CV_FOLDS_REGRESSION: int = 5
 OUTLIER_CONTAMINATION: float = 0.05
 HUBER_DELTA_DEFAULT: float = 5.0  # Tuned to match salt-mass scale (std ~29 g)
 
+# Stratification constants
+RARE_METALS_THRESHOLD: int = 10  # Metals with < 10 samples grouped as "Other"
+
 # Physics-informed loss constants
 R_GAS_J_MOL_K: float = 8.314  # Gas constant in J/(mol·K)
 E0_BOUNDS_KJ_MOL: tuple[float, float] = (10.0, 50.0)  # Bounds for E0 in kJ/mol (physisorption range)
@@ -19,6 +22,7 @@ E_E0_RATIO_TARGET: float = 1.0 / 3.0
 E_E0_RATIO_TOLERANCE: float = 0.05  # absolute tolerance in ratio units
 WS_W0_TOLERANCE: float = 0.0
 
+# Adsorption features for dataset
 ADSORPTION_FEATURES = [
     'W0, см3/г',
     'E0, кДж/моль',
@@ -184,8 +188,8 @@ TEMPERATURE_CATEGORIES = {
     },
     'Treg_Category': {
         'column': 'Tрег, ᵒС',
-        'bins': [0, 155, 265, 500],
-        'labels': ['Низкая (<155°C)', 'Средняя (155-265°C)', 'Высокая (>265°C)'],
+        'bins': [0, 150, 250, 400],
+        'labels': ['Низкая (<150°C)', 'Средняя (150-250°C)', 'Высокая (>250°C)'],
     },
 }
 
@@ -252,7 +256,7 @@ FORWARD_MODEL_INPUTS = [
     'Vсин. (р-ля), мл',
     'Т.син., °С',
     'Т суш., °С',
-    'Tрег, ᵒС',  # T activation
+    'Tрег, ᵒС',
 ]
 
 FORWARD_MODEL_TARGETS = [
@@ -272,7 +276,8 @@ FORWARD_MODEL_AUGMENTED_FEATURES = (
     LIGAND_3D_FEATURES +
     LIGAND_2D_FEATURES +
     SOLVENT_DESCRIPTOR_FEATURES +
-    INTERACTION_FEATURES
+    INTERACTION_FEATURES +
+    ['Tрег, ᵒС']  # Regeneration temperature
 )
 
 # Engineered features computed from synthesis parameters (known BEFORE synthesis)

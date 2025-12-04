@@ -24,7 +24,7 @@ from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.model_selection import train_test_split
 
 from adsorb_synthesis.data_processing import load_dataset, build_lookup_tables, prepare_forward_dataset
-from adsorb_synthesis.constants import RANDOM_SEED, FORWARD_MODEL_TARGETS
+from adsorb_synthesis.constants import RANDOM_SEED, FORWARD_MODEL_TARGETS, RARE_METALS_THRESHOLD
 from adsorb_synthesis.feature_selection import (
     select_features_advanced,
     get_curated_features,
@@ -71,46 +71,56 @@ def train_forward_models(
             print(f"Skipping {target}: not found in targets.")
             continue
 
-        # --- TARGET-BASED STRATIFICATION ---
-        # We split separately for EACH target to ensure its distribution is preserved
+        # --- IMPROVED TWO-LEVEL STRATIFICATION ---
+        # Combines Metal grouping with target quantile bins for better stratification
         y_target = y[target]
         
-        # Create bins for stratification (5 quantiles)
-        # qcut handles continuous variables well
+        # Step 1: Group rare metals to reduce singleton strata
+        if 'Металл' in X.columns:
+            metal_counts = X['Металл'].value_counts()
+            rare_metals = metal_counts[metal_counts < RARE_METALS_THRESHOLD].index.tolist()
+            metal_group = X['Металл'].apply(lambda m: 'Other' if m in rare_metals else m)
+        else:
+            metal_group = pd.Series(['Unknown'] * len(X), index=X.index)
+        
+        # Step 2: Create target bins (4 quantiles — optimal for 424 samples)
         try:
-            bins = pd.qcut(y_target, q=5, labels=False, duplicates='drop')
+            target_bins = pd.qcut(y_target, q=4, labels=['Q1', 'Q2', 'Q3', 'Q4'], duplicates='drop')
         except ValueError:
-            # Fallback if too few unique values (e.g. discrete target)
-            bins = y_target
-            
-        # Handle singletons in bins (classes with < 2 samples)
-        bin_counts = bins.value_counts()
-        singletons = bin_counts[bin_counts < 2].index
+            # Fallback if too few unique values
+            target_bins = pd.Series(['All'] * len(y_target), index=y_target.index)
+        
+        # Step 3: Combined stratification key: Metal_Group + Target_Bin
+        strat_key = metal_group.astype(str) + '_' + target_bins.astype(str)
+        
+        # Step 4: Handle singletons (strata with < 2 samples)
+        key_counts = strat_key.value_counts()
+        singletons = key_counts[key_counts < 2].index
         
         if len(singletons) > 0:
             # Mask non-singletons for splitting
-            mask_strat = ~bins.isin(singletons)
+            mask_strat = ~strat_key.isin(singletons)
             X_strat = X[mask_strat]
             y_strat = y_target[mask_strat]
-            bins_strat = bins[mask_strat]
+            strat_key_clean = strat_key[mask_strat]
             
             X_train, X_test, y_train_target, y_test_target = train_test_split(
                 X_strat, y_strat,
                 test_size=test_size,
                 random_state=RANDOM_SEED,
-                stratify=bins_strat
+                stratify=strat_key_clean
             )
             
-            # Add singletons to TRAIN
+            # Add singletons to TRAIN (avoid leakage)
             X_train = pd.concat([X_train, X[~mask_strat]])
             y_train_target = pd.concat([y_train_target, y_target[~mask_strat]])
         else:
-            # Standard stratified split
+            # Standard stratified split with combined key
             X_train, X_test, y_train_target, y_test_target = train_test_split(
                 X, y_target,
                 test_size=test_size,
                 random_state=RANDOM_SEED,
-                stratify=bins
+                stratify=strat_key
             )
             
         print(f"  Split for {target}: Train={len(X_train)}, Test={len(X_test)}")

@@ -378,12 +378,12 @@ FEATURE_GROUPS = {
     ],
     'temperature_primary': [
         'Т.син., °С',                         # Synthesis temperature
+        'Т суш., °С',                         # Drying temperature
         'Tрег, ᵒС',                           # Regeneration temperature
-        'T_range',                            # T_reg - T_syn
     ],
     'temperature_drop': [
-        'Т суш., °С',                         # Correlated with T.син
-        'T_activation',                       # = T_reg - T_dry
+        'T_range',                            # T_reg - T_syn
+        'T_activation',                       # T_reg - 100
     ],
     'interaction_primary': [
         'Metal_Ligand_Size_Ratio',            # Geometric matching

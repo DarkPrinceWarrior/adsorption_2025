@@ -155,6 +155,9 @@ def load_dataset(
     df = df.copy()
 
     add_molar_mass_columns(df)
+    
+    # Add thermodynamic features BEFORE validation (creates K_equilibrium, Delta_G)
+    add_thermodynamic_features(df)
 
     _ensure_adsorption_features(df)
 
@@ -163,8 +166,6 @@ def load_dataset(
     
     if add_salt_features:
         add_salt_mass_features(df)
-    
-    add_thermodynamic_features(df)
     
     add_physicochemical_descriptors(df)
 
@@ -232,7 +233,8 @@ def add_salt_mass_features(df: pd.DataFrame) -> None:
             where=ligand_moles != 0,
         )
 
-    # Temperature-derived features
+    # Temperature-derived features (Tрег removed - not available in merged dataset)
+    # Only compute if reg_temp_col exists (legacy datasets)
     if syn_temp_col in df.columns and reg_temp_col in df.columns:
         syn_temp = pd.to_numeric(df[syn_temp_col], errors='coerce')
         reg_temp = pd.to_numeric(df[reg_temp_col], errors='coerce')
@@ -307,8 +309,9 @@ def add_thermodynamic_features(df: pd.DataFrame) -> None:
     if 'Delta_G' in df.columns:
         delta_g_raw = pd.to_numeric(df['Delta_G'], errors='coerce').to_numpy(dtype=np.float64)
     elif 'E, кДж/моль' in df.columns:
-        # fallback Delta_G estimate using adsorption energy
-        delta_g_raw = pd.to_numeric(df['E, кДж/моль'], errors='coerce').to_numpy(dtype=np.float64)
+        # fallback Delta_G estimate using adsorption energy (negative sign for spontaneous adsorption)
+        delta_g_raw = -pd.to_numeric(df['E, кДж/моль'], errors='coerce').to_numpy(dtype=np.float64)
+        df['Delta_G'] = delta_g_raw  # Create the column for downstream use
 
     if delta_g_raw is not None:
         k_from_delta = np.full(len(df), np.nan, dtype=np.float64)
@@ -409,7 +412,7 @@ def _ensure_adsorption_features(df: pd.DataFrame) -> None:
     missing_after = expected.difference(df.columns)
     if missing_after:
         raise ValueError(
-            "Missing engineered adsorption features after processing: "
+            f"Missing engineered adsorption features after processing: "
             f"{sorted(missing_after)}"
         )
 
