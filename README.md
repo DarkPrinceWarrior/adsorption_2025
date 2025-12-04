@@ -34,15 +34,18 @@
 
 ## 2. Установка и Настройка
 
-Требуется Python 3.10+.
+Требуется Python 3.10+. Зависимости зафиксированы в `requirements.txt` (scikit-learn≥1.2, imbalanced-learn≥0.11).
 
 ```bash
 # 1. Создание виртуального окружения
 python3 -m venv venv
 source venv/bin/activate
 
-# 2. Установка зависимостей (CatBoost, Optuna, Pandas, Scikit-Learn)
+# 2. Установка зависимостей
 pip install -r requirements.txt
+
+# 3. Запуск тестов (40 тестов)
+PYTHONPATH=src python -m pytest tests/ -q
 ```
 
 ---
@@ -108,12 +111,17 @@ PYTHONPATH=src python scripts/run_bayes_opt.py \
 │   └── run_bayes_opt.py        # Inverse Design (Поиск рецептов)
 ├── src/
 │   └── adsorb_synthesis/
-│       ├── data_processing.py  # Генерация дескрипторов и очистка
-│       ├── feature_selection.py # Advanced Feature Selection (VIF, корреляции)
-│       ├── constants.py        # Справочники (Molar Masses, Features)
+│       ├── data_processing.py    # Генерация дескрипторов (inplace=True/False)
+│       ├── data_validation.py    # Валидация физических ограничений
+│       ├── outlier_detection.py  # Robust outlier detection (MAD/IQR/Tukey)
+│       ├── feature_selection.py  # Advanced Feature Selection (VIF, корреляции)
+│       ├── physics_losses.py     # Физические constraints и penalties
+│       ├── pipeline.py           # Multi-stage pipeline с physics weights
+│       ├── constants.py          # Справочники (Molar Masses, Features)
 │       └── ...
-├── data/                       # Экспериментальные датасеты
-└── artifacts/                  # Сохраненные модели и графики
+├── tests/                        # 40 unit/integration тестов
+├── data/                         # Экспериментальные датасеты
+└── artifacts/                    # Сохраненные модели и графики
 ```
 
 ## 5. Особенности реализации
@@ -131,7 +139,47 @@ PYTHONPATH=src python scripts/run_bayes_opt.py \
 *   **Лиганд:** `carboxyl_groups`, `molecular_weight`
 *   **Взаимодействие:** `Metal_Ligand_Size_Ratio`
 
+### Robust Outlier Detection
+Вместо `IsolationForest` (который может удалять валидные редкие режимы) используется **MAD-based detection**:
+*   **MAD (Median Absolute Deviation):** Робастен к скошенным распределениям (log-normal SBET, W0)
+*   **Winsorize fallback:** При малых выборках клиппинг вместо удаления
+*   **Configurable threshold:** `OutlierConfig(method=OutlierMethod.MAD, threshold=3.5)`
+
+### Data Processing Safety
+Все функции мутации DataFrame поддерживают параметр `inplace`:
+```python
+# Безопасная копия (не мутирует оригинал)
+df_new = add_salt_mass_features(df, inplace=False)
+
+# Мутация на месте (по умолчанию, backward compatible)
+add_salt_mass_features(df)  # inplace=True
+```
+
 ### Прочее
-*   **Physicochemical Constraints:** Оптимизатор учитывает жесткие ограничения (например, $T_{dry}$ не может быть сильно выше $T_{syn}$, стехиометрические соотношения должны быть в разумных пределах).
-*   **Robustness:** Использование `CatBoost` позволяет эффективно работать с категориальными данными без потери информации при One-Hot кодировании.
-*   **Uncertainty Quantification:** Ансамбль из 5 моделей даёт оценку неопределённости предсказания.
+*   **Physicochemical Constraints:** Оптимизатор учитывает жесткие ограничения (температурная монотонность, стехиометрия, точки кипения растворителей).
+*   **Physics Penalties:** Sample weights увеличиваются для образцов с нарушениями физических constraints ($a_0 = 28.86 \cdot W_0$, $E = E_0/3$).
+*   **Robustness:** `CatBoost` эффективно работает с категориальными данными без One-Hot кодирования.
+*   **Uncertainty Quantification:** Ансамбль из 5 моделей даёт оценку неопределённости ($\sigma$).
+*   **SMOTE/ADASYN:** Автоматический resampling для несбалансированных классов (требует `imbalanced-learn`).
+
+---
+
+## 6. Тестирование
+
+```bash
+# Все тесты
+PYTHONPATH=src python -m pytest tests/ -v
+
+# Только outlier detection
+PYTHONPATH=src python -m pytest tests/test_outlier_detection.py -v
+
+# Только physics constraints
+PYTHONPATH=src python -m pytest tests/test_physics_constraints.py -v
+```
+
+**Покрытие:** 40 тестов включая:
+*   Data validation (warn/strict modes)
+*   Outlier detection (MAD, IQR, Winsorize)
+*   Physics constraints (thermodynamics, stoichiometry)
+*   DataFrame copy semantics (`inplace=True/False`)
+*   Pipeline integration

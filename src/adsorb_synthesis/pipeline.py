@@ -12,7 +12,12 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, clone
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import IsolationForest
+from .outlier_detection import (
+    DEFAULT_OUTLIER_CONFIG,
+    OutlierConfig,
+    OutlierMethod,
+    filter_outliers,
+)
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
@@ -71,7 +76,7 @@ class StageConfig:
     feature_columns: Sequence[str]
     estimator_factory: Callable[[int], BaseEstimator]
     depends_on: Tuple[str, ...] = ()
-    outlier_contamination: Optional[float] = None
+    outlier_config: Optional[OutlierConfig] = None
     description: str = ""
     physics_weight: float = 0.0
     physics_evaluator: Optional[PhysicsConstraintEvaluator] = None
@@ -631,13 +636,13 @@ class InverseDesignPipeline:
             cols.append(stage.target)
         df = data[cols].dropna()
 
-        if stage.problem_type == "regression" and stage.outlier_contamination:
-            iso = IsolationForest(
-                contamination=stage.outlier_contamination,
-                random_state=self.random_state,
+        if stage.problem_type == "regression" and stage.outlier_config is not None:
+            df = filter_outliers(
+                df,
+                target_column=stage.target,
+                config=stage.outlier_config,
+                feature_columns=list(stage.feature_columns) if stage.outlier_config.use_features else None,
             )
-            mask = iso.fit_predict(df[[stage.target]]) == 1
-            df = df.loc[mask]
         return df
 
     def _build_pipeline(self, data: pd.DataFrame, features: Sequence[str], estimator: BaseEstimator) -> Pipeline:

@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Union, overload
+from typing_extensions import Literal
 
 import numpy as np
 import pandas as pd
@@ -175,8 +176,23 @@ def load_dataset(
     return df
 
 
-def add_salt_mass_features(df: pd.DataFrame) -> None:
-    """Add engineered features derived from synthesis parameters and adsorption checks."""
+@overload
+def add_salt_mass_features(df: pd.DataFrame, *, inplace: Literal[True] = ...) -> None: ...
+@overload
+def add_salt_mass_features(df: pd.DataFrame, *, inplace: Literal[False]) -> pd.DataFrame: ...
+
+def add_salt_mass_features(df: pd.DataFrame, *, inplace: bool = True) -> Optional[pd.DataFrame]:
+    """Add engineered features derived from synthesis parameters and adsorption checks.
+    
+    Args:
+        df: Input DataFrame.
+        inplace: If True (default), mutate df in place. If False, return a copy.
+        
+    Returns:
+        None if inplace=True, otherwise a new DataFrame with added features.
+    """
+    if not inplace:
+        df = df.copy()
 
     metal_col = 'Металл'
     ligand_col = 'Лиганд'
@@ -274,14 +290,33 @@ def add_salt_mass_features(df: pd.DataFrame) -> None:
         SBET = numeric_adsorption['SБЭТ, м2/г']
         W0 = numeric_adsorption['W0, см3/г']
         df['W0_per_SBET'] = np.divide(W0, SBET, out=np.full_like(W0, np.nan), where=SBET != 0)
+    
+    if not inplace:
+        return df
+    return None
 
 
-def add_thermodynamic_features(df: pd.DataFrame) -> None:
-    """Derive thermodynamic helper columns from measured K_eq and ΔG."""
+@overload
+def add_thermodynamic_features(df: pd.DataFrame, *, inplace: Literal[True] = ...) -> None: ...
+@overload
+def add_thermodynamic_features(df: pd.DataFrame, *, inplace: Literal[False]) -> pd.DataFrame: ...
+
+def add_thermodynamic_features(df: pd.DataFrame, *, inplace: bool = True) -> Optional[pd.DataFrame]:
+    """Derive thermodynamic helper columns from measured K_eq and ΔG.
+    
+    Args:
+        df: Input DataFrame.
+        inplace: If True (default), mutate df in place. If False, return a copy.
+        
+    Returns:
+        None if inplace=True, otherwise a new DataFrame with added features.
+    """
+    if not inplace:
+        df = df.copy()
 
     temperature_col = 'Т.син., °С'
     if temperature_col not in df.columns:
-        return
+        return df if not inplace else None
 
     temperature_c = pd.to_numeric(df[temperature_col], errors='coerce').to_numpy(dtype=np.float64)
     temperature_k = temperature_c + 273.15
@@ -333,10 +368,29 @@ def add_thermodynamic_features(df: pd.DataFrame) -> None:
             out=np.full(len(df), np.nan, dtype=np.float64),
             where=np.isfinite(k_from_delta) & (k_from_delta != 0),
         )
+    
+    if not inplace:
+        return df
+    return None
 
 
-def add_temperature_categories(df: pd.DataFrame) -> None:
-    """Add categorical temperature buckets used for classification models."""
+@overload
+def add_temperature_categories(df: pd.DataFrame, *, inplace: Literal[True] = ...) -> None: ...
+@overload
+def add_temperature_categories(df: pd.DataFrame, *, inplace: Literal[False]) -> pd.DataFrame: ...
+
+def add_temperature_categories(df: pd.DataFrame, *, inplace: bool = True) -> Optional[pd.DataFrame]:
+    """Add categorical temperature buckets used for classification models.
+    
+    Args:
+        df: Input DataFrame.
+        inplace: If True (default), mutate df in place. If False, return a copy.
+        
+    Returns:
+        None if inplace=True, otherwise a new DataFrame with added features.
+    """
+    if not inplace:
+        df = df.copy()
 
     for category_name, spec in TEMPERATURE_CATEGORIES.items():
         column = spec["column"]
@@ -345,6 +399,10 @@ def add_temperature_categories(df: pd.DataFrame) -> None:
         if column not in df.columns:
             continue
         df[category_name] = pd.cut(df[column], bins=bins, labels=labels, right=False)
+    
+    if not inplace:
+        return df
+    return None
 
 
 def build_lookup_tables(df: pd.DataFrame) -> LookupTables:
@@ -372,8 +430,23 @@ def build_lookup_tables(df: pd.DataFrame) -> LookupTables:
     return LookupTables(metal=metal_table, ligand=ligand_table, solvent=solvent_table)
 
 
-def _ensure_adsorption_features(df: pd.DataFrame) -> None:
-    """Compute engineered adsorption descriptors when they are missing."""
+@overload
+def _ensure_adsorption_features(df: pd.DataFrame, *, inplace: Literal[True] = ...) -> None: ...
+@overload
+def _ensure_adsorption_features(df: pd.DataFrame, *, inplace: Literal[False]) -> pd.DataFrame: ...
+
+def _ensure_adsorption_features(df: pd.DataFrame, *, inplace: bool = True) -> Optional[pd.DataFrame]:
+    """Compute engineered adsorption descriptors when they are missing.
+    
+    Args:
+        df: Input DataFrame.
+        inplace: If True (default), mutate df in place. If False, return a copy.
+        
+    Returns:
+        None if inplace=True, otherwise a new DataFrame with added features.
+    """
+    if not inplace:
+        df = df.copy()
 
     required_base = {
         'E, кДж/моль',
@@ -415,9 +488,18 @@ def _ensure_adsorption_features(df: pd.DataFrame) -> None:
             f"Missing engineered adsorption features after processing: "
             f"{sorted(missing_after)}"
         )
+    
+    if not inplace:
+        return df
+    return None
 
 
-def add_physicochemical_descriptors(df: pd.DataFrame) -> None:
+@overload
+def add_physicochemical_descriptors(df: pd.DataFrame, *, inplace: Literal[True] = ...) -> None: ...
+@overload
+def add_physicochemical_descriptors(df: pd.DataFrame, *, inplace: Literal[False]) -> pd.DataFrame: ...
+
+def add_physicochemical_descriptors(df: pd.DataFrame, *, inplace: bool = True) -> Optional[pd.DataFrame]:
     """
     Add physicochemical descriptors based on 'Hidden Water' and True Molarity.
     
@@ -426,7 +508,17 @@ def add_physicochemical_descriptors(df: pd.DataFrame) -> None:
     2. Calculate Hidden Water using HYDRATION_MAP.
     3. Calculate True Molarity (Molarity_Metal, Molarity_Ligand, Molarity_H2O_Hidden).
     4. Calculate Supersaturation Index and Reactor Loading.
+    
+    Args:
+        df: Input DataFrame.
+        inplace: If True (default), mutate df in place. If False, return a copy.
+        
+    Returns:
+        None if inplace=True, otherwise a new DataFrame with added features.
     """
+    if not inplace:
+        df = df.copy()
+    
     # Constants
     EPSILON = 1e-9
     
@@ -495,6 +587,10 @@ def add_physicochemical_descriptors(df: pd.DataFrame) -> None:
     for col in new_cols:
         if col in df.columns:
             df[col] = df[col].fillna(0.0)
+    
+    if not inplace:
+        return df
+    return None
 
 
 def _missing_columns(df: pd.DataFrame, columns: Iterable[str]) -> Iterable[str]:

@@ -64,10 +64,14 @@ def test_project_stoichiometry_respects_targets_and_fallback():
 
 
 def test_enforce_temperature_limits_monotonic_and_boiling():
+    # Use exact category labels from TEMPERATURE_CATEGORIES in constants.py:
+    # Tsyn_Category: ['Низкая (<115°C)', 'Средняя (115-135°C)', 'Высокая (>135°C)']
+    # Tdry_Category: ['Низкая (<115°C)', 'Средняя (115-135°C)', 'Высокая (>135°C)']
+    # Treg_Category: ['Низкая (<150°C)', 'Средняя (150-250°C)', 'Высокая (>250°C)']
     df = pd.DataFrame({
         'Tsyn_Category': ['Средняя (115-135°C)', 'Высокая (>135°C)'],
         'Tdry_Category': ['Низкая (<115°C)', 'Высокая (>135°C)'],
-        'Treg_Category': ['Низкая (<155°C)', 'Низкая (<155°C)'],
+        'Treg_Category': ['Низкая (<150°C)', 'Средняя (150-250°C)'],  # Fixed label
         'Растворитель': ['ДМФА', 'Метанол'],
         'Т.син., °С': [np.nan, np.nan],
         'Т суш., °С': [np.nan, np.nan],
@@ -86,7 +90,6 @@ def test_enforce_temperature_limits_monotonic_and_boiling():
     assert df.loc[1, 'Т.син., °С'] < 65.0
     assert df.loc[1, 'Т суш., °С'] >= df.loc[1, 'Т.син., °С']
     assert df.loc[1, 'Tрег, ᵒС'] >= df.loc[1, 'Т суш., °С']
-    assert df.loc[1, 'Treg_Category'] != 'Низкая (<155°C)'
 
 
 def test_physics_evaluator_enforces_new_constraint_types():

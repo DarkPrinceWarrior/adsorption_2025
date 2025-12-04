@@ -48,6 +48,11 @@ def _apply_smote_if_available(X: np.ndarray, y: np.ndarray, random_state: int) -
     """Apply SMOTE/ADASYN if available, otherwise return original data."""
     SMOTE, ADASYN = _try_import_smote()
     if SMOTE is None:
+        warnings.warn(
+            "imbalanced-learn not installed; SMOTE/ADASYN resampling will be skipped. "
+            "Install with: pip install imbalanced-learn>=0.11.0",
+            UserWarning,
+        )
         return X, y
     
     try:
