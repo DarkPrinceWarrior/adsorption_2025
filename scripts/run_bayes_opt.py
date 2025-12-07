@@ -52,6 +52,7 @@ class AdsorbentOptimizer:
         self.models_dir = models_dir
         self.data_path = data_path
         self.n_trials = n_trials
+        self.strict_validation = False
         
         # Load Models
         self.models = self._load_models()
@@ -59,7 +60,8 @@ class AdsorbentOptimizer:
         
         # Load Reference Data & Lookups
         print(f"Loading reference data from {data_path}...")
-        self.df_ref = load_dataset(data_path)
+        validation_mode = "strict" if getattr(self, "strict_validation", False) else "warn"
+        self.df_ref = load_dataset(data_path, validation_mode=validation_mode)
         self.lookup_tables = build_lookup_tables(self.df_ref)
         
         # Define Search Space based on available data
@@ -375,9 +377,6 @@ class AdsorbentOptimizer:
                 term = weights.get(target_name, 1.0) * (err_term + LAMBDA_UNCERTAINTY * sigma_term)
                     
                 loss += term
-            else:
-                continue
-
         # Additional physics-based checks on predictions (where available)
         # E0 bounds
         e0_pred = predictions.get("E0, кДж/моль")
@@ -386,6 +385,18 @@ class AdsorbentOptimizer:
             if not (lo_e0 <= e0_pred <= hi_e0):
                 return 1e9
         
+        # Physics consistency checks on predictions (hard rejection)
+        w0_pred = predictions.get("W0, см3/г")
+        ws_pred = predictions.get("Ws, см3/г")
+        if w0_pred is not None and ws_pred is not None and ws_pred < w0_pred:
+            return 1e9
+
+        e_pred = predictions.get("E, кДж/моль")
+        if e_pred is not None and e0_pred is not None and e0_pred != 0:
+            ratio = e_pred / e0_pred
+            if ratio < 0.2 or ratio > 1.0:
+                return 1e9
+
         # --- 5. Store predictions for later retrieval ---
         for k, v in predictions.items():
             trial.set_user_attr(k, float(v))
@@ -432,6 +443,7 @@ def main():
     parser.add_argument("--trials", type=int, default=200, help="Number of optimization trials")
     parser.add_argument("--output", type=str, default="predictions_bo.csv", help="Output CSV file")
     parser.add_argument("--models", type=str, default="artifacts/forward_models", help="Path to trained models")
+    parser.add_argument("--strict-validation", action="store_true", help="Use strict validation (errors on invalid rows)")
     
     args = parser.parse_args()
     
@@ -452,6 +464,7 @@ def main():
         data_path="data/SEC_SYN_with_features_enriched.csv",
         n_trials=args.trials
     )
+    optimizer.strict_validation = args.strict_validation
     
     df_results = optimizer.optimize(targets)
     
