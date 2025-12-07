@@ -22,6 +22,8 @@ import pandas as pd
 from catboost import CatBoostRegressor
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.model_selection import train_test_split
+from sklearn.isotonic import IsotonicRegression
+from collections import defaultdict
 
 from adsorb_synthesis.data_processing import load_dataset, build_lookup_tables, prepare_forward_dataset
 from adsorb_synthesis.constants import RANDOM_SEED, FORWARD_MODEL_TARGETS, RARE_METALS_THRESHOLD
@@ -31,6 +33,25 @@ from adsorb_synthesis.feature_selection import (
     remove_highly_correlated,
     FEATURE_GROUPS
 )
+
+
+def fit_uncertainty_calibrator(sigmas: np.ndarray, abs_errors: np.ndarray) -> Dict:
+    """Fit sigma->abs_error calibrator using isotonic regression or scale fallback."""
+    sigmas = np.asarray(sigmas, dtype=float)
+    abs_errors = np.asarray(abs_errors, dtype=float)
+    mask = np.isfinite(sigmas) & np.isfinite(abs_errors)
+    sigmas = sigmas[mask]
+    abs_errors = abs_errors[mask]
+
+    if len(sigmas) >= 20 and np.unique(sigmas).size >= 5:
+        iso = IsotonicRegression(out_of_bounds="clip")
+        iso.fit(sigmas, abs_errors)
+        return {"type": "isotonic", "model": iso}
+
+    # Fallback: linear scaling of sigma to median absolute error
+    median_sigma = np.median(sigmas) if len(sigmas) else 1e-8
+    scale = np.median(abs_errors) / max(median_sigma, 1e-8)
+    return {"type": "scale", "scale": float(scale)}
 
 def train_forward_models(
     data_path: str,
@@ -59,6 +80,7 @@ def train_forward_models(
     metrics = {}
     models = {} # Initialize models dict
     os.makedirs(output_dir, exist_ok=True)
+    calibrators = {}
     
     # Train a separate ENSEMBLE of models for each target property
     n_ensemble = 5
@@ -165,11 +187,21 @@ def train_forward_models(
         model_paths = []
         ensemble_preds_test = []
         ensemble_preds_train = []
-        
+        oob_preds = defaultdict(list)  # idx -> list of OOB predictions
+
         for i in range(n_ensemble):
             seed = RANDOM_SEED + i
             print(f"  Training member {i+1}/{n_ensemble} (seed={seed})...")
             
+            # Bootstrap sampling for epistemic diversity
+            rng = np.random.RandomState(seed)
+            boot_indices = rng.choice(len(X_train_sel), size=len(X_train_sel), replace=True)
+            boot_mask = np.zeros(len(X_train_sel), dtype=bool)
+            boot_mask[boot_indices] = True
+            oob_mask = ~boot_mask
+            X_boot = X_train_sel.iloc[boot_indices]
+            y_boot = y_train_target.iloc[boot_indices]
+
             # Initialize CatBoost with balanced regularization
             model = CatBoostRegressor(
                 iterations=iterations,
@@ -188,7 +220,7 @@ def train_forward_models(
             
             # Fit model on SELECTED features
             model.fit(
-                X_train_sel, y_train_target,
+                X_boot, y_boot,
                 eval_set=(X_test_sel, y_test_target),
                 early_stopping_rounds=100,
                 use_best_model=True
@@ -203,6 +235,13 @@ def train_forward_models(
             # Collect predictions
             ensemble_preds_test.append(model.predict(X_test_sel))
             ensemble_preds_train.append(model.predict(X_train_sel))
+
+            # Collect OOB predictions for calibration
+            if np.any(oob_mask):
+                oob_idx_labels = X_train_sel.index[oob_mask]
+                oob_pred_values = model.predict(X_train_sel.iloc[oob_mask])
+                for idx_val, pred_val in zip(oob_idx_labels, oob_pred_values):
+                    oob_preds[idx_val].append(pred_val)
 
         # Aggregate predictions (Mean of Ensemble)
         mean_preds_test = np.mean(ensemble_preds_test, axis=0)
@@ -236,7 +275,33 @@ def train_forward_models(
         # Identify physics features in selection
         physics_features = [f for f in selected_features if any(x in f for x in 
             ['metal_coord', 'ligand_3d', 'ligand_2d', 'Size_Ratio', 'Electronegativity_Diff', 'Jahn_Teller'])]
-        
+
+        # Fit uncertainty calibrator using OOB predictions (sigma -> |error|)
+        oob_sigmas = []
+        oob_abs_errors = []
+        if oob_preds:
+            for idx_val, preds_list in oob_preds.items():
+                if len(preds_list) == 0:
+                    continue
+                mu = np.mean(preds_list)
+                sigma = np.std(preds_list)
+                if not np.isfinite(sigma):
+                    continue
+                oob_sigmas.append(sigma)
+                oob_abs_errors.append(abs(y_train_target.loc[idx_val] - mu))
+        calibrator = None
+        calibrator_meta = None
+        if oob_sigmas:
+            calibrator = fit_uncertainty_calibrator(np.array(oob_sigmas), np.array(oob_abs_errors))
+            if calibrator["type"] == "isotonic":
+                calibrator_meta = {"type": "isotonic", "n_oob": len(oob_sigmas)}
+            else:
+                calibrator_meta = {"type": "scale", "n_oob": len(oob_sigmas), "scale": calibrator.get("scale", None)}
+        else:
+            calibrator_meta = {"type": "none", "n_oob": 0}
+        # Store calibrator for saving later
+        calibrators[target] = calibrator
+
         metrics[target] = {
             "R2_test": r2_test,
             "R2_train": r2_train,
@@ -245,13 +310,17 @@ def train_forward_models(
             "selected_features": selected_features,
             "physics_features": physics_features,
             "n_removed_multicollinear": n_removed,
-            "Uncertainty_Mean": float(np.mean(std_preds_test))
+            "Uncertainty_Mean": float(np.mean(std_preds_test)),
+            "Uncertainty_Calibrator": calibrator_meta,
         }
 
     # Save metrics summary
     metrics_path = os.path.join(output_dir, "metrics.json")
     with open(metrics_path, 'w', encoding='utf-8') as f:
         json.dump(metrics, f, indent=4, ensure_ascii=False)
+    # Save uncertainty calibrators (if any)
+    if 'calibrators' in locals():
+        joblib.dump(calibrators, os.path.join(output_dir, "uncertainty_calibrators.joblib"))
         
     print(f"\nTraining complete. Models saved to {output_dir}")
     

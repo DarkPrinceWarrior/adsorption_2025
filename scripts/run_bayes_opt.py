@@ -36,6 +36,9 @@ from adsorb_synthesis.constants import (
 # Suppress Optuna logging to keep output clean
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+# Risk aversion for BO (weight on uncertainty term)
+LAMBDA_UNCERTAINTY = 0.5
+
 class AdsorbentOptimizer:
     def __init__(self, 
                  models_dir: str, 
@@ -48,6 +51,7 @@ class AdsorbentOptimizer:
         
         # Load Models
         self.models = self._load_models()
+        self.calibrators = self._load_calibrators()
         
         # Load Reference Data & Lookups
         print(f"Loading reference data from {data_path}...")
@@ -104,6 +108,31 @@ class AdsorbentOptimizer:
             raise RuntimeError("No models found! Please run train_forward_model.py first.")
             
         return models
+
+    def _load_calibrators(self) -> Dict[str, object]:
+        """Load uncertainty calibrators if available."""
+        path = os.path.join(self.models_dir, "uncertainty_calibrators.joblib")
+        if os.path.exists(path):
+            try:
+                return joblib.load(path)
+            except Exception as e:
+                print(f"Warning: failed to load calibrators at {path}: {e}")
+        return {}
+
+    def _calibrate_sigma(self, target_name: str, raw_sigma: float) -> float:
+        """Apply sigma calibration if calibrator is available."""
+        calibrator = self.calibrators.get(target_name)
+        if calibrator is None:
+            return float(raw_sigma)
+        try:
+            if isinstance(calibrator, dict) and calibrator.get("type") == "scale":
+                scale = calibrator.get("scale", 1.0)
+                return float(raw_sigma * scale)
+            if hasattr(calibrator, "predict"):
+                return float(calibrator.predict([raw_sigma])[0])
+        except Exception:
+            pass
+        return float(raw_sigma)
 
     def _define_search_space(self) -> Dict:
         """Extract unique categories and ranges from reference data."""
@@ -308,14 +337,18 @@ class AdsorbentOptimizer:
                     return 1e9
                 
                 predictions[target_name] = mean_pred
-                uncertainties[target_name] = std_pred
+                calibrated_sigma = self._calibrate_sigma(target_name, std_pred)
+                uncertainties[target_name] = calibrated_sigma
                 
                 # Normalized MSE Loss component
                 # (pred - target)^2 / target^2  <- relative percentage error
+                scale = abs(target_val) if target_val != 0 else 1.0
                 if target_val != 0:
-                    term = weights.get(target_name, 1.0) * ((mean_pred - target_val) / target_val) ** 2
+                    err_term = ((mean_pred - target_val) / target_val) ** 2
                 else:
-                    term = weights.get(target_name, 1.0) * (mean_pred - target_val) ** 2
+                    err_term = (mean_pred - target_val) ** 2
+                sigma_term = (calibrated_sigma / scale) ** 2
+                term = weights.get(target_name, 1.0) * (err_term + LAMBDA_UNCERTAINTY * sigma_term)
                     
                 loss += term
         
