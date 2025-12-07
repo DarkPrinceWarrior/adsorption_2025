@@ -1,6 +1,5 @@
 **Кратко**
 - В `src/adsorb_synthesis/data_processing.py:add_thermodynamic_features` термодинамика реализована неверно: запасной расчёт `K_eq = exp(E/(R·T))` и `Delta_G = -E` не имеют физического смысла, поэтому производные столбцы (`K_equilibrium`, `Delta_G_equilibrium`, `Delta_G_residual`) недостоверны.
-- План SALT_MASS_FIX реализован частично: колонка `log_salt_mass` добавлена, но обучение/инференс в лог-пространстве и квантильная регрессия из `specs/SALT_MASS_FIX.md` и `specs/LOG_TRANSFORM_INFO.txt` не подключены.
 - Несоответствие инженерии признаков train↔BO: `Supersaturation_Index` в обучении = `Molarity_Metal * Molarity_Ligand`, в `scripts/run_bayes_opt.py` используется другая формула с гидратацией, что ведёт к дрейфу признаков на инференсе.
 - Физические проверки слабые: дефолтный режим валидации “warn”, `scripts/validate_physics_constraints.py` вызывает отсутствующий `adsorb_synthesis.physics_losses`, в BO нет проверки точек кипения растворителей и целевых стехиометрий, допускаются физически невозможные рецепты.
 - UQ и BO слабо связаны: ансамбль — пять CatBoost на одном разбиении с разными сидами, дисперсия отражает только стохастику; в BO неопределённость не используется.

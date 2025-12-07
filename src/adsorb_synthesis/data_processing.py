@@ -224,10 +224,6 @@ def add_salt_mass_features(df: pd.DataFrame, *, inplace: bool = True) -> Optiona
         df['Is_Cu'] = (df[metal_col] == 'Cu').astype(int)
         df['Is_Zn'] = (df[metal_col] == 'Zn').astype(int)
 
-    if salt_mass_col in df.columns:
-        salt_mass = pd.to_numeric(df[salt_mass_col], errors='coerce')
-        df['log_salt_mass'] = np.log1p(salt_mass.clip(lower=0))
-
     # Concentrations
     if solvent_vol_col in df.columns:
         solvent_vol = pd.to_numeric(df[solvent_vol_col], errors='coerce').replace(0, np.nan)
