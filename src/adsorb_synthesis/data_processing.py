@@ -328,18 +328,13 @@ def add_thermodynamic_features(df: pd.DataFrame, *, inplace: bool = True) -> Opt
     if temperature_col not in df.columns:
         return df if not inplace else None
 
+    # Without measured K_eq we do not synthesize thermodynamic quantities
+    if 'K_equilibrium' not in df.columns:
+        return df if not inplace else None
+
     temperature_c = pd.to_numeric(df[temperature_col], errors='coerce').to_numpy(dtype=np.float64)
     temperature_k = temperature_c + 273.15
 
-    # Fill missing K_equilibrium using E (if available) and actual temperature
-    if 'K_equilibrium' not in df.columns and 'E, кДж/моль' in df.columns:
-        E = pd.to_numeric(df['E, кДж/моль'], errors='coerce').to_numpy(dtype=np.float64)
-        fallback_k = np.full(len(df), np.nan, dtype=np.float64)
-        valid = np.isfinite(E) & np.isfinite(temperature_k)
-        if np.any(valid):
-            R_kj = R_GAS_CONSTANT / 1000.0
-            fallback_k[valid] = np.exp(E[valid] / (R_kj * temperature_k[valid]))
-        df['K_equilibrium'] = fallback_k
     k_measured = pd.to_numeric(df.get('K_equilibrium'), errors='coerce').to_numpy(dtype=np.float64)
 
     delta_g_from_k = np.full(len(df), np.nan, dtype=np.float64)
@@ -353,11 +348,6 @@ def add_thermodynamic_features(df: pd.DataFrame, *, inplace: bool = True) -> Opt
     delta_g_raw = None
     if 'Delta_G' in df.columns:
         delta_g_raw = pd.to_numeric(df['Delta_G'], errors='coerce').to_numpy(dtype=np.float64)
-    elif 'E, кДж/моль' in df.columns:
-        # fallback Delta_G estimate using adsorption energy (negative sign for spontaneous adsorption)
-        delta_g_raw = -pd.to_numeric(df['E, кДж/моль'], errors='coerce').to_numpy(dtype=np.float64)
-        df['Delta_G'] = delta_g_raw  # Create the column for downstream use
-
     if delta_g_raw is not None:
         k_from_delta = np.full(len(df), np.nan, dtype=np.float64)
         valid_delta = np.isfinite(temperature_k) & np.isfinite(delta_g_raw)
