@@ -31,6 +31,10 @@ from adsorb_synthesis.constants import (
     FORWARD_MODEL_TARGETS,
     FORWARD_MODEL_AUGMENTED_FEATURES,
     FORWARD_MODEL_ENGINEERED_FEATURES,
+    SOLVENT_BOILING_POINTS_C,
+    STOICHIOMETRY_TARGETS,
+    DEFAULT_STOICHIOMETRY_BOUNDS,
+    E0_BOUNDS_KJ_MOL,
 )
 
 # Suppress Optuna logging to keep output clean
@@ -151,6 +155,13 @@ class AdsorbentOptimizer:
             "t_act_range": (100, 400),
         }
 
+    @staticmethod
+    def _get_boiling_point(solvent: str) -> Optional[float]:
+        if solvent is None:
+            return None
+        key = str(solvent).strip()
+        return SOLVENT_BOILING_POINTS_C.get(key) or SOLVENT_BOILING_POINTS_C.get(key.capitalize()) or SOLVENT_BOILING_POINTS_C.get(key.lower())
+
     def _objective(self, trial: optuna.Trial, targets: Dict[str, float], weights: Dict[str, float]) -> float:
         """
         The core function optimized by Optuna.
@@ -184,6 +195,11 @@ class AdsorbentOptimizer:
         
         # Activation must be higher than drying
         if t_act < t_dry:
+            return 1e9
+
+        # 2.1b. Solvent boiling point constraint
+        bp = self._get_boiling_point(solvent)
+        if bp is not None and t_syn >= bp:
             return 1e9
         
         # 2.2. Stoichiometry constraints
@@ -224,10 +240,18 @@ class AdsorbentOptimizer:
             return 1e9
         
         n_ratio = n_salt / n_acid
-        
-        # Reject extreme stoichiometry (e.g., 1:100 ratio is unrealistic)
-        if n_ratio < 0.1 or n_ratio > 10.0:
-            return 1e9
+        # Target stoichiometry by metal-ligand pair if available
+        stoich_spec = STOICHIOMETRY_TARGETS.get((metal, ligand))
+        if stoich_spec:
+            target_ratio = stoich_spec["ratio"]
+            tol = stoich_spec.get("tolerance", 0.1)
+            if not (target_ratio * (1 - tol) <= n_ratio <= target_ratio * (1 + tol)):
+                return 1e9
+        else:
+            # Fallback broad bounds
+            lo, hi = DEFAULT_STOICHIOMETRY_BOUNDS
+            if n_ratio < lo or n_ratio > hi:
+                return 1e9
         
         # 2.3. Concentration constraints
         if v_solv <= 0:
@@ -351,6 +375,16 @@ class AdsorbentOptimizer:
                 term = weights.get(target_name, 1.0) * (err_term + LAMBDA_UNCERTAINTY * sigma_term)
                     
                 loss += term
+            else:
+                continue
+
+        # Additional physics-based checks on predictions (where available)
+        # E0 bounds
+        e0_pred = predictions.get("E0, кДж/моль")
+        if e0_pred is not None:
+            lo_e0, hi_e0 = E0_BOUNDS_KJ_MOL
+            if not (lo_e0 <= e0_pred <= hi_e0):
+                return 1e9
         
         # --- 5. Store predictions for later retrieval ---
         for k, v in predictions.items():
