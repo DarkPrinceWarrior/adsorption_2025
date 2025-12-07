@@ -1,0 +1,168 @@
+{
+    "W0, см3/г": {
+        "R2_test": 0.3266845417210438,
+        "R2_train": 0.5675583492942982,
+        "RMSE": 0.1562085093623478,
+        "MAE": 0.1108397993623621,
+        "selected_features": [
+            "Металл",
+            "Лиганд",
+            "Растворитель",
+            "Metal_Ligand_Combo",
+            "Tрег, ᵒС",
+            "R_molar",
+            "Т.син., °С",
+            "Molarity_H2O_Hidden",
+            "Vsyn_m",
+            "Metal_Ligand_Size_Ratio",
+            "Т суш., °С",
+            "Ratio_H2O_Metal",
+            "Solvent_MolWt",
+            "log_Vсин. (р-ля), мл",
+            "T_dry_norm",
+            "molecular_weight (ligand)",
+            "h_bond_acceptors (ligand)",
+            "Solvent_LogP",
+            "ionic_radius_pm (metal_coord)"
+        ],
+        "physics_features": [
+            "Metal_Ligand_Size_Ratio",
+            "ionic_radius_pm (metal_coord)"
+        ],
+        "n_removed_multicollinear": 20,
+        "Uncertainty_Mean": 0.017647905033561277
+    },
+    "E0, кДж/моль": {
+        "R2_test": 0.8985760338616573,
+        "R2_train": 0.8820329086894316,
+        "RMSE": 3.261027181064902,
+        "MAE": 2.1710004248477297,
+        "selected_features": [
+            "Металл",
+            "Лиганд",
+            "Растворитель",
+            "Metal_Ligand_Combo",
+            "Molarity_Metal",
+            "ionic_radius_pm (metal_coord)",
+            "R_molar",
+            "Tрег, ᵒС",
+            "Vsyn_m",
+            "oxidation_state (metal_coord)",
+            "log_m (соли), г",
+            "Metal_Ligand_Size_Ratio",
+            "Т.син., °С",
+            "T_dry_norm",
+            "Т суш., °С",
+            "Solvent_LogP",
+            "logP (ligand)",
+            "Solvent_NumHDonors"
+        ],
+        "physics_features": [
+            "ionic_radius_pm (metal_coord)",
+            "oxidation_state (metal_coord)",
+            "Metal_Ligand_Size_Ratio"
+        ],
+        "n_removed_multicollinear": 21,
+        "Uncertainty_Mean": 0.3911039101111525
+    },
+    "SБЭТ, м2/г": {
+        "R2_test": 0.37801655213199203,
+        "R2_train": 0.4712006480596219,
+        "RMSE": 329.4742979141071,
+        "MAE": 240.06752545430467,
+        "selected_features": [
+            "Металл",
+            "Лиганд",
+            "Растворитель",
+            "Metal_Ligand_Combo",
+            "R_molar",
+            "Tрег, ᵒС",
+            "Т.син., °С",
+            "Vsyn_m",
+            "Molarity_Metal",
+            "ionic_radius_pm (metal_coord)",
+            "Metal_Ligand_Size_Ratio",
+            "Т суш., °С",
+            "Ratio_H2O_Metal",
+            "Solvent_MolWt",
+            "log_Vсин. (р-ля), мл",
+            "T_dry_norm",
+            "Solvent_LogP",
+            "molecular_weight (ligand)",
+            "oxidation_state (metal_coord)"
+        ],
+        "physics_features": [
+            "ionic_radius_pm (metal_coord)",
+            "Metal_Ligand_Size_Ratio",
+            "oxidation_state (metal_coord)"
+        ],
+        "n_removed_multicollinear": 20,
+        "Uncertainty_Mean": 40.41921861238296
+    },
+    "х0, нм": {
+        "R2_test": 0.892049888236846,
+        "R2_train": 0.8550134990993554,
+        "RMSE": 0.06834580454003171,
+        "MAE": 0.04877877207523879,
+        "selected_features": [
+            "Металл",
+            "Лиганд",
+            "Растворитель",
+            "Metal_Ligand_Combo",
+            "ionic_radius_pm (metal_coord)",
+            "Metal_Ligand_Size_Ratio",
+            "Vsyn_m",
+            "Molarity_Metal",
+            "R_molar",
+            "Т.син., °С",
+            "Tрег, ᵒС",
+            "oxidation_state (metal_coord)",
+            "log_Vсин. (р-ля), мл",
+            "Solvent_NumHDonors",
+            "Т суш., °С",
+            "Solvent_LogP",
+            "T_dry_norm",
+            "carboxyl_groups (ligand)"
+        ],
+        "physics_features": [
+            "ionic_radius_pm (metal_coord)",
+            "Metal_Ligand_Size_Ratio",
+            "oxidation_state (metal_coord)"
+        ],
+        "n_removed_multicollinear": 23,
+        "Uncertainty_Mean": 0.006996883576060791
+    },
+    "Sme, м2/г": {
+        "R2_test": 0.6175511682683466,
+        "R2_train": 0.8823903637914534,
+        "RMSE": 82.11348533917254,
+        "MAE": 51.34403610112772,
+        "selected_features": [
+            "Металл",
+            "Лиганд",
+            "Растворитель",
+            "Metal_Ligand_Combo",
+            "ionic_radius_pm (metal_coord)",
+            "Vсин. (р-ля), мл",
+            "R_molar",
+            "Т суш., °С",
+            "Vsyn_m",
+            "Molarity_Metal",
+            "n_water_hidden",
+            "Tрег, ᵒС",
+            "Solvent_MolWt",
+            "Т.син., °С",
+            "Ratio_H2O_Metal",
+            "Metal_Ligand_Size_Ratio",
+            "T_dry_norm",
+            "h_bond_acceptors (ligand)",
+            "Solvent_LogP"
+        ],
+        "physics_features": [
+            "ionic_radius_pm (metal_coord)",
+            "Metal_Ligand_Size_Ratio"
+        ],
+        "n_removed_multicollinear": 21,
+        "Uncertainty_Mean": 6.119779031673258
+    }
+}

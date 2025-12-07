@@ -20,13 +20,17 @@ from catboost import CatBoostRegressor, Pool
 # Add src to path to import project modules
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from adsorb_synthesis.data_processing import load_dataset, build_lookup_tables
+from adsorb_synthesis.data_processing import (
+    load_dataset,
+    build_lookup_tables,
+    add_salt_mass_features,
+    add_physicochemical_descriptors,
+)
 from adsorb_synthesis.constants import (
     FORWARD_MODEL_INPUTS,
     FORWARD_MODEL_TARGETS,
     FORWARD_MODEL_AUGMENTED_FEATURES,
     FORWARD_MODEL_ENGINEERED_FEATURES,
-    HYDRATION_MAP,
 )
 
 # Suppress Optuna logging to keep output clean
@@ -200,18 +204,8 @@ class AdsorbentOptimizer:
         if v_solv <= 0:
             return 1e9
         
-        c_metal = m_salt / v_solv
-        c_ligand = m_acid / v_solv
-        
         # --- 3. FEATURE ENGINEERING (Must match training!) ---
-        # Calculate all 45 features that the model expects
-        
-        # Temperature features
-        t_range = t_act - t_syn
-        t_activation = t_act - 100.0
-        t_range_denom = t_range if t_range != 0 else 1e-9
-        t_dry_norm = (t_dry - t_syn) / t_range_denom
-        
+        # Calculate all features that the model expects
         input_data = {
             # Base categorical
             "Металл": metal,
@@ -230,38 +224,11 @@ class AdsorbentOptimizer:
             "log_m (соли), г": np.log1p(m_salt),
             "log_m(кис-ты), г": np.log1p(m_acid),
             "log_Vсин. (р-ля), мл": np.log1p(v_solv),
-            
-            # Stoichiometry (from FORWARD_MODEL_ENGINEERED_FEATURES)
-            "R_molar": n_ratio,
-            "R_mass": m_salt / m_acid if m_acid != 0 else 0,
-            
-            # Concentrations
-            "C_metal": c_metal,
-            "C_ligand": c_ligand,
-            "log_C_metal": np.log1p(c_metal),
-            "log_C_ligand": np.log1p(c_ligand),
-            
+
             # From CSV (pre-computed in training data)
             "n_соли": n_salt,
             "n_кислоты": n_acid,
             "Vsyn_m": v_solv / m_salt if m_salt != 0 else 0,
-            
-            # Temperature features
-            "T_range": t_range,
-            "T_activation": t_activation,
-            "T_dry_norm": t_dry_norm,
-            
-            # Interaction feature
-            "Metal_Ligand_Combo": f"{metal}_{ligand}",
-            
-            # Physicochemical descriptors (Hidden Water)
-            "n_water_hidden": n_salt * HYDRATION_MAP.get(metal, 0.0),
-            "Ratio_H2O_Metal": HYDRATION_MAP.get(metal, 0.0),
-            "Molarity_Metal": n_salt / (v_solv / 1000.0) if v_solv > 0 else 0.0,
-            "Molarity_Ligand": n_acid / (v_solv / 1000.0) if v_solv > 0 else 0.0,
-            "Molarity_H2O_Hidden": (n_salt * HYDRATION_MAP.get(metal, 0.0)) / (v_solv / 1000.0) if v_solv > 0 else 0.0,
-            "Supersaturation_Index": (n_salt * HYDRATION_MAP.get(metal, 0.0) * n_acid) / (v_solv / 1000.0 + 1e-9),
-            "Reactor_Loading_g_mL": (m_salt + m_acid) / v_solv if v_solv > 0 else 0.0,
         }
         
         # Convert to DataFrame
@@ -277,6 +244,22 @@ class AdsorbentOptimizer:
         for idx, val in solvent_desc.items():
             if idx not in df_input.columns:
                 df_input[idx] = val
+
+        # Reuse training feature engineering to avoid train/inference drift
+        add_salt_mass_features(df_input, inplace=True)
+        add_physicochemical_descriptors(df_input, inplace=True)
+
+        # Interaction feature (categorical, used by CatBoost)
+        df_input["Metal_Ligand_Combo"] = df_input["Металл"].astype(str) + "_" + df_input["Лиганд"].astype(str)
+
+        # Temperature-derived features not handled by helper
+        t_range = t_act - t_syn
+        t_activation = t_act - 100.0
+        t_range_denom = t_range if t_range != 0 else 1e-9
+        t_dry_norm = (t_dry - t_syn) / t_range_denom
+        df_input["T_range"] = t_range
+        df_input["T_activation"] = t_activation
+        df_input["T_dry_norm"] = t_dry_norm
         
         # Ensure categorical features have correct dtype for CatBoost
         cat_features = ['Металл', 'Лиганд', 'Растворитель', 'Metal_Ligand_Combo']
