@@ -326,6 +326,9 @@ class AdsorbentOptimizer:
         loss = 0.0
         predictions = {}
         uncertainties = {}
+        ei_terms = []
+        pi_terms = []
+        eps = 1e-8
         
         for target_name, target_val in targets.items():
             if target_name in self.models:
@@ -366,17 +369,28 @@ class AdsorbentOptimizer:
                 calibrated_sigma = self._calibrate_sigma(target_name, std_pred)
                 uncertainties[target_name] = calibrated_sigma
                 
-                # Normalized MSE Loss component
-                # (pred - target)^2 / target^2  <- relative percentage error
-                scale = abs(target_val) if target_val != 0 else 1.0
-                if target_val != 0:
-                    err_term = ((mean_pred - target_val) / target_val) ** 2
-                else:
-                    err_term = (mean_pred - target_val) ** 2
+                # Scale by target magnitude (to balance units) if provided
+                scale = abs(target_val) if target_val != 0 else max(abs(mean_pred), 1.0)
+                err_term = ((mean_pred - target_val) / scale) ** 2
                 sigma_term = (calibrated_sigma / scale) ** 2
+
+                # EI / PI components (maximize improvement -> minimize negative EI/PI)
+                z = (abs(target_val - mean_pred) + eps) / (calibrated_sigma + eps)
+                from math import erf, sqrt, exp, pi
+                cdf = 0.5 * (1 + erf(-z / sqrt(2)))  # P(improvement)
+                pdf = (1 / sqrt(2 * pi)) * exp(-0.5 * z * z)
+                ei = (abs(target_val - mean_pred)) * cdf + calibrated_sigma * pdf
+                pi = cdf
+                ei_terms.append(ei)
+                pi_terms.append(pi)
+
                 term = weights.get(target_name, 1.0) * (err_term + LAMBDA_UNCERTAINTY * sigma_term)
-                    
                 loss += term
+
+        # Combine EI/PI into acquisition penalty (encourage improvement & low sigma)
+        if ei_terms:
+            # Use mean negative EI and PI as additional terms
+            loss += LAMBDA_UNCERTAINTY * (np.mean(ei_terms) + np.mean(pi_terms))
         # Additional physics-based checks on predictions (where available)
         # E0 bounds
         e0_pred = predictions.get("E0, кДж/моль")
