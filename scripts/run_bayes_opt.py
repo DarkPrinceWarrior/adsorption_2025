@@ -36,12 +36,14 @@ from adsorb_synthesis.constants import (
     DEFAULT_STOICHIOMETRY_BOUNDS,
     E0_BOUNDS_KJ_MOL,
 )
+from adsorb_synthesis.physics_losses import compute_physics_penalty
 
 # Suppress Optuna logging to keep output clean
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # Risk aversion for BO (weight on uncertainty term)
 LAMBDA_UNCERTAINTY = 0.5
+PHYSICS_PENALTY_WEIGHT = 1.0
 
 class AdsorbentOptimizer:
     def __init__(self, 
@@ -391,6 +393,17 @@ class AdsorbentOptimizer:
         if ei_terms:
             # Use mean negative EI and PI as additional terms
             loss += LAMBDA_UNCERTAINTY * (np.mean(ei_terms) + np.mean(pi_terms))
+
+        # Physics penalty using available predictions
+        if predictions:
+            phys_row = {}
+            for col in ["W0, см3/г", "E0, кДж/моль", "Ws, см3/г", "E, кДж/моль"]:
+                if col in predictions:
+                    phys_row[col] = predictions[col]
+            phys_df = pd.DataFrame([phys_row]) if phys_row else None
+            if phys_df is not None:
+                phys_penalty = compute_physics_penalty(phys_df).iloc[0]
+                loss += PHYSICS_PENALTY_WEIGHT * phys_penalty
         # Additional physics-based checks on predictions (where available)
         # E0 bounds
         e0_pred = predictions.get("E0, кДж/моль")

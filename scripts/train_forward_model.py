@@ -30,6 +30,7 @@ from adsorb_synthesis.feature_selection import (
     select_features_advanced,
     get_curated_features
 )
+from adsorb_synthesis.physics_losses import compute_physics_penalty
 
 
 def fit_uncertainty_calibrator(sigmas: np.ndarray, abs_errors: np.ndarray) -> Dict:
@@ -81,6 +82,7 @@ def train_forward_models(
     
     # CV ensemble parameters
     n_splits = 5
+    PHYSICS_PENALTY_WEIGHT = 1.0
     
     for target in FORWARD_MODEL_TARGETS:
         print(f"\n=== Training ENSEMBLE for target: {target} ===")
@@ -103,6 +105,12 @@ def train_forward_models(
         except ValueError:
             target_bins = pd.Series(['All'] * len(y_target), index=y_target.index)
         strat_key = metal_group.astype(str) + '_' + target_bins.astype(str)
+
+        # Physics penalty as sample weight proxy
+        physics_penalty = compute_physics_penalty(df_raw)
+        physics_penalty = physics_penalty.reindex(X.index).fillna(0.0)
+        sample_weights_full = 1.0 + PHYSICS_PENALTY_WEIGHT * physics_penalty.values
+        print(f"  Mean physics penalty weight: {np.mean(sample_weights_full):.3f}")
         
         # Feature Selection (once per target on full data)
         print(f"  Advanced Feature Selection for {target}...")
@@ -136,6 +144,8 @@ def train_forward_models(
             X_val_sel = X.iloc[val_idx][selected_features]
             y_train_target = y_target.iloc[train_idx]
             y_val_target = y_target.iloc[val_idx]
+            w_train = sample_weights_full[train_idx]
+            w_val = sample_weights_full[val_idx]
 
             model = CatBoostRegressor(
                 iterations=iterations,
@@ -154,6 +164,7 @@ def train_forward_models(
 
             model.fit(
                 X_train_sel, y_train_target,
+                sample_weight=w_train,
                 eval_set=(X_val_sel, y_val_target),
                 early_stopping_rounds=100,
                 use_best_model=True

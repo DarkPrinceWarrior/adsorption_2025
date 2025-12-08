@@ -67,9 +67,6 @@
   - Валидация по умолчанию остаётся “warn” (src/adsorb_synthesis/data_validation.py:8-13), load_dataset всегда вызывает её в warn-
     режиме (src/adsorb_synthesis/data_processing.py:149-186), поэтому строки с неверным порядком температур или T_syn выше точки
     кипения не блокируются при обучении.
-
-  - Физические штрафы из src/adsorb_synthesis/physics_losses.py не используются ни в обучении, ни в BO; только сломанный скрипт
-    валидации их вызывает.
     
   - Электронные/окислительные дескрипторы (d_electrons, Jahn_Teller_Active, oxidation_state и др.) нигде не вычисляются и не
     проверяются — код предполагает их наличие в CSV, иначе build_lookup_tables упадёт.
