@@ -18,7 +18,7 @@ def main():
     parser.add_argument(
         "--data",
         type=str,
-        default="data/SEC_SYN_with_features.csv",
+        default="data/SEC_SYN_with_features_enriched.csv",
         help="Path to the dataset CSV file",
     )
     parser.add_argument(
@@ -51,31 +51,41 @@ def main():
     print("=" * 70)
     print()
     
-    stats = validate_physics_constraints(df, verbose=args.verbose)
+    report = validate_physics_constraints(df, verbose=args.verbose)
+    report_dict = report.to_dict() if hasattr(report, "to_dict") else {}
     
     print()
     print("=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    for key, value in stats.items():
-        print(f"  {key}: {value:.4f}")
+    if report_dict:
+        for key, value in report_dict.items():
+            print(f"  {key}: {value:.4f}")
+    else:
+        print("  (no summary values available)")
     
     print()
     print("Recommendations:")
-    if stats.get("thermodynamic_consistency_rate", 0) < 0.8:
-        print("  ⚠ Low thermodynamic consistency - consider using soft constraints with tolerance")
-    else:
-        print("  ✓ Good thermodynamic consistency")
-    
-    if stats.get("e0_within_bounds_rate", 0) < 0.9:
-        print("  ⚠ Some E0 values outside physical range - energy bounds loss will help")
-    else:
-        print("  ✓ E0 values mostly within physical bounds")
-    
-    if stats.get("energy_ratio_within_bounds_rate", 0) < 0.9:
-        print("  ⚠ Some E/E0 ratios outside physical range - energy ratio constraints recommended")
-    else:
-        print("  ✓ Energy ratios mostly within physical bounds")
+    er_mean = report_dict.get("energy_ratio_mean", None)
+    if er_mean is not None:
+        if er_mean > 0.05:
+            print("  ⚠ Energy ratio penalty is high — consider enforcing E/E0 ≈ 1/3.")
+        else:
+            print("  ✓ Energy ratio penalty is low.")
+
+    e0_bounds_mean = report_dict.get("e0_bounds_mean", None)
+    if e0_bounds_mean is not None:
+        if e0_bounds_mean > 0:
+            print("  ⚠ Some E0 values outside physical range — tighten bounds or clean data.")
+        else:
+            print("  ✓ E0 values within configured bounds.")
+
+    ws_w0_mean = report_dict.get("ws_w0_mean", None)
+    if ws_w0_mean is not None:
+        if ws_w0_mean > 0:
+            print("  ⚠ Ws < W0 detected — check pore volume hierarchy.")
+        else:
+            print("  ✓ Ws ≥ W0 holds for all rows.")
     
     print()
     print("Next steps:")

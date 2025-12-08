@@ -565,12 +565,10 @@ def add_physicochemical_descriptors(df: pd.DataFrame, *, inplace: bool = True) -
 
     # 2. Hidden Water Calculations
     if 'Металл' in df.columns and 'n_соли' in df.columns:
-        # Map hydration coefficient
-        # Use 0.0 for unknown metals to avoid NaNs, or keep NaNs if critical? 
-        # Prompt says "fill NaNs... with zeros" later, so we can use map and fillna(0)
-        df['hydration_coeff'] = df['Металл'].map(HYDRATION_MAP).fillna(0.0)
+        # Map hydration coefficient; keep NaN for unknown metals to avoid masking missing data
+        df['hydration_coeff'] = df['Металл'].map(HYDRATION_MAP)
         
-        n_salt = pd.to_numeric(df['n_соли'], errors='coerce').fillna(0.0)
+        n_salt = pd.to_numeric(df['n_соли'], errors='coerce')
         
         # n_water_hidden = n_salt * hydration_coeff
         df['n_water_hidden'] = n_salt * df['hydration_coeff']
@@ -580,44 +578,37 @@ def add_physicochemical_descriptors(df: pd.DataFrame, *, inplace: bool = True) -
         
     # 3. True Molarity Calculations
     if 'Vсин. (р-ля), мл' in df.columns:
-        vol_ml = pd.to_numeric(df['Vсин. (р-ля), мл'], errors='coerce').fillna(0.0)
+        vol_ml = pd.to_numeric(df['Vсин. (р-ля), мл'], errors='coerce')
         vol_L = vol_ml / 1000.0
         # Avoid division by zero
         vol_L_safe = vol_L.replace(0, np.nan)
         
         if 'n_соли' in df.columns:
-            n_salt = pd.to_numeric(df['n_соли'], errors='coerce').fillna(0.0)
+            n_salt = pd.to_numeric(df['n_соли'], errors='coerce')
             df['Molarity_Metal'] = n_salt / vol_L_safe
             
         if 'n_кислоты' in df.columns:
-            n_acid = pd.to_numeric(df['n_кислоты'], errors='coerce').fillna(0.0)
+            n_acid = pd.to_numeric(df['n_кислоты'], errors='coerce')
             df['Molarity_Ligand'] = n_acid / vol_L_safe
             
         if 'n_water_hidden' in df.columns:
-            n_water = pd.to_numeric(df['n_water_hidden'], errors='coerce').fillna(0.0)
+            n_water = pd.to_numeric(df['n_water_hidden'], errors='coerce')
             df['Molarity_H2O_Hidden'] = n_water / vol_L_safe
             
     # 4. Supersaturation & Reactor Loading
+    # Use dimensionless supersaturation proxy: log ratios to 1 mol/L reference
     if 'Molarity_Metal' in df.columns and 'Molarity_Ligand' in df.columns:
-        df['Supersaturation_Index'] = df['Molarity_Metal'].fillna(0.0) * df['Molarity_Ligand'].fillna(0.0)
+        C_REF = 1.0  # mol/L reference to make the ratio dimensionless
+        mol_metal = pd.to_numeric(df['Molarity_Metal'], errors='coerce').clip(lower=0)
+        mol_ligand = pd.to_numeric(df['Molarity_Ligand'], errors='coerce').clip(lower=0)
+        df['Supersaturation_Index'] = np.log1p(mol_metal / C_REF) + np.log1p(mol_ligand / C_REF)
         
     if {'m (соли), г', 'm(кис-ты), г', 'Vсин. (р-ля), мл'}.issubset(df.columns):
-        m_salt = pd.to_numeric(df['m (соли), г'], errors='coerce').fillna(0.0)
-        m_acid = pd.to_numeric(df['m(кис-ты), г'], errors='coerce').fillna(0.0)
+        m_salt = pd.to_numeric(df['m (соли), г'], errors='coerce')
+        m_acid = pd.to_numeric(df['m(кис-ты), г'], errors='coerce')
         vol_ml = pd.to_numeric(df['Vсин. (р-ля), мл'], errors='coerce').replace(0, np.nan)
         
         df['Reactor_Loading_g_mL'] = (m_salt + m_acid) / vol_ml
-
-    # Fill NaNs with 0 for the new columns as requested
-    new_cols = [
-        'n_water_hidden', 'Ratio_H2O_Metal', 
-        'Molarity_Metal', 'Molarity_Ligand', 'Molarity_H2O_Hidden',
-        'Supersaturation_Index', 'Reactor_Loading_g_mL'
-    ]
-    
-    for col in new_cols:
-        if col in df.columns:
-            df[col] = df[col].fillna(0.0)
     
     if not inplace:
         return df
