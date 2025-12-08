@@ -21,17 +21,14 @@ import joblib
 import pandas as pd
 from catboost import CatBoostRegressor
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold
 from sklearn.isotonic import IsotonicRegression
-from collections import defaultdict
 
 from adsorb_synthesis.data_processing import load_dataset, build_lookup_tables, prepare_forward_dataset
 from adsorb_synthesis.constants import RANDOM_SEED, FORWARD_MODEL_TARGETS, RARE_METALS_THRESHOLD
 from adsorb_synthesis.feature_selection import (
     select_features_advanced,
-    get_curated_features,
-    remove_highly_correlated,
-    FEATURE_GROUPS
+    get_curated_features
 )
 
 
@@ -78,240 +75,143 @@ def train_forward_models(
     print(f"Categorical features found: {cat_features}")
     
     metrics = {}
-    models = {} # Initialize models dict
+    models = {} # target -> list of model paths
     os.makedirs(output_dir, exist_ok=True)
     calibrators = {}
     
-    # Train a separate ENSEMBLE of models for each target property
-    n_ensemble = 5
+    # CV ensemble parameters
+    n_splits = 5
     
     for target in FORWARD_MODEL_TARGETS:
         print(f"\n=== Training ENSEMBLE for target: {target} ===")
         
-        # Check for target presence
-        if target not in y.columns: # Check in full y, not y_train
+        if target not in y.columns:
             print(f"Skipping {target}: not found in targets.")
             continue
 
-        # --- IMPROVED TWO-LEVEL STRATIFICATION ---
-        # Combines Metal grouping with target quantile bins for better stratification
         y_target = y[target]
-        
-        # Step 1: Group rare metals to reduce singleton strata
+
+        # Stratification key (Metal + target bins)
         if 'Металл' in X.columns:
             metal_counts = X['Металл'].value_counts()
             rare_metals = metal_counts[metal_counts < RARE_METALS_THRESHOLD].index.tolist()
             metal_group = X['Металл'].apply(lambda m: 'Other' if m in rare_metals else m)
         else:
             metal_group = pd.Series(['Unknown'] * len(X), index=X.index)
-        
-        # Step 2: Create target bins (4 quantiles — optimal for 424 samples)
         try:
             target_bins = pd.qcut(y_target, q=4, labels=['Q1', 'Q2', 'Q3', 'Q4'], duplicates='drop')
         except ValueError:
-            # Fallback if too few unique values
             target_bins = pd.Series(['All'] * len(y_target), index=y_target.index)
-        
-        # Step 3: Combined stratification key: Metal_Group + Target_Bin
         strat_key = metal_group.astype(str) + '_' + target_bins.astype(str)
         
-        # Step 4: Handle singletons (strata with < 2 samples)
-        key_counts = strat_key.value_counts()
-        singletons = key_counts[key_counts < 2].index
-        
-        if len(singletons) > 0:
-            # Mask non-singletons for splitting
-            mask_strat = ~strat_key.isin(singletons)
-            X_strat = X[mask_strat]
-            y_strat = y_target[mask_strat]
-            strat_key_clean = strat_key[mask_strat]
-            
-            X_train, X_test, y_train_target, y_test_target = train_test_split(
-                X_strat, y_strat,
-                test_size=test_size,
-                random_state=RANDOM_SEED,
-                stratify=strat_key_clean
-            )
-            
-            # Add singletons to TRAIN (avoid leakage)
-            X_train = pd.concat([X_train, X[~mask_strat]])
-            y_train_target = pd.concat([y_train_target, y_target[~mask_strat]])
-        else:
-            # Standard stratified split with combined key
-            X_train, X_test, y_train_target, y_test_target = train_test_split(
-                X, y_target,
-                test_size=test_size,
-                random_state=RANDOM_SEED,
-                stratify=strat_key
-            )
-            
-        print(f"  Split for {target}: Train={len(X_train)}, Test={len(X_test)}")
-        
-        # --- Advanced Feature Selection with Multicollinearity Removal ---
+        # Feature Selection (once per target on full data)
         print(f"  Advanced Feature Selection for {target}...")
-        
-        # Step 1: Use curated features (domain knowledge) to pre-filter
         keep_features, drop_features = get_curated_features()
-        
-        # Filter X_train to only curated + categorical features
-        available_keep = [f for f in keep_features if f in X_train.columns]
-        available_drop = [f for f in drop_features if f in X_train.columns]
-        
-        # Start with categorical + curated numeric features
-        numeric_cols = [c for c in X_train.columns if c not in cat_features]
+        available_drop = [f for f in drop_features if f in X.columns]
+        numeric_cols = [c for c in X.columns if c not in cat_features]
         curated_numeric = [c for c in numeric_cols if c not in available_drop]
-        
-        # Use advanced selection on curated features
         selected_features, selection_report = select_features_advanced(
-            X_train[cat_features + curated_numeric],
-            y_train_target,
+            X[cat_features + curated_numeric],
+            y_target,
             categorical_cols=cat_features,
             corr_threshold=0.85,
             vif_threshold=10.0,
             max_features=15,
-            verbose=False  # Less verbose in training
+            verbose=False
         )
-        
-        # Report results
         n_removed = len(selection_report['removed_correlation']) + len(selection_report['removed_vif'])
         print(f"    Removed {n_removed} multicollinear features")
         print(f"    Selected {len(selected_features)} features: {selected_features[:5]}...")
-        
-        # Filter datasets to selected features only
-        X_train_sel = X_train[selected_features]
-        X_test_sel = X_test[selected_features]
-        
-        # Update cat_features for the selected subset
         cat_features_sel = [c for c in selected_features if c in cat_features]
 
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
         model_paths = []
-        ensemble_preds_test = []
-        ensemble_preds_train = []
-        oob_preds = defaultdict(list)  # idx -> list of OOB predictions
+        fold_models = []
+        oof_preds = np.full(len(X), np.nan, dtype=float)
 
-        for i in range(n_ensemble):
-            seed = RANDOM_SEED + i
-            print(f"  Training member {i+1}/{n_ensemble} (seed={seed})...")
-            
-            # Bootstrap sampling for epistemic diversity
-            rng = np.random.RandomState(seed)
-            boot_indices = rng.choice(len(X_train_sel), size=len(X_train_sel), replace=True)
-            boot_mask = np.zeros(len(X_train_sel), dtype=bool)
-            boot_mask[boot_indices] = True
-            oob_mask = ~boot_mask
-            X_boot = X_train_sel.iloc[boot_indices]
-            y_boot = y_train_target.iloc[boot_indices]
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X, strat_key)):
+            seed = RANDOM_SEED + fold_idx
+            print(f"  Fold {fold_idx+1}/{n_splits} (seed={seed})...")
+            X_train_sel = X.iloc[train_idx][selected_features]
+            X_val_sel = X.iloc[val_idx][selected_features]
+            y_train_target = y_target.iloc[train_idx]
+            y_val_target = y_target.iloc[val_idx]
 
-            # Initialize CatBoost with balanced regularization
             model = CatBoostRegressor(
                 iterations=iterations,
-                learning_rate=0.05, # Increased from 0.03
-                depth=6,            # Increased from 4
-                l2_leaf_reg=1.0,    # Decreased from 3.0 (less regularization)
-                min_data_in_leaf=1, # Allow smaller leaves
+                learning_rate=0.05,
+                depth=6,
+                l2_leaf_reg=1.0,
+                min_data_in_leaf=1,
                 subsample=0.8,
                 colsample_bylevel=0.8,
                 loss_function='RMSE',
                 random_seed=seed,
-                verbose=False, # Less verbose
+                verbose=False,
                 allow_writing_files=False,
-                cat_features=cat_features_sel # Use updated cat_features
+                cat_features=cat_features_sel
             )
-            
-            # Fit model on SELECTED features
+
             model.fit(
-                X_boot, y_boot,
-                eval_set=(X_test_sel, y_test_target),
+                X_train_sel, y_train_target,
+                eval_set=(X_val_sel, y_val_target),
                 early_stopping_rounds=100,
                 use_best_model=True
             )
-            
-            # Save individual model
+
             safe_target = target.replace('/', '_').replace(' ', '_')
-            model_path = os.path.join(output_dir, f"catboost_{safe_target}_ens{i}.cbm")
+            model_path = os.path.join(output_dir, f"catboost_{safe_target}_ens{fold_idx}.cbm")
             model.save_model(model_path)
             model_paths.append(model_path)
-            
-            # Collect predictions
-            ensemble_preds_test.append(model.predict(X_test_sel))
-            ensemble_preds_train.append(model.predict(X_train_sel))
+            fold_models.append(model)
 
-            # Collect OOB predictions for calibration
-            if np.any(oob_mask):
-                oob_idx_labels = X_train_sel.index[oob_mask]
-                oob_pred_values = model.predict(X_train_sel.iloc[oob_mask])
-                for idx_val, pred_val in zip(oob_idx_labels, oob_pred_values):
-                    oob_preds[idx_val].append(pred_val)
+            oof_preds[val_idx] = model.predict(X_val_sel)
 
-        # Aggregate predictions (Mean of Ensemble)
-        mean_preds_test = np.mean(ensemble_preds_test, axis=0)
-        std_preds_test = np.std(ensemble_preds_test, axis=0)
-        mean_preds_train = np.mean(ensemble_preds_train, axis=0)
-        
-        r2_test = r2_score(y_test_target, mean_preds_test)
-        r2_train = r2_score(y_train_target, mean_preds_train)
-        rmse_test = np.sqrt(mean_squared_error(y_test_target, mean_preds_test))
-        mae_test = mean_absolute_error(y_test_target, mean_preds_test)
-        
-        print(f"Ensemble Results for {target}:")
-        print(f"  R2 (Test):  {r2_test:.4f}")
-        print(f"  R2 (Train): {r2_train:.4f}")
-        print(f"  RMSE:       {rmse_test:.4f}")
-        print(f"  Avg Uncertainty (StdDev): {np.mean(std_preds_test):.4f}")
-        
-        models[target] = model_paths # Store list of paths
-        
-        # Save predictions for parity plots
+        # Ensemble predictions on full data
+        all_preds = np.stack([m.predict(X[selected_features]) for m in fold_models], axis=1)
+        ensemble_mean = np.mean(all_preds, axis=1)
+        ensemble_std = np.std(all_preds, axis=1)
+
+        r2_all = r2_score(y_target, ensemble_mean)
+        rmse_all = np.sqrt(mean_squared_error(y_target, ensemble_mean))
+        mae_all = mean_absolute_error(y_target, ensemble_mean)
+        print(f"  CV Ensemble R2: {r2_all:.4f}, RMSE: {rmse_all:.4f}, MAE: {mae_all:.4f}")
+        print(f"  Avg Uncertainty (StdDev across folds): {np.mean(ensemble_std):.4f}")
+
+        models[target] = model_paths
+
         safe_target = target.replace('/', '_').replace(' ', '_')
         predictions_df = pd.DataFrame({
-            'y_actual': y_test_target.values,
-            'y_pred': mean_preds_test,
-            'y_std': std_preds_test
+            'y_actual': y_target.values,
+            'y_pred': ensemble_mean,
+            'y_std': ensemble_std,
+            'y_oof': oof_preds
         })
         predictions_path = os.path.join(output_dir, f"predictions_{safe_target}.csv")
         predictions_df.to_csv(predictions_path, index=False)
         print(f"  Saved predictions: {predictions_path}")
-        
-        # Identify physics features in selection
+
         physics_features = [f for f in selected_features if any(x in f for x in 
             ['metal_coord', 'ligand_3d', 'ligand_2d', 'Size_Ratio', 'Electronegativity_Diff', 'Jahn_Teller'])]
 
-        # Fit uncertainty calibrator using OOB predictions (sigma -> |error|)
-        oob_sigmas = []
-        oob_abs_errors = []
-        if oob_preds:
-            for idx_val, preds_list in oob_preds.items():
-                if len(preds_list) == 0:
-                    continue
-                mu = np.mean(preds_list)
-                sigma = np.std(preds_list)
-                if not np.isfinite(sigma):
-                    continue
-                oob_sigmas.append(sigma)
-                oob_abs_errors.append(abs(y_train_target.loc[idx_val] - mu))
-        calibrator = None
-        calibrator_meta = None
-        if oob_sigmas:
-            calibrator = fit_uncertainty_calibrator(np.array(oob_sigmas), np.array(oob_abs_errors))
-            if calibrator["type"] == "isotonic":
-                calibrator_meta = {"type": "isotonic", "n_oob": len(oob_sigmas)}
-            else:
-                calibrator_meta = {"type": "scale", "n_oob": len(oob_sigmas), "scale": calibrator.get("scale", None)}
+        abs_errors = np.abs(y_target.values - ensemble_mean)
+        calibrator = fit_uncertainty_calibrator(ensemble_std, abs_errors)
+        if calibrator["type"] == "isotonic":
+            calibrator_meta = {"type": "isotonic", "n_samples": len(ensemble_std)}
         else:
-            calibrator_meta = {"type": "none", "n_oob": 0}
-        # Store calibrator for saving later
+            calibrator_meta = {"type": "scale", "n_samples": len(ensemble_std), "scale": calibrator.get("scale", None)}
         calibrators[target] = calibrator
 
         metrics[target] = {
-            "R2_test": r2_test,
-            "R2_train": r2_train,
-            "RMSE": rmse_test,
-            "MAE": mae_test,
+            "R2": r2_all,
+            "RMSE": rmse_all,
+            "MAE": mae_all,
             "selected_features": selected_features,
             "physics_features": physics_features,
             "n_removed_multicollinear": n_removed,
-            "Uncertainty_Mean": float(np.mean(std_preds_test)),
+            "Uncertainty_Mean": float(np.mean(ensemble_std)),
             "Uncertainty_Calibrator": calibrator_meta,
+            "cv_folds": n_splits
         }
 
     # Save metrics summary

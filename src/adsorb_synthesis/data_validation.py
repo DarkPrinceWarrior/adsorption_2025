@@ -8,6 +8,8 @@ from typing import Mapping, Optional
 import numpy as np
 import pandas as pd
 
+from .constants import DEFAULT_STOICHIOMETRY_BOUNDS, STOICHIOMETRY_TARGETS
+
 DEFAULT_VALIDATION_MODE = "warn"
 VALIDATION_MODES = {"warn", "strict"}
 
@@ -231,6 +233,71 @@ def validate_synthesis_data(
                     delta=_safe_float(syn.iloc[pos] - boiling.iloc[pos]),
                 )
             )
+
+    # Stoichiometry checks (Metal/Ligand molar ratio)
+    metal_col = 'Металл'
+    ligand_col = 'Лиганд'
+    ratio_col = 'R_molar'
+    n_salt_col = 'n_соли'
+    n_acid_col = 'n_кислоты'
+    salt_mass_col = 'm (соли), г'
+    acid_mass_col = 'm(кис-ты), г'
+    molar_salt_col = 'Молярка_соли'
+    molar_acid_col = 'Молярка_кислоты'
+
+    if metal_col in df.columns and ligand_col in df.columns:
+        for idx in df.index:
+            metal = df.at[idx, metal_col]
+            ligand = df.at[idx, ligand_col]
+
+            ratio_val = np.nan
+            # Prefer precomputed R_molar
+            if ratio_col in df.columns:
+                ratio_val = pd.to_numeric(df.at[idx, ratio_col], errors='coerce')
+            else:
+                # Try to derive from moles if present
+                n_salt = pd.to_numeric(df.at[idx, n_salt_col], errors='coerce') if n_salt_col in df.columns else np.nan
+                n_acid = pd.to_numeric(df.at[idx, n_acid_col], errors='coerce') if n_acid_col in df.columns else np.nan
+                if np.isfinite(n_salt) and np.isfinite(n_acid) and n_acid != 0:
+                    ratio_val = n_salt / n_acid
+                elif {salt_mass_col, acid_mass_col, molar_salt_col, molar_acid_col}.issubset(df.columns):
+                    m_salt = pd.to_numeric(df.at[idx, salt_mass_col], errors='coerce')
+                    m_acid = pd.to_numeric(df.at[idx, acid_mass_col], errors='coerce')
+                    mw_salt = pd.to_numeric(df.at[idx, molar_salt_col], errors='coerce')
+                    mw_acid = pd.to_numeric(df.at[idx, molar_acid_col], errors='coerce')
+                    if np.isfinite(m_salt) and np.isfinite(m_acid) and np.isfinite(mw_salt) and np.isfinite(mw_acid) and mw_acid != 0 and mw_salt != 0:
+                        n_salt = m_salt / mw_salt
+                        n_acid = m_acid / mw_acid
+                        if n_acid != 0:
+                            ratio_val = n_salt / n_acid
+
+            if not np.isfinite(ratio_val):
+                continue
+
+            spec = STOICHIOMETRY_TARGETS.get((metal, ligand))
+            if spec:
+                target = spec.get("ratio")
+                tol = spec.get("tolerance", 0.1)
+                lower = target * (1 - tol)
+                upper = target * (1 + tol)
+            else:
+                lower, upper = DEFAULT_STOICHIOMETRY_BOUNDS
+
+            if ratio_val < lower or ratio_val > upper:
+                issues.append(
+                    ValidationIssue(
+                        row=idx,
+                        column=ratio_col,
+                        severity="error",
+                        message=(
+                            f"R_molar={ratio_val:.3f} outside allowed range "
+                            f"[{lower:.3f}, {upper:.3f}] for ({metal}, {ligand})"
+                        ),
+                        actual=_safe_float(ratio_val),
+                        expected=None,
+                        delta=None,
+                    )
+                )
 
     report = ValidationReport(issues=issues)
     _log_issues(report, context="synthesis data")
