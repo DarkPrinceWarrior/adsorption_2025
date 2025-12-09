@@ -55,11 +55,12 @@ def train_forward_models(
     data_path: str,
     output_dir: str,
     test_size: float = 0.2,
-    iterations: int = 1000
+    iterations: int = 1000,
+    validation_mode: str = "warn"
 ):
     print(f"Loading dataset from {data_path}...")
     # Load raw data with standard enrichment
-    df_raw = load_dataset(data_path)
+    df_raw = load_dataset(data_path, validation_mode=validation_mode)
     
     # Build lookups for descriptors (Metal, Ligand, Solvent)
     lookup_tables = build_lookup_tables(df_raw)
@@ -183,10 +184,17 @@ def train_forward_models(
         ensemble_mean = np.mean(all_preds, axis=1)
         ensemble_std = np.std(all_preds, axis=1)
 
+        # Full-data fit quality (acts as "train" since ensemble is fit on all rows cumulatively)
         r2_all = r2_score(y_target, ensemble_mean)
         rmse_all = np.sqrt(mean_squared_error(y_target, ensemble_mean))
         mae_all = mean_absolute_error(y_target, ensemble_mean)
-        print(f"  CV Ensemble R2: {r2_all:.4f}, RMSE: {rmse_all:.4f}, MAE: {mae_all:.4f}")
+        # Out-of-fold quality (proxy for test CV)
+        r2_oof = r2_score(y_target, oof_preds)
+        rmse_oof = np.sqrt(mean_squared_error(y_target, oof_preds))
+        mae_oof = mean_absolute_error(y_target, oof_preds)
+
+        print(f"  CV Ensemble R2 (OOF): {r2_oof:.4f}, RMSE: {rmse_oof:.4f}, MAE: {mae_oof:.4f}")
+        print(f"  Full-fit R2 (train-ish): {r2_all:.4f}, RMSE: {rmse_all:.4f}, MAE: {mae_all:.4f}")
         print(f"  Avg Uncertainty (StdDev across folds): {np.mean(ensemble_std):.4f}")
 
         models[target] = model_paths
@@ -214,9 +222,18 @@ def train_forward_models(
         calibrators[target] = calibrator
 
         metrics[target] = {
-            "R2": r2_all,
-            "RMSE": rmse_all,
-            "MAE": mae_all,
+            # Backward-compatible keys: R2/RMSE/MAE now map to OOF (CV holdout),
+            # while *_train capture full-fit quality.
+            "R2": r2_oof,
+            "R2_oof": r2_oof,
+            "R2_train": r2_all,
+            "R2_test": r2_oof,  # alias for consumers expecting test metric
+            "RMSE": rmse_oof,
+            "MAE": mae_oof,
+            "RMSE_oof": rmse_oof,
+            "MAE_oof": mae_oof,
+            "RMSE_train": rmse_all,
+            "MAE_train": mae_all,
             "selected_features": selected_features,
             "physics_features": physics_features,
             "n_removed_multicollinear": n_removed,
@@ -248,7 +265,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default="artifacts/forward_models", help="Directory to save models")
     parser.add_argument("--iterations", type=int, default=1000, help="CatBoost iterations")
     parser.add_argument("--no-feature-selection", action="store_true", help="Disable feature selection, use all features")
+    parser.add_argument("--validation-mode", type=str, default="warn", choices=["warn", "strict"], help="Validation mode for dataset loading")
     
     args = parser.parse_args()
     
-    train_forward_models(args.data, args.output, iterations=args.iterations)
+    train_forward_models(args.data, args.output, iterations=args.iterations, validation_mode=args.validation_mode)
