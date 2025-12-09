@@ -169,6 +169,8 @@ SOLVENT_DESCRIPTOR_FEATURES = [
     'Solvent_LogP',
     'Solvent_NumHDonors',
     'Solvent_NumHAcceptors',
+    'Solvent_Dipole_Moment',
+    'Solvent_Dielectric_Constant',
 ]
 
 PROCESS_CONTEXT_FEATURES = [
@@ -205,6 +207,24 @@ SOLVENT_BOILING_POINTS_C = {
     'Acetonitrile': 82.0,
     'Метанол': 65.0,
     'Methanol': 65.0,
+}
+
+SOLVENT_POLAR_PROPERTIES = {
+    # Values are approximate at 25°C; used for solubility/kinetics descriptors
+    'ДМФА': {'Dipole_Moment': 3.82, 'Dielectric_Constant': 36.7},
+    'DMF': {'Dipole_Moment': 3.82, 'Dielectric_Constant': 36.7},
+    'N,N-dimethylformamide': {'Dipole_Moment': 3.82, 'Dielectric_Constant': 36.7},
+    'ДМСО': {'Dipole_Moment': 3.96, 'Dielectric_Constant': 46.7},
+    'DMSO': {'Dipole_Moment': 3.96, 'Dielectric_Constant': 46.7},
+    'Dimethyl sulfoxide': {'Dipole_Moment': 3.96, 'Dielectric_Constant': 46.7},
+    'Этанол': {'Dipole_Moment': 1.69, 'Dielectric_Constant': 24.3},
+    'Ethanol': {'Dipole_Moment': 1.69, 'Dielectric_Constant': 24.3},
+    'Вода': {'Dipole_Moment': 1.85, 'Dielectric_Constant': 78.4},
+    'Water': {'Dipole_Moment': 1.85, 'Dielectric_Constant': 78.4},
+    'Ацетонитрил': {'Dipole_Moment': 3.92, 'Dielectric_Constant': 35.9},
+    'Acetonitrile': {'Dipole_Moment': 3.92, 'Dielectric_Constant': 35.9},
+    'Метанол': {'Dipole_Moment': 1.70, 'Dielectric_Constant': 32.6},
+    'Methanol': {'Dipole_Moment': 1.70, 'Dielectric_Constant': 32.6},
 }
 
 STOICHIOMETRY_TARGETS = {

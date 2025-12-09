@@ -188,23 +188,40 @@ class AdsorbentOptimizer:
         t_syn = trial.suggest_int("Т.син., °С", *self.search_space["t_syn_range"], step=5)
         t_dry = trial.suggest_int("Т суш., °С", *self.search_space["t_dry_range"], step=5)
         t_act = trial.suggest_int("Tрег, ᵒС", *self.search_space["t_act_range"], step=5)
-        
-        # --- 2. HARD CONSTRAINTS (Physical Feasibility) ---
-        # Reject physically impossible recipes before expensive model inference
-        
-        # 2.1. Temperature constraints
-        # Drying should not be hotter than synthesis (usually)
-        if t_dry > t_syn + 20:
-            return 1e9
-        
-        # Activation must be higher than drying
-        if t_act < t_dry:
-            return 1e9
 
-        # 2.1b. Solvent boiling point constraint
+        # --- 2. SOFT CONSTRAINTS (Physical Feasibility) ---
+        # Instead of flat 1e9 penalties, accumulate a smooth penalty term.
+        constraint_penalty = 0.0
+        penalty_reasons: List[Tuple[str, float]] = []
+
+        def add_penalty(amount: float, reason: str) -> None:
+            nonlocal constraint_penalty
+            penalty = float(max(amount, 0.0))
+            if penalty <= 0:
+                return
+            constraint_penalty += penalty
+            if len(penalty_reasons) < 5:  # keep a short trace for debugging
+                penalty_reasons.append((reason, penalty))
+
+        def relative_violation(value: float, lower: Optional[float], upper: Optional[float], eps: float = 1e-8) -> float:
+            if lower is not None and value < lower:
+                return (lower - value) / max(abs(lower), eps)
+            if upper is not None and value > upper:
+                return (value - upper) / max(abs(upper), eps)
+            return 0.0
+
+        # 2.1. Temperature constraints (soft)
+        dry_excess = max(0.0, t_dry - (t_syn + 20))
+        add_penalty(dry_excess * 2.0, "dry_above_synthesis")
+
+        act_shortfall = max(0.0, t_dry - t_act)
+        add_penalty(act_shortfall * 3.0, "activation_below_dry")
+
+        # 2.1b. Solvent boiling point constraint (soft)
         bp = self._get_boiling_point(solvent)
-        if bp is not None and t_syn >= bp:
-            return 1e9
+        if bp is not None:
+            boil_over = max(0.0, t_syn - bp)
+            add_penalty(boil_over * 5.0, "syn_above_boiling")
         
         # 2.2. Stoichiometry constraints
         # Get molar masses from lookup tables
@@ -213,7 +230,9 @@ class AdsorbentOptimizer:
             ligand_desc = self.lookup_tables.ligand.loc[ligand]
             solvent_desc = self.lookup_tables.solvent.loc[solvent]
         except KeyError:
-            return 1e9  # Metal/ligand/solvent not found in lookup
+            add_penalty(5_000.0, "lookup_missing")
+            trial.report(constraint_penalty, step=0)
+            raise optuna.TrialPruned("Missing lookup entry for metal/ligand/solvent")
         
         # Handle case where lookup returns DataFrame (multiple rows) vs Series (single row)
         if isinstance(metal_desc, pd.DataFrame):
@@ -233,7 +252,9 @@ class AdsorbentOptimizer:
             mw_acid = mw_acid.item()
         
         if pd.isna(mw_salt) or pd.isna(mw_acid) or mw_salt == 0 or mw_acid == 0:
-            return 1e9  # Missing data, cannot proceed
+            add_penalty(5_000.0, "missing_molar_mass")
+            trial.report(constraint_penalty, step=0)
+            raise optuna.TrialPruned("Missing molar mass data")
         
         # Calculate moles
         n_salt = m_salt / mw_salt
@@ -241,7 +262,8 @@ class AdsorbentOptimizer:
         
         # Avoid division by zero
         if n_acid == 0:
-            return 1e9
+            add_penalty(2_000.0, "zero_acid_moles")
+            n_acid = 1e-6
         
         n_ratio = n_salt / n_acid
         # Target stoichiometry by metal-ligand pair if available
@@ -249,17 +271,20 @@ class AdsorbentOptimizer:
         if stoich_spec:
             target_ratio = stoich_spec["ratio"]
             tol = stoich_spec.get("tolerance", 0.1)
-            if not (target_ratio * (1 - tol) <= n_ratio <= target_ratio * (1 + tol)):
-                return 1e9
+            lower = target_ratio * (1 - tol)
+            upper = target_ratio * (1 + tol)
+            violation = relative_violation(n_ratio, lower, upper)
+            add_penalty(500.0 * violation * violation, "stoichiometry")
         else:
             # Fallback broad bounds
             lo, hi = DEFAULT_STOICHIOMETRY_BOUNDS
-            if n_ratio < lo or n_ratio > hi:
-                return 1e9
+            violation = relative_violation(n_ratio, lo, hi)
+            add_penalty(250.0 * violation * violation, "stoichiometry_fallback")
         
         # 2.3. Concentration constraints
         if v_solv <= 0:
-            return 1e9
+            add_penalty(1_000.0 + abs(v_solv) * 100.0, "non_positive_solvent_volume")
+            v_solv = max(v_solv, 1e-3)  # guard log/ratio calculations
         
         # --- 3. FEATURE ENGINEERING (Must match training!) ---
         # Calculate all features that the model expects
@@ -344,7 +369,9 @@ class AdsorbentOptimizer:
                     if missing:
                         if trial.number == 0:  # Only print once
                             print(f"Missing features for {target_name}: {missing}")
-                        return 1e9
+                        add_penalty(10_000.0 * len(missing), "missing_features")
+                        trial.report(loss + constraint_penalty, step=1)
+                        raise optuna.TrialPruned(f"Missing features for {target_name}")
                         
                     # Prepare input slice for this specific model
                     df_slice = df_input[model_features]
@@ -365,7 +392,9 @@ class AdsorbentOptimizer:
                 except Exception as e:
                     # Feature mismatch or other error
                     print(f"Prediction error for {target_name}: {e}")
-                    return 1e9
+                    add_penalty(20_000.0, f"prediction_error_{target_name}")
+                    trial.report(loss + constraint_penalty, step=1)
+                    raise optuna.TrialPruned(f"Prediction failed for {target_name}")
                 
                 predictions[target_name] = mean_pred
                 calibrated_sigma = self._calibrate_sigma(target_name, std_pred)
@@ -409,28 +438,40 @@ class AdsorbentOptimizer:
         e0_pred = predictions.get("E0, кДж/моль")
         if e0_pred is not None:
             lo_e0, hi_e0 = E0_BOUNDS_KJ_MOL
-            if not (lo_e0 <= e0_pred <= hi_e0):
-                return 1e9
+            violation = relative_violation(e0_pred, lo_e0, hi_e0)
+            add_penalty(300.0 * violation, "E0_bounds")
         
         # Physics consistency checks on predictions (hard rejection)
         w0_pred = predictions.get("W0, см3/г")
         ws_pred = predictions.get("Ws, см3/г")
         if w0_pred is not None and ws_pred is not None and ws_pred < w0_pred:
-            return 1e9
+            add_penalty(
+                200.0 * (w0_pred - ws_pred) / max(abs(w0_pred), 1e-6),
+                "Ws_less_than_W0"
+            )
 
         e_pred = predictions.get("E, кДж/моль")
         if e_pred is not None and e0_pred is not None and e0_pred != 0:
             ratio = e_pred / e0_pred
-            if ratio < 0.2 or ratio > 1.0:
-                return 1e9
+            ratio_violation = relative_violation(ratio, 0.2, 1.0)
+            add_penalty(200.0 * ratio_violation, "E_over_E0_ratio")
 
         # --- 5. Store predictions for later retrieval ---
         for k, v in predictions.items():
             trial.set_user_attr(k, float(v))
         for k, v in uncertainties.items():
             trial.set_user_attr(f"Uncertainty_{k}", float(v))
-            
-        return loss
+
+        trial.set_user_attr("ConstraintPenalty", float(constraint_penalty))
+        if penalty_reasons:
+            trial.set_user_attr(
+                "PenaltyReasons",
+                [f"{reason}:{value:.3f}" for reason, value in penalty_reasons]
+            )
+
+        total_loss = loss + constraint_penalty
+        trial.report(total_loss, step=2)
+        return total_loss
 
     def optimize(self, targets: Dict[str, float], weights: Dict[str, float] = None) -> pd.DataFrame:
         if weights is None:

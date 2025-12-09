@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Union, overload
+from typing import Dict, Iterable, List, Optional, Union, overload
 from typing_extensions import Literal
 
 import numpy as np
@@ -14,6 +14,7 @@ from .constants import (
     METAL_DESCRIPTOR_FEATURES,
     SOLVENT_DESCRIPTOR_FEATURES,
     SOLVENT_BOILING_POINTS_C,
+    SOLVENT_POLAR_PROPERTIES,
     TEMPERATURE_CATEGORIES,
     FORWARD_MODEL_INPUTS,
     FORWARD_MODEL_TARGETS,
@@ -178,6 +179,7 @@ def load_dataset(
     if add_salt_features:
         add_salt_mass_features(df)
     
+    add_solvent_polar_descriptors(df)
     add_physicochemical_descriptors(df)
 
     validate_SEH_data(df, mode=validation_mode)
@@ -624,6 +626,58 @@ def add_physicochemical_descriptors(df: pd.DataFrame, *, inplace: bool = True) -
         
         df['Reactor_Loading_g_mL'] = (m_salt + m_acid) / vol_ml
     
+    if not inplace:
+        return df
+    return None
+
+
+@overload
+def add_solvent_polar_descriptors(df: pd.DataFrame, *, inplace: Literal[True] = ...) -> None: ...
+@overload
+def add_solvent_polar_descriptors(df: pd.DataFrame, *, inplace: Literal[False]) -> pd.DataFrame: ...
+
+def add_solvent_polar_descriptors(df: pd.DataFrame, *, inplace: bool = True) -> Optional[pd.DataFrame]:
+    """
+    Add solvent polarity descriptors (dipole moment and dielectric constant).
+    
+    Values are looked up from SOLVENT_POLAR_PROPERTIES. For solvent mixtures
+    denoted with '/', the properties are averaged across components, mirroring
+    the existing solvent descriptor handling.
+    """
+    if not inplace:
+        df = df.copy()
+
+    if 'Растворитель' not in df.columns:
+        return df if not inplace else None
+
+    def _compute_property(solvent_name: str, key: str) -> float:
+        if pd.isna(solvent_name):
+            return np.nan
+        components = [comp.strip() for comp in str(solvent_name).split('/')]
+        values: List[float] = []
+        for comp in components:
+            props = SOLVENT_POLAR_PROPERTIES.get(comp) or \
+                    SOLVENT_POLAR_PROPERTIES.get(comp.capitalize()) or \
+                    SOLVENT_POLAR_PROPERTIES.get(comp.lower())
+            if props and key in props:
+                values.append(props[key])
+        return float(np.mean(values)) if values else np.nan
+
+    descriptor_map = {
+        'Solvent_Dipole_Moment': 'Dipole_Moment',
+        'Solvent_Dielectric_Constant': 'Dielectric_Constant',
+    }
+
+    for column, key in descriptor_map.items():
+        if column not in df.columns:
+            df[column] = df['Растворитель'].apply(lambda name: _compute_property(name, key))
+        else:
+            missing_mask = df[column].isna()
+            if missing_mask.any():
+                df.loc[missing_mask, column] = df.loc[missing_mask, 'Растворитель'].apply(
+                    lambda name: _compute_property(name, key)
+                )
+
     if not inplace:
         return df
     return None
