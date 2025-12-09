@@ -447,6 +447,20 @@ def build_lookup_tables(df: pd.DataFrame, include_extended: bool = True) -> Look
     for entity, cols in missing_cols.items():
         if cols:
             raise ValueError(f"Dataset is missing required columns {sorted(cols)} for {entity} lookup")
+    if include_extended:
+        missing_extended: Dict[str, Iterable[str]] = {
+            "metal_coord": _missing_columns(df, METAL_COORD_FEATURES),
+            "ligand_3d": _missing_columns(df, LIGAND_3D_FEATURES),
+            "ligand_2d": _missing_columns(df, LIGAND_2D_FEATURES),
+            "interaction": _missing_columns(df, INTERACTION_FEATURES),
+        }
+        missing_block = {k: v for k, v in missing_extended.items() if v}
+        if missing_block:
+            details = "; ".join(f"{k}: {sorted(v)}" for k, v in missing_block.items())
+            raise ValueError(
+                "Extended descriptor columns are missing. "
+                f"{details}. Run scripts/enrich_descriptors.py to generate the enriched dataset."
+            )
 
     metal_table = (
         df[["Металл", *metal_features]].drop_duplicates().set_index("Металл").sort_index()

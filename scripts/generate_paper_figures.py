@@ -57,8 +57,12 @@ def load_metrics(metrics_path: str) -> dict:
 def plot_model_performance(metrics: dict, output_dir: str):
     """Figure 1: Model Performance Comparison - R² bar chart."""
     targets = list(metrics.keys())
-    r2_test = [metrics[t]['R2_test'] for t in targets]
-    r2_train = [metrics[t]['R2_train'] for t in targets]
+    # Some metrics.json files only store "R2" (CV) without train/test split.
+    def _r2_or_default(entry: dict, key: str) -> float:
+        return float(entry.get(key, entry.get('R2', np.nan)))
+
+    r2_test = [_r2_or_default(metrics[t], 'R2_test') for t in targets]
+    r2_train = [_r2_or_default(metrics[t], 'R2_train') for t in targets]
     
     target_labels = [t.replace(', ', '\n') for t in targets]
     
@@ -131,6 +135,7 @@ def plot_parity_plots(data_path: str, models_dir: str, metrics: dict, output_dir
         y_pred = preds_df['y_pred'].values
         y_std = preds_df['y_std'].values
         
+        r2 = metrics[target].get('R2_test', metrics[target].get('R2', np.nan))
         # Plot scatter
         ax.scatter(y_test, y_pred, alpha=0.6, s=30, c=COLORS['primary'], edgecolors='white', linewidth=0.5)
         
@@ -146,7 +151,6 @@ def plot_parity_plots(data_path: str, models_dir: str, metrics: dict, output_dir
         ax.set_xlim(lims)
         ax.set_ylim(lims)
         
-        r2 = metrics[target]['R2_test']
         rmse = metrics[target]['RMSE']
         ax.set_title(f'{target}\nR²={r2:.3f}, RMSE={rmse:.2f}')
         ax.set_xlabel('Actual')
@@ -291,7 +295,7 @@ def plot_uncertainty_analysis(metrics: dict, output_dir: str):
     """Figure 6: Model Uncertainty Analysis."""
     targets = list(metrics.keys())
     uncertainties = [metrics[t]['Uncertainty_Mean'] for t in targets]
-    r2_values = [metrics[t]['R2_test'] for t in targets]
+    r2_values = [metrics[t].get('R2_test', metrics[t].get('R2', np.nan)) for t in targets]
     
     target_labels = [t.replace(', ', '\n') for t in targets]
     

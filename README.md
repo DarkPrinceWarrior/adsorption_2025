@@ -63,6 +63,12 @@ PYTHONPATH=src python scripts/train_forward_model.py \
     --data data/SEC_SYN_with_features_enriched.csv \
     --iterations 1000
 ```
+Если у вас только базовый датасет `data/SEC_SYN_with_features.csv`, сначала обогатите его дескрипторами:
+```bash
+PYTHONPATH=src python scripts/enrich_descriptors.py \
+    --input data/SEC_SYN_with_features.csv \
+    --output data/SEC_SYN_with_features_enriched.csv
+```
 *Результат:* В папке `artifacts/forward_models` создаются 5 ансамблей (по одному на каждое целевое свойство).
 
 ### Этап II: Валидация (Validation)
@@ -108,7 +114,8 @@ PYTHONPATH=src python scripts/run_bayes_opt.py \
 ├── scripts/
 │   ├── train_forward_model.py  # Обучение Deep Ensembles
 │   ├── validate_uncertainty.py # Оценка качества и калибровка
-│   └── run_bayes_opt.py        # Inverse Design (Поиск рецептов)
+│   ├── run_bayes_opt.py        # Inverse Design (Поиск рецептов)
+│   └── enrich_descriptors.py   # Обогащение датасета (RDKit + коорд. химия)
 ├── src/
 │   └── adsorb_synthesis/
 │       ├── data_processing.py    # Генерация дескрипторов (inplace=True/False)

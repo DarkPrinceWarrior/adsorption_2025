@@ -244,7 +244,7 @@ def train_forward_models(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Forward Models for Adsorbent Synthesis")
-    parser.add_argument("--data", type=str, default="data/SEC_SYN_with_features.csv", help="Path to input CSV")
+    parser.add_argument("--data", type=str, default="data/SEC_SYN_with_features_enriched.csv", help="Path to input CSV")
     parser.add_argument("--output", type=str, default="artifacts/forward_models", help="Directory to save models")
     parser.add_argument("--iterations", type=int, default=1000, help="CatBoost iterations")
     parser.add_argument("--no-feature-selection", action="store_true", help="Disable feature selection, use all features")
