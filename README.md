@@ -61,7 +61,8 @@ PYTHONPATH=src python -m pytest tests/ -q
 ```bash
 PYTHONPATH=src python scripts/train_forward_model.py \
     --data data/SEC_SYN_with_features_enriched.csv \
-    --iterations 1000
+    --iterations 1000 \
+    --validation-mode warn  # use strict to fail on invalid rows
 ```
 Если у вас только базовый датасет `data/SEC_SYN_with_features.csv`, сначала обогатите его дескрипторами:
 ```bash
