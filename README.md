@@ -62,7 +62,7 @@ PYTHONPATH=src python -m pytest tests/ -q
 PYTHONPATH=src python scripts/train_forward_model.py \
     --data data/SEC_SYN_with_features_enriched.csv \
     --iterations 1000 \
-    --validation-mode warn  # use strict to fail on invalid rows
+    --validation-mode warn  # strict -> остановится на неконсистентных строках
 ```
 Если у вас только базовый датасет `data/SEC_SYN_with_features.csv`, сначала обогатите его дескрипторами:
 ```bash
@@ -79,11 +79,13 @@ PYTHONPATH=src python scripts/enrich_descriptors.py \
 PYTHONPATH=src python scripts/validate_uncertainty.py
 ```
 *Результат:* Графики в `artifacts/plots/uncertainty_rejection_plots.png`.
-*Метрики (на тестовой выборке):*
-*   **$x_0$:** $R^2 \approx 0.90$ — лучший результат благодаря физическим дескрипторам (`electron_affinity`, `ionic_radius`)
-*   **$E_0$:** $R^2 \approx 0.88$ — `Jahn_Teller_Active` как ключевой маркер Cu²⁺
-*   **$S_{me}$:** $R^2 \approx 0.86$
-*   **$W_0$, $S_{BET}$:** $R^2 \approx 0.29$ — сложные таргеты (зависят от неконтролируемых факторов)
+*Метрики (5-fold OOF CV, см. `artifacts/forward_models/metrics.json`):*
+*   **$x_0$:** $R^2 \approx 0.82$
+*   **$E_0$:** $R^2 \approx 0.79$
+*   **$S_{me}$:** $R^2 \approx 0.79$
+*   **$S_{BET}$:** $R^2 \approx 0.37$
+*   **$W_0$:** $R^2 \approx 0.26$
+Строгая валидация (`--validation-mode strict`) на текущем датасете падает из-за неконсистентных температур/стехиометрии; по умолчанию используйте `warn` или очистите данные.
 
 ### Этап III: Поиск рецепта (Inverse Design)
 Основной инструмент исследователя. Вы задаете желаемые СЭХ, а алгоритм ищет оптимальные условия синтеза.
@@ -116,18 +118,17 @@ PYTHONPATH=src python scripts/run_bayes_opt.py \
 │   ├── train_forward_model.py  # Обучение Deep Ensembles
 │   ├── validate_uncertainty.py # Оценка качества и калибровка
 │   ├── run_bayes_opt.py        # Inverse Design (Поиск рецептов)
+│   ├── generate_paper_figures.py # Фигуры для статьи/отчета
 │   └── enrich_descriptors.py   # Обогащение датасета (RDKit + коорд. химия)
 ├── src/
 │   └── adsorb_synthesis/
 │       ├── data_processing.py    # Генерация дескрипторов (inplace=True/False)
 │       ├── data_validation.py    # Валидация физических ограничений
-│       ├── outlier_detection.py  # Robust outlier detection (MAD/IQR/Tukey)
 │       ├── feature_selection.py  # Advanced Feature Selection (VIF, корреляции)
 │       ├── physics_losses.py     # Физические constraints и penalties
-│       ├── pipeline.py           # Multi-stage pipeline с physics weights
 │       ├── constants.py          # Справочники (Molar Masses, Features)
 │       └── ...
-├── tests/                        # 40 unit/integration тестов
+├── tests/                        # Базовые unit-тесты
 ├── data/                         # Экспериментальные датасеты
 └── artifacts/                    # Сохраненные модели и графики
 ```
@@ -147,11 +148,8 @@ PYTHONPATH=src python scripts/run_bayes_opt.py \
 *   **Лиганд:** `carboxyl_groups`, `molecular_weight`
 *   **Взаимодействие:** `Metal_Ligand_Size_Ratio`
 
-### Robust Outlier Detection
-Вместо `IsolationForest` (который может удалять валидные редкие режимы) используется **MAD-based detection**:
-*   **MAD (Median Absolute Deviation):** Робастен к скошенным распределениям (log-normal SBET, W0)
-*   **Winsorize fallback:** При малых выборках клиппинг вместо удаления
-*   **Configurable threshold:** `OutlierConfig(method=OutlierMethod.MAD, threshold=3.5)`
+### Валидация данных
+`validate_synthesis_data` поддерживает режимы `warn`/`strict`. Текущий датасет содержит строки с нарушением температурного порядка, точек кипения и стехиометрии, поэтому строгий режим приведет к ошибке загрузки — используйте `warn`, либо предварительно очистите данные.
 
 ### Data Processing Safety
 Все функции мутации DataFrame поддерживают параметр `inplace`:
@@ -168,7 +166,6 @@ add_salt_mass_features(df)  # inplace=True
 *   **Physics Penalties:** Sample weights увеличиваются для образцов с нарушениями физических constraints ($a_0 = 28.86 \cdot W_0$, $E = E_0/3$).
 *   **Robustness:** `CatBoost` эффективно работает с категориальными данными без One-Hot кодирования.
 *   **Uncertainty Quantification:** Ансамбль из 5 моделей даёт оценку неопределённости ($\sigma$).
-*   **SMOTE/ADASYN:** Автоматический resampling для несбалансированных классов (требует `imbalanced-learn`).
 
 ---
 
@@ -177,17 +174,6 @@ add_salt_mass_features(df)  # inplace=True
 ```bash
 # Все тесты
 PYTHONPATH=src python -m pytest tests/ -v
-
-# Только outlier detection
-PYTHONPATH=src python -m pytest tests/test_outlier_detection.py -v
-
-# Только physics constraints
-PYTHONPATH=src python -m pytest tests/test_physics_constraints.py -v
 ```
 
-**Покрытие:** 40 тестов включая:
-*   Data validation (warn/strict modes)
-*   Outlier detection (MAD, IQR, Winsorize)
-*   Physics constraints (thermodynamics, stoichiometry)
-*   DataFrame copy semantics (`inplace=True/False`)
-*   Pipeline integration
+**Покрытие:** базовые юнит-тесты по валидации данных, инженерии признаков и расчёту молярных масс.
