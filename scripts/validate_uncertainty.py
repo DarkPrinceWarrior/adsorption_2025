@@ -130,8 +130,12 @@ def validate_uncertainty(data_path: str, models_dir: str, output_dir: str):
         print(f"  Top-50% confident MAE: {maes[len(maes)//2]:.4f}")
         
     # Plot Results
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    axes = axes.flatten()
+    n_targets = len(FORWARD_MODEL_TARGETS)
+    n_cols = min(3, n_targets) if n_targets else 1
+    n_rows = (n_targets + n_cols - 1) // n_cols if n_targets else 1
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4.5 * n_rows))
+    axes = np.atleast_1d(axes).reshape(-1)
     
     for i, target in enumerate(FORWARD_MODEL_TARGETS):
         if target not in results:
@@ -147,13 +151,13 @@ def validate_uncertainty(data_path: str, models_dir: str, output_dir: str):
         ax.set_ylabel('MAE Error')
         ax.grid(True)
         
-        # Add R2 on secondary axis if needed, but for clarity let's stick to MAE reduction
-        # or put R2 in title
-        
         # Calculate Improvement
         improvement = (res['maes'][0] - res['maes'][-1]) / res['maes'][0] * 100
         ax.text(0.05, 0.95, f"Imp: {improvement:.1f}%", transform=ax.transAxes, 
                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.5))
+
+    for ax in axes[n_targets:]:
+        ax.set_visible(False)
 
     plt.tight_layout()
     plot_path = os.path.join(output_dir, 'uncertainty_rejection_plots.png')

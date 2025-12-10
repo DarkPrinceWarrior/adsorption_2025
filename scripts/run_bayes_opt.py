@@ -502,9 +502,7 @@ def main():
     parser = argparse.ArgumentParser(description="Inverse Design Inference via Bayesian Optimization")
     
     # Target arguments
-    parser.add_argument("--W0", type=float, help="Target W0 micropore volume (cm3/g)")
     parser.add_argument("--E0", type=float, help="Target E0 characteristic energy (kJ/mol)")
-    parser.add_argument("--SBET", type=float, help="Target S_BET surface area (m2/g)")
     parser.add_argument("--x0", type=float, help="Target x0 pore half-width (nm)")
     parser.add_argument("--Sme", type=float, help="Target Sme mesopore surface area (m2/g)")
     
@@ -517,14 +515,12 @@ def main():
     
     # Construct target dict
     targets = {}
-    if args.W0: targets['W0, см3/г'] = args.W0
     if args.E0: targets['E0, кДж/моль'] = args.E0
-    if args.SBET: targets['SБЭТ, м2/г'] = args.SBET
     if args.x0: targets['х0, нм'] = args.x0
     if args.Sme: targets['Sme, м2/г'] = args.Sme
     
     if not targets:
-        print("Error: No targets specified! Use --W0, --E0, --SBET, --x0, or --Sme.")
+        print("Error: No targets specified! Use --E0, --x0, or --Sme.")
         return
 
     optimizer = AdsorbentOptimizer(

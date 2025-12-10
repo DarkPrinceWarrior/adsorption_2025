@@ -281,9 +281,8 @@ FORWARD_MODEL_INPUTS = [
 ]
 
 FORWARD_MODEL_TARGETS = [
-    'W0, см3/г',
+    # Focused target set (we no longer predict W0 or SБЭТ)
     'E0, кДж/моль',
-    'SБЭТ, м2/г',
     'х0, нм',
     'Sme, м2/г',
 ]

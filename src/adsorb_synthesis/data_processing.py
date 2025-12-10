@@ -70,7 +70,7 @@ def prepare_forward_dataset(
         
     Returns:
         X: DataFrame of input features (Recipe parameters + optional descriptors).
-        y: DataFrame of target properties (W0, E0, S_BET, x0).
+        y: DataFrame of target properties (E0, x0, Sme).
     """
     df = df.copy()
     
@@ -121,7 +121,7 @@ def prepare_forward_dataset(
     X = X.drop(columns=['_orig_idx'])
     
     # 4. Copy Engineered Features from df (already computed by add_salt_mass_features)
-    # These are critical for W0 prediction - CatBoost struggles to learn ratios
+    # These remain to keep feature consistency with prior models (ratios, temps, combos)
     for col in FORWARD_MODEL_ENGINEERED_FEATURES:
         if col in df.columns:
             X[col] = df.loc[X.index, col].values
