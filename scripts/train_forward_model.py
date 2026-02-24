@@ -22,7 +22,6 @@ import pandas as pd
 from catboost import CatBoostRegressor
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.model_selection import StratifiedKFold
-from sklearn.isotonic import IsotonicRegression
 
 from adsorb_synthesis.data_processing import load_dataset, build_lookup_tables, prepare_forward_dataset
 from adsorb_synthesis.constants import RANDOM_SEED, FORWARD_MODEL_TARGETS, RARE_METALS_THRESHOLD
@@ -33,24 +32,6 @@ from adsorb_synthesis.feature_selection import (
 )
 from adsorb_synthesis.physics_losses import compute_physics_penalty
 
-
-def fit_uncertainty_calibrator(sigmas: np.ndarray, abs_errors: np.ndarray) -> Dict:
-    """Fit sigma->abs_error calibrator using isotonic regression or scale fallback."""
-    sigmas = np.asarray(sigmas, dtype=float)
-    abs_errors = np.asarray(abs_errors, dtype=float)
-    mask = np.isfinite(sigmas) & np.isfinite(abs_errors)
-    sigmas = sigmas[mask]
-    abs_errors = abs_errors[mask]
-
-    if len(sigmas) >= 20 and np.unique(sigmas).size >= 5:
-        iso = IsotonicRegression(out_of_bounds="clip")
-        iso.fit(sigmas, abs_errors)
-        return {"type": "isotonic", "model": iso}
-
-    # Fallback: linear scaling of sigma to median absolute error
-    median_sigma = np.median(sigmas) if len(sigmas) else 1e-8
-    scale = np.median(abs_errors) / max(median_sigma, 1e-8)
-    return {"type": "scale", "scale": float(scale)}
 
 def train_forward_models(
     data_path: str,
@@ -114,15 +95,21 @@ def train_forward_models(
         sample_weights_full = 1.0 + PHYSICS_PENALTY_WEIGHT * physics_penalty.values
         print(f"  Mean physics penalty weight: {np.mean(sample_weights_full):.3f}")
         
-        # Feature Selection (once per target on full data)
-        print(f"  Advanced Feature Selection for {target}...")
+        # Create CV splits BEFORE feature selection to avoid data leakage.
+        # Feature selection will only see fold-0's training data.
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
+        cv_splits = list(skf.split(X, strat_key))
+        fs_train_idx = cv_splits[0][0]  # fold-0 train indices for feature selection
+
+        # Feature Selection (on fold-0 train data only — no leakage)
+        print(f"  Advanced Feature Selection for {target} (on fold-0 train, n={len(fs_train_idx)})...")
         keep_features, drop_features = get_curated_features()
         available_drop = [f for f in drop_features if f in X.columns]
         numeric_cols = [c for c in X.columns if c not in cat_features]
         curated_numeric = [c for c in numeric_cols if c not in available_drop]
         selected_features, selection_report = select_features_advanced(
-            X[cat_features + curated_numeric],
-            y_target,
+            X.iloc[fs_train_idx][cat_features + curated_numeric],
+            y_target.iloc[fs_train_idx],
             categorical_cols=cat_features,
             corr_threshold=FORWARD_MODEL_CONFIG.feature_selection_corr_threshold,
             vif_threshold=FORWARD_MODEL_CONFIG.feature_selection_vif_threshold,
@@ -134,68 +121,111 @@ def train_forward_models(
         print(f"    Selected {len(selected_features)} features: {selected_features[:5]}...")
         cat_features_sel = [c for c in selected_features if c in cat_features]
 
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
-        model_paths = []
-        fold_models = []
+        # =====================================================================
+        # Phase 1: CV loop — honest OOF metrics (fold models are temporary)
+        # =====================================================================
         oof_preds = np.full(len(X), np.nan, dtype=float)
 
-        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X, strat_key)):
+        for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
             seed = RANDOM_SEED + fold_idx
-            print(f"  Fold {fold_idx+1}/{n_splits} (seed={seed})...")
+            print(f"  CV Fold {fold_idx+1}/{n_splits} (seed={seed})...")
             X_train_sel = X.iloc[train_idx][selected_features]
             X_val_sel = X.iloc[val_idx][selected_features]
             y_train_target = y_target.iloc[train_idx]
             y_val_target = y_target.iloc[val_idx]
             w_train = sample_weights_full[train_idx]
-            w_val = sample_weights_full[val_idx]
 
-            model = CatBoostRegressor(
+            fold_model = CatBoostRegressor(
                 **CATBOOST_CONFIG.to_params(random_state=seed),
                 cat_features=cat_features_sel
             )
-
-            model.fit(
+            fold_model.fit(
                 X_train_sel, y_train_target,
                 sample_weight=w_train,
                 eval_set=(X_val_sel, y_val_target),
                 early_stopping_rounds=FORWARD_MODEL_CONFIG.early_stopping_rounds,
                 use_best_model=True
             )
+            oof_preds[val_idx] = fold_model.predict(X_val_sel)
 
-            safe_target = target.replace('/', '_').replace(' ', '_')
-            model_path = os.path.join(output_dir, f"catboost_{safe_target}_ens{fold_idx}.cbm")
-            model.save_model(model_path)
-            model_paths.append(model_path)
-            fold_models.append(model)
-
-            oof_preds[val_idx] = model.predict(X_val_sel)
-
-        # Ensemble predictions on full data
-        all_preds = np.stack([m.predict(X[selected_features]) for m in fold_models], axis=1)
-        ensemble_mean = np.mean(all_preds, axis=1)
-        ensemble_std = np.std(all_preds, axis=1)
-
-        # Full-data fit quality (acts as "train" since ensemble is fit on all rows cumulatively)
-        r2_all = r2_score(y_target, ensemble_mean)
-        rmse_all = np.sqrt(mean_squared_error(y_target, ensemble_mean))
-        mae_all = mean_absolute_error(y_target, ensemble_mean)
-        # Out-of-fold quality (proxy for test CV)
         r2_oof = r2_score(y_target, oof_preds)
         rmse_oof = np.sqrt(mean_squared_error(y_target, oof_preds))
         mae_oof = mean_absolute_error(y_target, oof_preds)
+        print(f"  CV OOF R2: {r2_oof:.4f}, RMSE: {rmse_oof:.4f}, MAE: {mae_oof:.4f}")
 
-        print(f"  CV Ensemble R2 (OOF): {r2_oof:.4f}, RMSE: {rmse_oof:.4f}, MAE: {mae_oof:.4f}")
-        print(f"  Full-fit R2 (train-ish): {r2_all:.4f}, RMSE: {rmse_all:.4f}, MAE: {mae_all:.4f}")
-        print(f"  Avg Uncertainty (StdDev across folds): {np.mean(ensemble_std):.4f}")
+        # =====================================================================
+        # Phase 2: Production Deep Ensemble — N models on 100% data
+        # =====================================================================
+        n_members = FORWARD_MODEL_CONFIG.n_ensemble_members
+        seed_step = FORWARD_MODEL_CONFIG.ensemble_seed_step
+        print(f"  Training production ensemble ({n_members} members on full data)...")
+        safe_target = target.replace('/', '_').replace(' ', '_')
+        model_paths = []
+        prod_models = []
+
+        for m_idx in range(n_members):
+            seed = RANDOM_SEED + (m_idx + 1) * seed_step
+            model = CatBoostRegressor(
+                **CATBOOST_CONFIG.to_params(random_state=seed),
+                cat_features=cat_features_sel
+            )
+            model.fit(
+                X[selected_features], y_target,
+                sample_weight=sample_weights_full,
+            )
+            model_path = os.path.join(output_dir, f"catboost_{safe_target}_ens{m_idx}.cbm")
+            model.save_model(model_path)
+            model_paths.append(model_path)
+            prod_models.append(model)
+
+        # Production ensemble predictions (on training data — for diagnostics)
+        prod_preds = np.stack([m.predict(X[selected_features]) for m in prod_models], axis=1)
+        prod_mean = np.mean(prod_preds, axis=1)
+        prod_sigma = np.std(prod_preds, axis=1)
+
+        r2_prod = r2_score(y_target, prod_mean)
+        rmse_prod = np.sqrt(mean_squared_error(y_target, prod_mean))
+        mae_prod = mean_absolute_error(y_target, prod_mean)
+        print(f"  Production Ensemble R2: {r2_prod:.4f}, RMSE: {rmse_prod:.4f}, MAE: {mae_prod:.4f}")
+        print(f"  Avg Ensemble σ: {np.mean(prod_sigma):.4f}")
 
         models[target] = model_paths
 
-        safe_target = target.replace('/', '_').replace(' ', '_')
+        # =====================================================================
+        # Phase 3: Conformal calibration from OOF residuals
+        # =====================================================================
+        alpha = FORWARD_MODEL_CONFIG.conformal_alpha
+        oof_residuals = np.abs(y_target.values - oof_preds)
+        # Normalized scores: honest residual / production sigma
+        eps = 1e-8
+        norm_scores = oof_residuals / (prod_sigma + eps)
+        # Finite-sample corrected quantile (Vovk et al.)
+        n_cal = len(norm_scores)
+        q_level = min((1 - alpha) * (1 + 1 / n_cal), 1.0)
+        conformal_q = float(np.quantile(norm_scores, q_level))
+
+        # Marginal (non-normalized) quantile as fallback
+        marginal_q = float(np.quantile(oof_residuals, q_level))
+
+        print(f"  Conformal quantile (α={alpha}): q={conformal_q:.4f} "
+              f"(marginal={marginal_q:.4f})")
+
+        calibrators[target] = {
+            "type": "conformal",
+            "conformal_q": conformal_q,
+            "marginal_q": marginal_q,
+            "alpha": alpha,
+            "n_calibration": n_cal,
+        }
+
+        # Save predictions (OOF + production)
         predictions_df = pd.DataFrame({
             'y_actual': y_target.values,
-            'y_pred': ensemble_mean,
-            'y_std': ensemble_std,
-            'y_oof': oof_preds
+            'y_oof': oof_preds,
+            'y_prod_mean': prod_mean,
+            'y_prod_sigma': prod_sigma,
+            'oof_residual': oof_residuals,
+            'norm_score': norm_scores,
         })
         predictions_path = os.path.join(output_dir, f"predictions_{safe_target}.csv")
         predictions_df.to_csv(predictions_path, index=False)
@@ -204,33 +234,24 @@ def train_forward_models(
         physics_features = [f for f in selected_features if any(x in f for x in 
             ['metal_coord', 'ligand_3d', 'ligand_2d', 'Size_Ratio', 'Electronegativity_Diff', 'Jahn_Teller'])]
 
-        abs_errors = np.abs(y_target.values - ensemble_mean)
-        calibrator = fit_uncertainty_calibrator(ensemble_std, abs_errors)
-        if calibrator["type"] == "isotonic":
-            calibrator_meta = {"type": "isotonic", "n_samples": len(ensemble_std)}
-        else:
-            calibrator_meta = {"type": "scale", "n_samples": len(ensemble_std), "scale": calibrator.get("scale", None)}
-        calibrators[target] = calibrator
-
         metrics[target] = {
-            # Backward-compatible keys: R2/RMSE/MAE now map to OOF (CV holdout),
-            # while *_train capture full-fit quality.
             "R2": r2_oof,
             "R2_oof": r2_oof,
-            "R2_train": r2_all,
-            "R2_test": r2_oof,  # alias for consumers expecting test metric
+            "R2_production": r2_prod,
             "RMSE": rmse_oof,
             "MAE": mae_oof,
             "RMSE_oof": rmse_oof,
             "MAE_oof": mae_oof,
-            "RMSE_train": rmse_all,
-            "MAE_train": mae_all,
+            "RMSE_production": rmse_prod,
+            "MAE_production": mae_prod,
             "selected_features": selected_features,
             "physics_features": physics_features,
             "n_removed_multicollinear": n_removed,
-            "Uncertainty_Mean": float(np.mean(ensemble_std)),
-            "Uncertainty_Calibrator": calibrator_meta,
-            "cv_folds": n_splits
+            "Ensemble_Sigma_Mean": float(np.mean(prod_sigma)),
+            "Conformal_q": conformal_q,
+            "Conformal_alpha": alpha,
+            "cv_folds": n_splits,
+            "ensemble_members": n_members,
         }
 
     # Save metrics summary

@@ -40,12 +40,20 @@ class CatBoostConfig:
 class ForwardModelConfig:
     """Training-level settings for the forward model ensemble."""
 
+    # CV settings (used for OOF metrics only)
     n_ensemble_splits: int = 5
     early_stopping_rounds: int = 100
     physics_penalty_weight: float = 1.0
     feature_selection_corr_threshold: float = 0.85
     feature_selection_vif_threshold: float = 10.0
     feature_selection_max_features: int = 15
+
+    # Production ensemble (true Deep Ensemble for BO inference)
+    n_ensemble_members: int = 5
+    ensemble_seed_step: int = 137  # seed spacing between members
+
+    # Conformal prediction
+    conformal_alpha: float = 0.10  # 90% prediction coverage
 
 
 CATBOOST_CONFIG = CatBoostConfig()

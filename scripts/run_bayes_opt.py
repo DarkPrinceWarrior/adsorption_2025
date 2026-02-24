@@ -130,14 +130,24 @@ class AdsorbentOptimizer:
         return {}
 
     def _calibrate_sigma(self, target_name: str, raw_sigma: float) -> float:
-        """Apply sigma calibration if calibrator is available."""
+        """Apply sigma calibration if calibrator is available.
+
+        For conformal calibrators, returns ``raw_sigma * conformal_q`` which
+        represents the half-width of the prediction interval at the configured
+        coverage level (e.g. 90%).
+        """
         calibrator = self.calibrators.get(target_name)
         if calibrator is None:
             return float(raw_sigma)
         try:
-            if isinstance(calibrator, dict) and calibrator.get("type") == "scale":
-                scale = calibrator.get("scale", 1.0)
-                return float(raw_sigma * scale)
+            if isinstance(calibrator, dict):
+                cal_type = calibrator.get("type")
+                if cal_type == "conformal":
+                    q = calibrator.get("conformal_q", 1.0)
+                    return float(raw_sigma * q)
+                if cal_type == "scale":
+                    scale = calibrator.get("scale", 1.0)
+                    return float(raw_sigma * scale)
             if hasattr(calibrator, "predict"):
                 return float(calibrator.predict([raw_sigma])[0])
         except Exception:
