@@ -56,5 +56,41 @@ class ForwardModelConfig:
     conformal_alpha: float = 0.10  # 90% prediction coverage
 
 
-CATBOOST_CONFIG = CatBoostConfig()
+CATBOOST_CONFIG = CatBoostConfig()  # default fallback
 FORWARD_MODEL_CONFIG = ForwardModelConfig()
+
+# Per-target tuned hyperparameters (from tune_hyperparams.py, 80 trials each)
+TUNED_CATBOOST_CONFIGS: Dict[str, CatBoostConfig] = {
+    "E0, кДж/моль": CatBoostConfig(
+        iterations=1700,
+        learning_rate=0.0336,
+        depth=8,
+        l2_leaf_reg=2.2,
+        min_data_in_leaf=10,
+        subsample=0.921,
+        colsample_bylevel=0.530,
+    ),
+    "х0, нм": CatBoostConfig(
+        iterations=1600,
+        learning_rate=0.0638,
+        depth=7,
+        l2_leaf_reg=1.846,
+        min_data_in_leaf=4,
+        subsample=0.950,
+        colsample_bylevel=0.502,
+    ),
+    "Sme, м2/г": CatBoostConfig(
+        iterations=2000,
+        learning_rate=0.0469,
+        depth=6,
+        l2_leaf_reg=0.108,
+        min_data_in_leaf=10,
+        subsample=0.926,
+        colsample_bylevel=0.623,
+    ),
+}
+
+
+def get_catboost_config(target: str) -> CatBoostConfig:
+    """Return tuned config for target, falling back to default."""
+    return TUNED_CATBOOST_CONFIGS.get(target, CATBOOST_CONFIG)

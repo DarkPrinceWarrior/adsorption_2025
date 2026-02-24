@@ -25,7 +25,7 @@ from sklearn.model_selection import StratifiedKFold
 
 from adsorb_synthesis.data_processing import load_dataset, build_lookup_tables, prepare_forward_dataset
 from adsorb_synthesis.constants import RANDOM_SEED, FORWARD_MODEL_TARGETS, RARE_METALS_THRESHOLD
-from adsorb_synthesis.config import CATBOOST_CONFIG, FORWARD_MODEL_CONFIG
+from adsorb_synthesis.config import FORWARD_MODEL_CONFIG, get_catboost_config
 from adsorb_synthesis.feature_selection import (
     select_features_advanced,
     get_curated_features
@@ -121,6 +121,11 @@ def train_forward_models(
         print(f"    Selected {len(selected_features)} features: {selected_features[:5]}...")
         cat_features_sel = [c for c in selected_features if c in cat_features]
 
+        # Per-target tuned hyperparameters (falls back to default if not tuned)
+        cb_config = get_catboost_config(target)
+        print(f"  CatBoost config: iter={cb_config.iterations}, lr={cb_config.learning_rate}, "
+              f"depth={cb_config.depth}")
+
         # =====================================================================
         # Phase 1: CV loop — honest OOF metrics (fold models are temporary)
         # =====================================================================
@@ -136,7 +141,7 @@ def train_forward_models(
             w_train = sample_weights_full[train_idx]
 
             fold_model = CatBoostRegressor(
-                **CATBOOST_CONFIG.to_params(random_state=seed),
+                **cb_config.to_params(random_state=seed),
                 cat_features=cat_features_sel
             )
             fold_model.fit(
@@ -166,7 +171,7 @@ def train_forward_models(
         for m_idx in range(n_members):
             seed = RANDOM_SEED + (m_idx + 1) * seed_step
             model = CatBoostRegressor(
-                **CATBOOST_CONFIG.to_params(random_state=seed),
+                **cb_config.to_params(random_state=seed),
                 cat_features=cat_features_sel
             )
             model.fit(
