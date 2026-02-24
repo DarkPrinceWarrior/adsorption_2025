@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Bayesian Optimization Engine for Adsorbent Inverse Design.
+Multi-Objective Bayesian Optimization for Adsorbent Inverse Design.
+
+Uses Optuna NSGA-II to optimise multiple adsorption targets simultaneously,
+producing a Pareto front of non-dominated synthesis recipes.
 
 Stage 3 & 4: "Navigator" + "Inference"
-User Constraints -> Optuna (Search) -> Forward Model (Simulator) -> Top Recipes
+User Constraints -> Optuna NSGA-II -> Forward Model -> Pareto Recipes
 """
 
 import argparse
@@ -14,7 +17,6 @@ import joblib
 import optuna
 import pandas as pd
 import numpy as np
-from math import erf, sqrt, exp, pi as PI_CONST
 from typing import Dict, List, Tuple, Optional
 from catboost import CatBoostRegressor, Pool
 
@@ -30,8 +32,6 @@ from adsorb_synthesis.data_processing import (
 from adsorb_synthesis.constants import (
     FORWARD_MODEL_INPUTS,
     FORWARD_MODEL_TARGETS,
-    FORWARD_MODEL_AUGMENTED_FEATURES,
-    FORWARD_MODEL_ENGINEERED_FEATURES,
     SOLVENT_BOILING_POINTS_C,
     STOICHIOMETRY_TARGETS,
     DEFAULT_STOICHIOMETRY_BOUNDS,
@@ -44,98 +44,103 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # Risk aversion for BO (weight on uncertainty term)
 LAMBDA_UNCERTAINTY = 0.5
-PHYSICS_PENALTY_WEIGHT = 1.0
+
+
+def _relative_violation(value: float, lower: Optional[float],
+                        upper: Optional[float], eps: float = 1e-8) -> float:
+    if lower is not None and value < lower:
+        return (lower - value) / max(abs(lower), eps)
+    if upper is not None and value > upper:
+        return (value - upper) / max(abs(upper), eps)
+    return 0.0
+
 
 class AdsorbentOptimizer:
-    def __init__(self, 
-                 models_dir: str, 
-                 data_path: str, 
+    def __init__(self,
+                 models_dir: str,
+                 data_path: str,
                  n_trials: int = 200,
                  strict_validation: bool = False):
-        
+
         self.models_dir = models_dir
         self.data_path = data_path
         self.n_trials = n_trials
         self.strict_validation = strict_validation
-        
+
         # Load Models
         self.models = self._load_models()
         self.calibrators = self._load_calibrators()
-        
+
         # Load Reference Data & Lookups
         print(f"Loading reference data from {data_path}...")
         validation_mode = "strict" if self.strict_validation else "warn"
         self.df_ref = load_dataset(data_path, validation_mode=validation_mode)
         self.lookup_tables = build_lookup_tables(self.df_ref)
-        
+
         # Define Search Space based on available data
         self.search_space = self._define_search_space()
-        
+
+    # ------------------------------------------------------------------
+    # Model loading
+    # ------------------------------------------------------------------
     def _load_models(self) -> Dict[str, List[CatBoostRegressor]]:
         models = {}
-        self._feature_order = None  # Will be set from first loaded model
-        
+        self._feature_order = None
+
         for target in FORWARD_MODEL_TARGETS:
             target_models = []
-            # Try to load ensemble members
             safe_target = target.replace('/', '_').replace(' ', '_')
-            
-            # Check for ensemble first
+
             ensemble_found = False
-            for i in range(5): # Assume max 5 members
-                path = os.path.join(self.models_dir, f"catboost_{safe_target}_ens{i}.cbm")
+            for i in range(10):  # support up to 10 members
+                path = os.path.join(self.models_dir,
+                                    f"catboost_{safe_target}_ens{i}.cbm")
                 if os.path.exists(path):
                     ensemble_found = True
                     model = CatBoostRegressor()
                     model.load_model(path)
                     target_models.append(model)
-                    
-                    # Store feature order from first model
                     if self._feature_order is None:
                         self._feature_order = model.feature_names_
-                        print(f"Feature order loaded: {len(self._feature_order)} features")
-            
-            # Fallback to single model if no ensemble found
+                        print(f"Feature order loaded: "
+                              f"{len(self._feature_order)} features")
+
             if not ensemble_found:
-                path = os.path.join(self.models_dir, f"catboost_{safe_target}.cbm")
+                path = os.path.join(self.models_dir,
+                                    f"catboost_{safe_target}.cbm")
                 if os.path.exists(path):
-                    print(f"Warning: Loading single model for {target} (No ensemble found)")
+                    print(f"Warning: single model for {target}")
                     model = CatBoostRegressor()
                     model.load_model(path)
                     target_models.append(model)
-                    
                     if self._feature_order is None:
                         self._feature_order = model.feature_names_
                 else:
-                    print(f"Warning: Model for {target} not found at {path}")
+                    print(f"Warning: no model for {target}")
             else:
-                print(f"Loaded ensemble of {len(target_models)} models for {target}")
+                print(f"Loaded {len(target_models)} ensemble members "
+                      f"for {target}")
 
             if target_models:
                 models[target] = target_models
-        
+
         if not models:
-            raise RuntimeError("No models found! Please run train_forward_model.py first.")
-            
+            raise RuntimeError(
+                "No models found! Run train_forward_model.py first.")
         return models
 
     def _load_calibrators(self) -> Dict[str, object]:
-        """Load uncertainty calibrators if available."""
-        path = os.path.join(self.models_dir, "uncertainty_calibrators.joblib")
+        path = os.path.join(self.models_dir,
+                            "uncertainty_calibrators.joblib")
         if os.path.exists(path):
             try:
                 return joblib.load(path)
             except Exception as e:
-                print(f"Warning: failed to load calibrators at {path}: {e}")
+                print(f"Warning: failed to load calibrators: {e}")
         return {}
 
-    def _calibrate_sigma(self, target_name: str, raw_sigma: float) -> float:
-        """Apply sigma calibration if calibrator is available.
-
-        For conformal calibrators, returns ``raw_sigma * conformal_q`` which
-        represents the half-width of the prediction interval at the configured
-        coverage level (e.g. 90%).
-        """
+    def _calibrate_sigma(self, target_name: str,
+                         raw_sigma: float) -> float:
         calibrator = self.calibrators.get(target_name)
         if calibrator is None:
             return float(raw_sigma)
@@ -146,27 +151,27 @@ class AdsorbentOptimizer:
                     q = calibrator.get("conformal_q", 1.0)
                     return float(raw_sigma * q)
                 if cal_type == "scale":
-                    scale = calibrator.get("scale", 1.0)
-                    return float(raw_sigma * scale)
+                    return float(raw_sigma * calibrator.get("scale", 1.0))
             if hasattr(calibrator, "predict"):
                 return float(calibrator.predict([raw_sigma])[0])
         except Exception:
             pass
         return float(raw_sigma)
 
+    # ------------------------------------------------------------------
+    # Search space
+    # ------------------------------------------------------------------
     def _define_search_space(self) -> Dict:
-        """Extract unique categories and ranges from reference data."""
         return {
             "metals": self.df_ref['Металл'].unique().tolist(),
             "ligands": self.df_ref['Лиганд'].unique().tolist(),
             "solvents": self.df_ref['Растворитель'].unique().tolist(),
-            
-            # Ranges (min, max) for continuous vars
-            "m_salt_range": (self.df_ref['m (соли), г'].min(), self.df_ref['m (соли), г'].max()),
-            "m_acid_range": (self.df_ref['m(кис-ты), г'].min(), self.df_ref['m(кис-ты), г'].max()),
-            # Round to nearest 5 to avoid Optuna step warnings
-            "v_solv_range": (10.0, 180.0),  # Rounded from actual data range
-            "t_syn_range": (80, 220), # Reasonable synthesis bounds
+            "m_salt_range": (self.df_ref['m (соли), г'].min(),
+                             self.df_ref['m (соли), г'].max()),
+            "m_acid_range": (self.df_ref['m(кис-ты), г'].min(),
+                             self.df_ref['m(кис-ты), г'].max()),
+            "v_solv_range": (10.0, 180.0),
+            "t_syn_range": (80, 220),
             "t_dry_range": (25, 150),
             "t_act_range": (100, 400),
         }
@@ -176,159 +181,131 @@ class AdsorbentOptimizer:
         if solvent is None:
             return None
         key = str(solvent).strip()
-        return SOLVENT_BOILING_POINTS_C.get(key) or SOLVENT_BOILING_POINTS_C.get(key.capitalize()) or SOLVENT_BOILING_POINTS_C.get(key.lower())
+        return (SOLVENT_BOILING_POINTS_C.get(key)
+                or SOLVENT_BOILING_POINTS_C.get(key.capitalize())
+                or SOLVENT_BOILING_POINTS_C.get(key.lower()))
 
-    def _objective(self, trial: optuna.Trial, targets: Dict[str, float], weights: Dict[str, float]) -> float:
-        """
-        The core function optimized by Optuna.
-        1. Suggest a recipe.
-        2. Apply hard physical constraints.
-        3. Calculate engineered features (must match training!).
-        4. Predict properties using Forward Models.
-        5. Calculate Loss (difference between predicted and desired properties).
-        """
-        
-        # --- 1. Sample Recipe (X) ---
-        metal = trial.suggest_categorical("Металл", self.search_space["metals"])
-        ligand = trial.suggest_categorical("Лиганд", self.search_space["ligands"])
-        solvent = trial.suggest_categorical("Растворитель", self.search_space["solvents"])
-        
-        m_salt = trial.suggest_float("m (соли), г", *self.search_space["m_salt_range"], log=True)
-        m_acid = trial.suggest_float("m(кис-ты), г", *self.search_space["m_acid_range"], log=True)
-        v_solv = trial.suggest_float("Vсин. (р-ля), мл", *self.search_space["v_solv_range"], step=5.0)
-        
-        t_syn = trial.suggest_int("Т.син., °С", *self.search_space["t_syn_range"], step=5)
-        t_dry = trial.suggest_int("Т суш., °С", *self.search_space["t_dry_range"], step=5)
-        t_act = trial.suggest_int("Tрег, ᵒС", *self.search_space["t_act_range"], step=5)
+    # ------------------------------------------------------------------
+    # Feature engineering (shared between objectives)
+    # ------------------------------------------------------------------
+    def _build_features(self, trial: optuna.Trial) -> Tuple[
+            pd.DataFrame, float, List[Tuple[str, float]]]:
+        """Sample recipe, apply constraints, compute features.
 
-        # --- 2. SOFT CONSTRAINTS (Physical Feasibility) ---
-        # Instead of flat 1e9 penalties, accumulate a smooth penalty term.
+        Returns:
+            df_input: Single-row DataFrame ready for prediction.
+            constraint_penalty: Total constraint violation (0 = feasible).
+            penalty_reasons: Short trace of violated constraints.
+        """
+        # --- 1. Sample Recipe ---
+        metal = trial.suggest_categorical(
+            "Металл", self.search_space["metals"])
+        ligand = trial.suggest_categorical(
+            "Лиганд", self.search_space["ligands"])
+        solvent = trial.suggest_categorical(
+            "Растворитель", self.search_space["solvents"])
+
+        m_salt = trial.suggest_float(
+            "m (соли), г", *self.search_space["m_salt_range"], log=True)
+        m_acid = trial.suggest_float(
+            "m(кис-ты), г", *self.search_space["m_acid_range"], log=True)
+        v_solv = trial.suggest_float(
+            "Vсин. (р-ля), мл", *self.search_space["v_solv_range"], step=5.0)
+
+        t_syn = trial.suggest_int(
+            "Т.син., °С", *self.search_space["t_syn_range"], step=5)
+        t_dry = trial.suggest_int(
+            "Т суш., °С", *self.search_space["t_dry_range"], step=5)
+        t_act = trial.suggest_int(
+            "Tрег, ᵒС", *self.search_space["t_act_range"], step=5)
+
+        # --- 2. Soft Constraints ---
         constraint_penalty = 0.0
         penalty_reasons: List[Tuple[str, float]] = []
 
         def add_penalty(amount: float, reason: str) -> None:
             nonlocal constraint_penalty
-            penalty = float(max(amount, 0.0))
-            if penalty <= 0:
-                return
-            constraint_penalty += penalty
-            if len(penalty_reasons) < 5:  # keep a short trace for debugging
-                penalty_reasons.append((reason, penalty))
+            p = float(max(amount, 0.0))
+            if p > 0:
+                constraint_penalty += p
+                if len(penalty_reasons) < 5:
+                    penalty_reasons.append((reason, p))
 
-        def relative_violation(value: float, lower: Optional[float], upper: Optional[float], eps: float = 1e-8) -> float:
-            if lower is not None and value < lower:
-                return (lower - value) / max(abs(lower), eps)
-            if upper is not None and value > upper:
-                return (value - upper) / max(abs(upper), eps)
-            return 0.0
-
-        # 2.1. Temperature constraints (soft)
-        dry_excess = max(0.0, t_dry - (t_syn + 20))
-        add_penalty(dry_excess * 2.0, "dry_above_synthesis")
-
-        act_shortfall = max(0.0, t_dry - t_act)
-        add_penalty(act_shortfall * 3.0, "activation_below_dry")
-
-        # 2.1b. Solvent boiling point constraint (soft)
+        # Temperature
+        add_penalty(max(0.0, t_dry - (t_syn + 20)) * 2.0,
+                    "dry_above_synthesis")
+        add_penalty(max(0.0, t_dry - t_act) * 3.0,
+                    "activation_below_dry")
         bp = self._get_boiling_point(solvent)
         if bp is not None:
-            boil_over = max(0.0, t_syn - bp)
-            add_penalty(boil_over * 5.0, "syn_above_boiling")
-        
-        # 2.2. Stoichiometry constraints
-        # Get molar masses from lookup tables
+            add_penalty(max(0.0, t_syn - bp) * 5.0, "syn_above_boiling")
+
+        # Lookups
         try:
             metal_desc = self.lookup_tables.metal.loc[metal]
             ligand_desc = self.lookup_tables.ligand.loc[ligand]
             solvent_desc = self.lookup_tables.solvent.loc[solvent]
         except KeyError:
             add_penalty(5_000.0, "lookup_missing")
-            trial.report(constraint_penalty, step=0)
-            raise optuna.TrialPruned("Missing lookup entry for metal/ligand/solvent")
-        
-        # Handle case where lookup returns DataFrame (multiple rows) vs Series (single row)
+            raise optuna.TrialPruned("Missing lookup")
+
         if isinstance(metal_desc, pd.DataFrame):
             metal_desc = metal_desc.iloc[0]
         if isinstance(ligand_desc, pd.DataFrame):
             ligand_desc = ligand_desc.iloc[0]
         if isinstance(solvent_desc, pd.DataFrame):
             solvent_desc = solvent_desc.iloc[0]
-        
+
         mw_salt = metal_desc.get('Молярка_соли', np.nan)
         mw_acid = ligand_desc.get('Молярка_кислоты', np.nan)
-        
-        # Ensure we have scalar values
         if hasattr(mw_salt, 'item'):
             mw_salt = mw_salt.item()
         if hasattr(mw_acid, 'item'):
             mw_acid = mw_acid.item()
-        
+
         if pd.isna(mw_salt) or pd.isna(mw_acid) or mw_salt == 0 or mw_acid == 0:
             add_penalty(5_000.0, "missing_molar_mass")
-            trial.report(constraint_penalty, step=0)
-            raise optuna.TrialPruned("Missing molar mass data")
-        
-        # Calculate moles
+            raise optuna.TrialPruned("Missing molar mass")
+
         n_salt = m_salt / mw_salt
         n_acid = m_acid / mw_acid
-        
-        # Avoid division by zero
         if n_acid == 0:
             add_penalty(2_000.0, "zero_acid_moles")
             n_acid = 1e-6
-        
+
+        # Stoichiometry
         n_ratio = n_salt / n_acid
-        # Target stoichiometry by metal-ligand pair if available
         stoich_spec = STOICHIOMETRY_TARGETS.get((metal, ligand))
         if stoich_spec:
-            target_ratio = stoich_spec["ratio"]
-            tol = stoich_spec.get("tolerance", 0.1)
-            lower = target_ratio * (1 - tol)
-            upper = target_ratio * (1 + tol)
-            violation = relative_violation(n_ratio, lower, upper)
-            add_penalty(500.0 * violation * violation, "stoichiometry")
+            lo = stoich_spec["ratio"] * (1 - stoich_spec.get("tolerance", 0.1))
+            hi = stoich_spec["ratio"] * (1 + stoich_spec.get("tolerance", 0.1))
+            v = _relative_violation(n_ratio, lo, hi)
+            add_penalty(500.0 * v * v, "stoichiometry")
         else:
-            # Fallback broad bounds
             lo, hi = DEFAULT_STOICHIOMETRY_BOUNDS
-            violation = relative_violation(n_ratio, lo, hi)
-            add_penalty(250.0 * violation * violation, "stoichiometry_fallback")
-        
-        # 2.3. Concentration constraints
+            v = _relative_violation(n_ratio, lo, hi)
+            add_penalty(250.0 * v * v, "stoichiometry_fallback")
+
         if v_solv <= 0:
-            add_penalty(1_000.0 + abs(v_solv) * 100.0, "non_positive_solvent_volume")
-            v_solv = max(v_solv, 1e-3)  # guard log/ratio calculations
-        
-        # --- 3. FEATURE ENGINEERING (Must match training!) ---
-        # Calculate all features that the model expects
+            add_penalty(1_000.0 + abs(v_solv) * 100.0,
+                        "non_positive_solvent_volume")
+            v_solv = max(v_solv, 1e-3)
+
+        # --- 3. Feature Engineering ---
         input_data = {
-            # Base categorical
-            "Металл": metal,
-            "Лиганд": ligand,
-            "Растворитель": solvent,
-            
-            # Base numeric
-            "m (соли), г": m_salt,
-            "m(кис-ты), г": m_acid,
+            "Металл": metal, "Лиганд": ligand, "Растворитель": solvent,
+            "m (соли), г": m_salt, "m(кис-ты), г": m_acid,
             "Vсин. (р-ля), мл": v_solv,
-            "Т.син., °С": t_syn,
-            "Т суш., °С": t_dry,
-            "Tрег, ᵒС": t_act,
-            
-            # Log transforms
+            "Т.син., °С": t_syn, "Т суш., °С": t_dry, "Tрег, ᵒС": t_act,
             "log_m (соли), г": np.log1p(m_salt),
             "log_m(кис-ты), г": np.log1p(m_acid),
             "log_Vсин. (р-ля), мл": np.log1p(v_solv),
-
-            # From CSV (pre-computed in training data)
-            "n_соли": n_salt,
-            "n_кислоты": n_acid,
+            "n_соли": n_salt, "n_кислоты": n_acid,
             "Vsyn_m": v_solv / m_salt if m_salt != 0 else 0,
         }
-        
-        # Convert to DataFrame
+
         df_input = pd.DataFrame([input_data])
-        
-        # Enrich with Descriptors from lookup tables
+
         for idx, val in metal_desc.items():
             if idx not in df_input.columns:
                 df_input[idx] = val
@@ -339,183 +316,229 @@ class AdsorbentOptimizer:
             if idx not in df_input.columns:
                 df_input[idx] = val
 
-        # Reuse training feature engineering to avoid train/inference drift
         add_salt_mass_features(df_input, inplace=True)
         add_physicochemical_descriptors(df_input, inplace=True)
 
-        # Interaction feature (categorical, used by CatBoost)
-        df_input["Metal_Ligand_Combo"] = df_input["Металл"].astype(str) + "_" + df_input["Лиганд"].astype(str)
+        df_input["Metal_Ligand_Combo"] = (
+            df_input["Металл"].astype(str) + "_" +
+            df_input["Лиганд"].astype(str))
 
-        # Temperature-derived features not handled by helper
         t_range = t_act - t_syn
-        t_activation = t_act - 100.0
-        t_range_denom = t_range if t_range != 0 else 1e-9
-        t_dry_norm = (t_dry - t_syn) / t_range_denom
         df_input["T_range"] = t_range
-        df_input["T_activation"] = t_activation
-        df_input["T_dry_norm"] = t_dry_norm
-        
-        # Ensure categorical features have correct dtype for CatBoost
-        cat_features = ['Металл', 'Лиганд', 'Растворитель', 'Metal_Ligand_Combo']
-        for col in cat_features:
+        df_input["T_activation"] = t_act - 100.0
+        df_input["T_dry_norm"] = (
+            (t_dry - t_syn) / (t_range if t_range != 0 else 1e-9))
+
+        for col in ['Металл', 'Лиганд', 'Растворитель',
+                     'Metal_Ligand_Combo']:
             if col in df_input.columns:
                 df_input[col] = df_input[col].astype(str)
-        
-        # --- 4. Predict Properties with Uncertainty ---
-        loss = 0.0
+
+        return df_input, constraint_penalty, penalty_reasons
+
+    # ------------------------------------------------------------------
+    # Prediction helper
+    # ------------------------------------------------------------------
+    def _predict_target(self, target_name: str,
+                        df_input: pd.DataFrame,
+                        trial: optuna.Trial
+                        ) -> Tuple[float, float]:
+        """Predict a single target. Returns (mean, calibrated_sigma)."""
+        ensemble = self.models[target_name]
+        model_features = ensemble[0].feature_names_
+
+        missing = set(model_features) - set(df_input.columns)
+        if missing:
+            if trial.number == 0:
+                print(f"Missing features for {target_name}: {missing}")
+            raise optuna.TrialPruned(f"Missing features for {target_name}")
+
+        df_slice = df_input[model_features]
+        known_cats = ['Металл', 'Лиганд', 'Растворитель',
+                      'Metal_Ligand_Combo']
+        present_cats = [c for c in df_slice.columns if c in known_cats]
+        pool = Pool(df_slice, cat_features=present_cats)
+
+        preds = [m.predict(pool)[0] for m in ensemble]
+        mean_pred = float(np.mean(preds))
+        std_pred = float(np.std(preds))
+        calibrated = self._calibrate_sigma(target_name, std_pred)
+        return mean_pred, calibrated
+
+    # ------------------------------------------------------------------
+    # Multi-objective objective
+    # ------------------------------------------------------------------
+    def _objective(self, trial: optuna.Trial,
+                   targets: Dict[str, float],
+                   weights: Dict[str, float]) -> Tuple[float, ...]:
+        """Returns one loss value per target. Constraint penalty is stored
+        as user_attr and handled by NSGAIISampler constraints_func."""
+
+        try:
+            df_input, constraint_penalty, penalty_reasons = \
+                self._build_features(trial)
+        except optuna.TrialPruned:
+            # Return large losses for all targets so NSGA-II deprioritises
+            trial.set_user_attr("ConstraintPenalty", 1e6)
+            return tuple(1e6 for _ in targets)
+
         predictions = {}
         uncertainties = {}
+        obj_values = []
+        target_order = list(targets.keys())
         eps = 1e-8
-        
-        for target_name, target_val in targets.items():
-            if target_name in self.models:
-                try:
-                    ensemble = self.models[target_name]
-                    # Get expected features from the first model in the ensemble
-                    model_features = ensemble[0].feature_names_
-                    
-                    # Check if we have all needed features
-                    missing = set(model_features) - set(df_input.columns)
-                    if missing:
-                        if trial.number == 0:  # Only print once
-                            print(f"Missing features for {target_name}: {missing}")
-                        add_penalty(10_000.0 * len(missing), "missing_features")
-                        trial.report(loss + constraint_penalty, step=1)
-                        raise optuna.TrialPruned(f"Missing features for {target_name}")
-                        
-                    # Prepare input slice for this specific model
-                    df_slice = df_input[model_features]
-                    
-                    # Prepare Pool just for this target
-                    # Identify present categorical features
-                    known_cats = ['Металл', 'Лиганд', 'Растворитель', 'Metal_Ligand_Combo']
-                    present_cats = [c for c in df_slice.columns if c in known_cats]
-                    
-                    predict_pool = Pool(df_slice, cat_features=present_cats)
-                    
-                    # Predict using Pool
-                    preds = [model.predict(predict_pool)[0] for model in ensemble]
-                    
-                    mean_pred = np.mean(preds)
-                    std_pred = np.std(preds)
-                    
-                except Exception as e:
-                    # Feature mismatch or other error
-                    print(f"Prediction error for {target_name}: {e}")
-                    add_penalty(20_000.0, f"prediction_error_{target_name}")
-                    trial.report(loss + constraint_penalty, step=1)
-                    raise optuna.TrialPruned(f"Prediction failed for {target_name}")
-                
-                predictions[target_name] = mean_pred
-                calibrated_sigma = self._calibrate_sigma(target_name, std_pred)
-                uncertainties[target_name] = calibrated_sigma
-                
-                # Scale by target magnitude (to balance units) if provided
-                scale = abs(target_val) if target_val != 0 else max(abs(mean_pred), 1.0)
-                err_term = ((mean_pred - target_val) / scale) ** 2
-                sigma_term = (calibrated_sigma / scale) ** 2
 
-                term = weights.get(target_name, 1.0) * (err_term + LAMBDA_UNCERTAINTY * sigma_term)
-                loss += term
+        for target_name in target_order:
+            target_val = targets[target_name]
+            if target_name not in self.models:
+                obj_values.append(1e6)
+                continue
+            try:
+                mean_pred, cal_sigma = self._predict_target(
+                    target_name, df_input, trial)
+            except (optuna.TrialPruned, Exception):
+                obj_values.append(1e6)
+                continue
 
-        # Physics penalty using available predictions
-        if predictions:
-            phys_row = {}
-            for col in ["W0, см3/г", "E0, кДж/моль", "Ws, см3/г", "E, кДж/моль"]:
-                if col in predictions:
-                    phys_row[col] = predictions[col]
-            phys_df = pd.DataFrame([phys_row]) if phys_row else None
-            if phys_df is not None:
-                phys_penalty = compute_physics_penalty(phys_df).iloc[0]
-                loss += PHYSICS_PENALTY_WEIGHT * phys_penalty
-        # Additional physics-based checks on predictions (where available)
-        # E0 bounds
+            predictions[target_name] = mean_pred
+            uncertainties[target_name] = cal_sigma
+
+            scale = abs(target_val) if target_val != 0 else max(
+                abs(mean_pred), 1.0)
+            err = ((mean_pred - target_val) / scale) ** 2
+            unc = (cal_sigma / scale) ** 2
+            obj = weights.get(target_name, 1.0) * (
+                err + LAMBDA_UNCERTAINTY * unc)
+            obj_values.append(obj)
+
+        # Physics checks → add to constraint penalty
         e0_pred = predictions.get("E0, кДж/моль")
         if e0_pred is not None:
             lo_e0, hi_e0 = E0_BOUNDS_KJ_MOL
-            violation = relative_violation(e0_pred, lo_e0, hi_e0)
-            add_penalty(300.0 * violation, "E0_bounds")
-        
-        # Physics consistency checks on predictions (hard rejection)
-        w0_pred = predictions.get("W0, см3/г")
-        ws_pred = predictions.get("Ws, см3/г")
-        if w0_pred is not None and ws_pred is not None and ws_pred < w0_pred:
-            add_penalty(
-                200.0 * (w0_pred - ws_pred) / max(abs(w0_pred), 1e-6),
-                "Ws_less_than_W0"
-            )
+            v = _relative_violation(e0_pred, lo_e0, hi_e0)
+            constraint_penalty += 300.0 * v
 
-        e_pred = predictions.get("E, кДж/моль")
-        if e_pred is not None and e0_pred is not None and e0_pred != 0:
-            ratio = e_pred / e0_pred
-            ratio_violation = relative_violation(ratio, 0.2, 1.0)
-            add_penalty(200.0 * ratio_violation, "E_over_E0_ratio")
-
-        # --- 5. Store predictions for later retrieval ---
+        # Store attrs
         for k, v in predictions.items():
             trial.set_user_attr(k, float(v))
         for k, v in uncertainties.items():
             trial.set_user_attr(f"Uncertainty_{k}", float(v))
-
         trial.set_user_attr("ConstraintPenalty", float(constraint_penalty))
         if penalty_reasons:
             trial.set_user_attr(
                 "PenaltyReasons",
-                [f"{reason}:{value:.3f}" for reason, value in penalty_reasons]
-            )
+                [f"{r}:{p:.3f}" for r, p in penalty_reasons])
 
-        total_loss = loss + constraint_penalty
-        trial.report(total_loss, step=2)
-        return total_loss
+        return tuple(obj_values)
 
-    def optimize(self, targets: Dict[str, float], weights: Dict[str, float] = None) -> pd.DataFrame:
+    # ------------------------------------------------------------------
+    # Optimization entry point
+    # ------------------------------------------------------------------
+    def optimize(self, targets: Dict[str, float],
+                 weights: Dict[str, float] = None) -> pd.DataFrame:
         if weights is None:
-            weights = {k: 1.0 for k in targets.keys()}
-            
-        print(f"\nStarting optimization for targets: {targets}")
-        
-        study = optuna.create_study(direction="minimize")
-        study.optimize(lambda t: self._objective(t, targets, weights), n_trials=self.n_trials)
-        
-        print(f"Optimization finished. Best Loss: {study.best_value:.6f}")
-        
-        # Retrieve Top-N results
-        trials = sorted(study.trials, key=lambda t: t.value)[:10] # Top 10
-        
-        results = []
-        for t in trials:
+            weights = {k: 1.0 for k in targets}
+
+        target_names = list(targets.keys())
+        n_obj = len(target_names)
+        print(f"\nMulti-objective optimization: {n_obj} targets, "
+              f"{self.n_trials} trials")
+        print(f"  Targets: {targets}")
+
+        # NSGA-II with constraint handling
+        def constraints_func(trial: optuna.trial.FrozenTrial) -> List[float]:
+            cp = trial.user_attrs.get("ConstraintPenalty", 0.0)
+            return [cp]  # positive = infeasible
+
+        sampler = optuna.samplers.NSGAIISampler(
+            constraints_func=constraints_func,
+            seed=42,
+        )
+        study = optuna.create_study(
+            directions=["minimize"] * n_obj,
+            sampler=sampler,
+        )
+        study.optimize(
+            lambda t: self._objective(t, targets, weights),
+            n_trials=self.n_trials,
+        )
+
+        # --- Extract results ---
+        # All completed trials
+        completed = [t for t in study.trials
+                     if t.state == optuna.trial.TrialState.COMPLETE]
+        if not completed:
+            print("No completed trials!")
+            return pd.DataFrame()
+
+        # Pareto front (non-dominated, feasible)
+        pareto_trials = study.best_trials
+        print(f"Pareto front: {len(pareto_trials)} non-dominated recipes "
+              f"(of {len(completed)} completed)")
+
+        # Build results DataFrame (Pareto first, then rest by scalarized)
+        def _trial_to_row(t: optuna.trial.FrozenTrial,
+                          is_pareto: bool) -> Dict:
             row = t.params.copy()
-            row['Loss'] = t.value
-            # Add predicted properties
+            row["Pareto"] = is_pareto
+            # Per-target objective
+            for i, name in enumerate(target_names):
+                row[f"Obj_{name}"] = t.values[i]
+            # Scalarized loss (sum of objectives)
+            row["ScalarLoss"] = sum(t.values)
+            # Predictions & uncertainties
             for k, v in t.user_attrs.items():
                 row[f"Pred_{k}"] = v
-            results.append(row)
-            
-        return pd.DataFrame(results)
+            return row
+
+        pareto_ids = {t.number for t in pareto_trials}
+        rows = []
+        for t in pareto_trials:
+            rows.append(_trial_to_row(t, True))
+        # Add non-Pareto, sorted by scalar loss, top 20
+        non_pareto = sorted(
+            [t for t in completed if t.number not in pareto_ids],
+            key=lambda t: sum(t.values))[:20]
+        for t in non_pareto:
+            rows.append(_trial_to_row(t, False))
+
+        return pd.DataFrame(rows)
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Inverse Design Inference via Bayesian Optimization")
-    
-    # Target arguments
-    parser.add_argument("--E0", type=float, help="Target E0 characteristic energy (kJ/mol)")
-    parser.add_argument("--x0", type=float, help="Target x0 pore half-width (nm)")
-    parser.add_argument("--Sme", type=float, help="Target Sme mesopore surface area (m2/g)")
-    
-    parser.add_argument("--trials", type=int, default=200, help="Number of optimization trials")
-    parser.add_argument("--output", type=str, default="predictions_bo.csv", help="Output CSV file")
-    parser.add_argument("--models", type=str, default="artifacts/forward_models", help="Path to trained models")
-    parser.add_argument("--strict-validation", action="store_true", help="Use strict validation (errors on invalid rows)")
-    
+    parser = argparse.ArgumentParser(
+        description="Multi-objective Inverse Design via Bayesian Optimization")
+
+    parser.add_argument("--E0", type=float,
+                        help="Target E0 (kJ/mol)")
+    parser.add_argument("--x0", type=float,
+                        help="Target x0 pore half-width (nm)")
+    parser.add_argument("--Sme", type=float,
+                        help="Target Sme mesopore surface area (m2/g)")
+
+    parser.add_argument("--trials", type=int, default=300,
+                        help="Number of optimization trials")
+    parser.add_argument("--output", type=str,
+                        default="predictions_bo.csv",
+                        help="Output CSV file")
+    parser.add_argument("--models", type=str,
+                        default="artifacts/forward_models",
+                        help="Path to trained models")
+    parser.add_argument("--strict-validation", action="store_true",
+                        help="Strict validation mode")
+
     args = parser.parse_args()
-    
-    # Construct target dict
+
     targets = {}
-    if args.E0: targets['E0, кДж/моль'] = args.E0
-    if args.x0: targets['х0, нм'] = args.x0
-    if args.Sme: targets['Sme, м2/г'] = args.Sme
-    
+    if args.E0 is not None:
+        targets['E0, кДж/моль'] = args.E0
+    if args.x0 is not None:
+        targets['х0, нм'] = args.x0
+    if args.Sme is not None:
+        targets['Sme, м2/г'] = args.Sme
+
     if not targets:
-        print("Error: No targets specified! Use --E0, --x0, or --Sme.")
+        print("Error: specify at least one target (--E0, --x0, --Sme).")
         return
 
     optimizer = AdsorbentOptimizer(
@@ -524,29 +547,27 @@ def main():
         n_trials=args.trials,
         strict_validation=args.strict_validation,
     )
-    
+
     df_results = optimizer.optimize(targets)
-    
-    print("\nTop 5 Recipes Found:")
-    # Select columns to display cleanly
-    pred_cols = [c for c in df_results.columns if 'Pred_' in c]
-    unc_cols = [c for c in df_results.columns if 'Uncertainty_' in c]
-    
-    # Interleave Pred and Uncertainty for readability
-    val_cols = []
-    for p in pred_cols:
-        val_cols.append(p)
-        # Find matching uncertainty column
-        base_name = p.replace('Pred_', '')
-        u_name = f"Uncertainty_{base_name}"
-        if u_name in df_results.columns:
-            val_cols.append(u_name)
-            
-    display_cols = ['Loss'] + val_cols + ['Металл', 'Лиганд', 'Т.син., °С']
-    print(df_results[display_cols].head(5).to_string(index=False))
-    
+
+    # --- Display ---
+    pareto_df = df_results[df_results["Pareto"] == True]
+    print(f"\n=== Pareto Front ({len(pareto_df)} recipes) ===")
+
+    obj_cols = [c for c in df_results.columns if c.startswith("Obj_")]
+    pred_cols = [c for c in df_results.columns
+                 if c.startswith("Pred_") and "Uncertainty" not in c
+                 and "Constraint" not in c and "Penalty" not in c]
+    unc_cols = [c for c in df_results.columns
+                if c.startswith("Pred_Uncertainty")]
+    display = (["ScalarLoss"] + obj_cols + pred_cols + unc_cols +
+               ['Металл', 'Лиганд', 'Т.син., °С'])
+    display = [c for c in display if c in df_results.columns]
+    print(pareto_df[display].head(10).to_string(index=False))
+
     df_results.to_csv(args.output, index=False)
-    print(f"\nFull results saved to {args.output}")
+    print(f"\nFull results ({len(df_results)} rows) saved to {args.output}")
+
 
 if __name__ == "__main__":
     main()
