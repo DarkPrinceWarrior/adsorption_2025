@@ -4,8 +4,9 @@
 Данный репозиторий реализует систему **обратного дизайна (Inverse Design)** пористых металл-органических каркасов (MOF). Система решает фундаментальную проблему материаловедения: поиск оптимальных условий синтеза для получения материала с заранее заданными структурно-энергетическими характеристиками (СЭХ).
 
 В основе подхода лежит гибридная архитектура:
-1.  **Deep Ensemble Forward Model:** Ансамбль градиентных бустингов (CatBoost) для предсказания свойств материала по условиям синтеза с оценкой эпистемической неопределенности (Uncertainty Quantification).
-2.  **Bayesian Optimization (Navigator):** Использование алгоритма Tree-structured Parzen Estimator (TPE) для навигации в пространстве химических реакций и поиска рецепта, удовлетворяющего критериям пользователя.
+1.  **Deep Ensemble Forward Model:** Ансамбль из 5 градиентных бустингов (CatBoost) с per-target тюнингом гиперпараметров (Optuna) для предсказания свойств материала по условиям синтеза.
+2.  **Conformal Prediction:** Калиброванные предиктивные интервалы с гарантированным покрытием (≥90%) на основе OOF-резидуалов и ensemble σ.
+3.  **Multi-Objective Bayesian Optimization:** Алгоритм NSGA-II (Optuna) для построения Pareto-фронта оптимальных рецептов синтеза.
 
 ---
 
@@ -13,95 +14,114 @@
 
 ### Прямая задача (Forward Problem)
 Мы моделируем функцию $f: \text{Synthesis} \to \text{Properties}$.
-*   **Входные данные ($X$):** 
+*   **Входные данные ($X$):**
     *   *Химические реагенты:* Тип металла, тип лиганда, растворитель.
-    *   *Физико-химические дескрипторы металла:* Ионный радиус, степень окисления, электронное сродство, HSAB жёсткость, эффект Яна-Теллера.
-    *   *Дескрипторы лиганда:* Молекулярная масса, число карбоксильных групп, TPSA.
-    *   *Параметры процесса:* Температуры синтеза, сушки и активации ($T_{syn}, T_{dry}, T_{act}$), стехиометрические соотношения (Metal/Ligand ratio), концентрации.
-*   **Целевые переменные ($Y$) — актуальная тройка (W0 и $S_{BET}$ больше не предсказываем):**
+    *   *Физико-химические дескрипторы металла:* Ионный радиус, степень окисления, электронное сродство, эффект Яна-Теллера.
+    *   *Дескрипторы лиганда:* Молекулярная масса, число карбоксильных групп.
+    *   *Параметры процесса:* Температуры синтеза, сушки и регенерации ($T_{syn}, T_{dry}, T_{reg}$), стехиометрические соотношения ($R_{molar}$), концентрации ($C_{metal}$, молярности).
+    *   *Физико-химические:* `n_water_hidden`, `Supersaturation_Index`, `Reactor_Loading_g_mL` и др.
+*   **Целевые переменные ($Y$):**
     *   $E_0$ [кДж/моль] — Характеристическая энергия адсорбции.
-    *   $S_{me}$ [м²/г] — Удельная поверхность мезопор (важно для транспортных свойств).
     *   $x_0$ [нм] — Характеристическая полуширина пор.
+    *   $S_{me}$ [м²/г] — Удельная поверхность мезопор.
 
 ### Оценка неопределенности (Uncertainty Quantification)
-Вместо точечного прогноза, система выдает распределение $P(y|x)$. Мы используем ансамбль из 5 моделей, обученных с различной инициализацией и стратификацией данных.
-*   **Среднее значение ($\mu$):** Наиболее вероятное свойство.
-*   **Стандартное отклонение ($\sigma$):** Мера уверенности модели. Если рецепт находится в "неизведанной" области химического пространства, $\sigma$ возрастает, что позволяет отфильтровывать ненадежные прогнозы.
+Система использует **True Deep Ensemble** + **Conformal Prediction**:
+
+1.  **Deep Ensemble (5 моделей):** Обучаются на 100% данных с разными random seeds. Ensemble σ — мера эпистемической неопределённости.
+2.  **Conformal Calibration:** OOF-резидуалы нормируются на ensemble σ для вычисления conformal quantile $q_\alpha$ с finite-sample correction (Vovk et al.). Предиктивный интервал: $\hat{y} \pm q_\alpha \cdot \sigma$.
+3.  **Гарантированное покрытие:** Для α=0.10 (номинал 90%) фактическое покрытие: $E_0$ — 98.7%, $x_0$ — 98.7%, $S_{me}$ — 100%.
+
+### Multi-Objective Bayesian Optimization
+Вместо скаляризации целей используется **NSGA-II** (Optuna) для построения Pareto-фронта:
+*   Каждый таргет — отдельная objective (minimize $|\hat{y} - y_{target}|$).
+*   Физико-химические ограничения обрабатываются через `constraints_func` сэмплера.
+*   Результат — множество Pareto-оптимальных рецептов + scalarized ranking для удобства выбора.
 
 ---
 
 ## 2. Установка и Настройка
 
-Требуется Python 3.10+. Зависимости зафиксированы в `requirements.txt` (scikit-learn≥1.2, imbalanced-learn≥0.11).
+Требуется Python 3.10+. Зависимости зафиксированы в `requirements.txt`.
 
 ```bash
 # 1. Создание виртуального окружения
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 
 # 2. Установка зависимостей
 pip install -r requirements.txt
 
-# 3. Запуск тестов (40 тестов)
-PYTHONPATH=src python -m pytest tests/ -q
+# 3. Запуск тестов
+PYTHONPATH=src python -m pytest tests/ -v
 ```
 
 ---
 
 ## 3. Руководство пользователя (Workflow)
 
-### Этап I: Обучение модели (Training)
-Система обучается на экспериментальных данных с **продвинутым отбором признаков**:
-1. **Удаление мультиколлинеарности:** Автоматически убираются фичи с корреляцией |r| > 0.85 и VIF > 10.
-2. **Domain Knowledge:** Используется экспертная фильтрация физически обоснованных дескрипторов.
-3. **Permutation Importance:** Финальный отбор топ-15 фич по важности.
-
-```bash
-PYTHONPATH=src python scripts/train_forward_model.py \
-    --data data/SEC_SYN_with_features_enriched.csv \
-    --iterations 1000 \
-    --validation-mode warn  # strict -> остановится на неконсистентных строках
-```
-Если у вас только базовый датасет `data/SEC_SYN_with_features.csv`, сначала обогатите его дескрипторами:
+### Шаг 0: Обогащение дескрипторов
+Если у вас только базовый датасет `data/SEC_SYN_with_features.csv`, сначала обогатите его:
 ```bash
 PYTHONPATH=src python scripts/enrich_descriptors.py \
     --input data/SEC_SYN_with_features.csv \
     --output data/SEC_SYN_with_features_enriched.csv
 ```
-*Результат:* В папке `artifacts/forward_models` создаются 5 ансамблей (по одному на каждое целевое свойство).
 
-### Этап II: Валидация (Validation)
-Перед использованием рекомендуется проверить надежность моделей. Скрипт строит **Rejection Plots**, показывая, как падает ошибка (MAE) при отсеве неуверенных прогнозов.
+### Шаг 1: Тюнинг гиперпараметров (опционально)
+Автоматический подбор гиперпараметров CatBoost для каждого таргета через Optuna (5-fold CV):
+```bash
+PYTHONPATH=src python scripts/tune_hyperparams.py \
+    --data data/SEC_SYN_with_features_enriched.csv \
+    --n-trials 80
+```
+*Результат:* `artifacts/best_hyperparams.json` + snippet для `config.py`.
 
+### Шаг 2: Обучение модели
+```bash
+PYTHONPATH=src python scripts/train_forward_model.py \
+    --data data/SEC_SYN_with_features_enriched.csv \
+    --validation-mode warn
+```
+*Результат:* В `artifacts/forward_models/`:
+*   15 моделей CatBoost (5 ensemble members × 3 таргета)
+*   `metrics.json` — OOF и production метрики
+*   `uncertainty_calibrators.joblib` — conformal калибраторы
+*   `predictions_*.csv` — OOF-предсказания для каждого таргета
+
+### Шаг 3: Валидация UQ
+Скрипт строит **Rejection Plots** и проверяет **Conformal Coverage**:
 ```bash
 PYTHONPATH=src python scripts/validate_uncertainty.py
 ```
-*Результат:* Графики в `artifacts/plots/uncertainty_rejection_plots.png`.
-*Метрики (5-fold OOF CV, см. `artifacts/forward_models/metrics.json`):*
-*   **$x_0$:** $R^2 \approx 0.82$
-*   **$E_0$:** $R^2 \approx 0.79$
-*   **$S_{me}$:** $R^2 \approx 0.79$
-Строгая валидация (`--validation-mode strict`) на текущем датасете падает из-за неконсистентных температур/стехиометрии; по умолчанию используйте `warn` или очистите данные.
+*Результат:* `artifacts/plots/uncertainty_rejection_plots.png`.
 
-### Этап III: Поиск рецепта (Inverse Design)
-Основной инструмент исследователя. Вы задаете желаемые СЭХ, а алгоритм ищет оптимальные условия синтеза.
+*Актуальные метрики (5-fold OOF CV, per-target tuned HP):*
 
-**Пример запроса:** Найти материал с высокой энергией адсорбции ($E_0 \approx 29.3$), подходящим размером пор ($x_0 \approx 0.41$) и развитой мезопористостью ($S_{me} \approx 82$).
+| Таргет | OOF R² | OOF RMSE | Conformal Coverage (90% nom.) | MAE drop (top-50%) |
+|--------|--------|----------|-------------------------------|---------------------|
+| $E_0$  | 0.792  | 4.98     | 98.7%                         | −54%                |
+| $x_0$  | 0.821  | 0.094    | 98.7%                         | −44%                |
+| $S_{me}$ | 0.777 | 88.1    | 100%                          | −54%                |
+
+### Шаг 4: Поиск рецепта (Inverse Design)
+Задайте желаемые СЭХ — алгоритм NSGA-II построит Pareto-фронт оптимальных рецептов.
 
 ```bash
 PYTHONPATH=src python scripts/run_bayes_opt.py \
-    --E0 29.3 \
-    --x0 0.41 \
-    --Sme 82 \
-    --trials 300
+    --E0 15.0 \
+    --x0 0.5 \
+    --Sme 100.0 \
+    --trials 300 \
+    --output artifacts/predictions_bo.csv
 ```
 
-**Аргументы (цели):**
+**Аргументы:**
 *   `--E0`, `--x0`, `--Sme`: целевые значения свойств.
-*   `--trials`: количество итераций поиска (рекомендуется 200-500).
+*   `--trials`: количество итераций NSGA-II (рекомендуется 200–500).
+*   `--output`: путь к файлу результатов.
 
-*Результат:* Файл `predictions_bo.csv` с ранжированным списком рецептов.
-В файле указаны не только условия синтеза (Металл, Лиганд, $T_{syn}$), но и предсказанная **неопределенность** ($\sigma$). Выбирайте рецепты с низким значением `Pred_Uncertainty`.
+*Результат:* CSV с Pareto-оптимальными рецептами, включая условия синтеза, предсказанные свойства (`Pred_E0`, `Pred_x0`, `Pred_Sme`), неопределённость (`Pred_Uncertainty_*`) и scalar loss для ранжирования.
 
 ---
 
@@ -109,65 +129,72 @@ PYTHONPATH=src python scripts/run_bayes_opt.py \
 
 ```
 ├── scripts/
-│   ├── train_forward_model.py  # Обучение Deep Ensembles
-│   ├── validate_uncertainty.py # Оценка качества и калибровка
-│   ├── run_bayes_opt.py        # Inverse Design (Поиск рецептов)
-│   ├── generate_paper_figures.py # Фигуры для статьи/отчета
-│   └── enrich_descriptors.py   # Обогащение датасета (RDKit + коорд. химия)
+│   ├── enrich_descriptors.py     # Шаг 0: Обогащение датасета (RDKit + коорд. химия)
+│   ├── tune_hyperparams.py       # Шаг 1: Optuna HP tuning (5-fold CV)
+│   ├── train_forward_model.py    # Шаг 2: Deep Ensemble + Conformal Calibration
+│   ├── validate_uncertainty.py   # Шаг 3: UQ валидация (rejection plots + coverage)
+│   ├── run_bayes_opt.py          # Шаг 4: Multi-Objective BO (NSGA-II)
+│   └── generate_paper_figures.py # Фигуры для статьи/отчета
 ├── src/
 │   └── adsorb_synthesis/
+│       ├── config.py             # Конфигурация моделей (per-target tuned HP)
+│       ├── constants.py          # Справочники (Molar Masses, Features, Targets)
 │       ├── data_processing.py    # Генерация дескрипторов (inplace=True/False)
 │       ├── data_validation.py    # Валидация физических ограничений
-│       ├── feature_selection.py  # Advanced Feature Selection (VIF, корреляции)
-│       ├── physics_losses.py     # Физические constraints и penalties
-│       ├── constants.py          # Справочники (Molar Masses, Features)
-│       └── ...
-├── tests/                        # Базовые unit-тесты
-├── data/                         # Экспериментальные датасеты
-└── artifacts/                    # Сохраненные модели и графики
+│       ├── feature_selection.py  # Feature Selection (VIF, корреляции, domain knowledge)
+│       └── physics_losses.py     # Физические constraints и penalties
+├── tests/                        # Unit-тесты (7 тестов)
+├── data/                         # Экспериментальные датасеты (380 образцов)
+└── artifacts/                    # Модели, метрики, графики, результаты BO
 ```
 
 ## 5. Особенности реализации
 
-### Advanced Feature Selection
+### Feature Engineering Pipeline
 Для каждого таргета автоматически:
-1. Удаляются высококоррелированные фичи (|r| > 0.85)
-2. Итеративно убираются фичи с VIF > 10 (мультиколлинеарность)
-3. Ранжирование по Permutation Importance
-4. Отбор топ-15 фич с учётом domain knowledge
+1. **Domain-driven curation:** Экспертный список keep/drop фичей (дедупликация обратных признаков: `Vsyn_m` ↔ `C_metal`, `R_mass` ↔ `R_molar`)
+2. **Удаление мультиколлинеарности:** Фичи с |r| > 0.85 и VIF > 10 убираются итеративно
+3. **Permutation Importance:** Финальный отбор топ-15 фич
+4. **No data leakage:** Feature selection выполняется только на fold-0 train data
+
+> **Примечание:** RDKit-дескрипторы лиганда (3D geometry, 2D topological) исключены из модели — при 4 уникальных лигандах они вырождаются в lookup-таблицу из 4 строк. Категориальный признак `Лиганд` + `carboxyl_groups` + `molecular_weight` достаточны.
 
 ### Физико-химические дескрипторы
-Модель использует продвинутые дескрипторы:
 *   **Металл:** `ionic_radius_pm`, `electron_affinity_kj`, `oxidation_state`, `Jahn_Teller_Active`
 *   **Лиганд:** `carboxyl_groups`, `molecular_weight`
 *   **Взаимодействие:** `Metal_Ligand_Size_Ratio`
+*   **Физико-химические:** `n_water_hidden`, `Supersaturation_Index`, `Molarity_Metal`, `Reactor_Loading_g_mL`
+
+### Per-Target Hyperparameter Tuning
+Каждый таргет имеет оптимальные гиперпараметры CatBoost (см. `config.py`):
+
+| Таргет | iterations | learning_rate | depth | l2_leaf_reg |
+|--------|-----------|---------------|-------|-------------|
+| $E_0$  | 1700      | 0.034         | 8     | 2.2         |
+| $x_0$  | 1600      | 0.064         | 7     | 1.85        |
+| $S_{me}$ | 2000    | 0.047         | 6     | 0.11        |
 
 ### Валидация данных
-`validate_synthesis_data` поддерживает режимы `warn`/`strict`. Текущий датасет содержит строки с нарушением температурного порядка, точек кипения и стехиометрии, поэтому строгий режим приведет к ошибке загрузки — используйте `warn`, либо предварительно очистите данные.
+`validate_synthesis_data` поддерживает режимы `warn`/`strict`. Текущий датасет содержит строки с нарушением температурного порядка, точек кипения и стехиометрии — используйте `warn` (по умолчанию).
 
 ### Data Processing Safety
 Все функции мутации DataFrame поддерживают параметр `inplace`:
 ```python
-# Безопасная копия (не мутирует оригинал)
-df_new = add_salt_mass_features(df, inplace=False)
-
-# Мутация на месте (по умолчанию, backward compatible)
-add_salt_mass_features(df)  # inplace=True
+df_new = add_salt_mass_features(df, inplace=False)  # безопасная копия
+add_salt_mass_features(df)  # inplace=True (по умолчанию)
 ```
 
 ### Прочее
-*   **Physicochemical Constraints:** Оптимизатор учитывает жесткие ограничения (температурная монотонность, стехиометрия, точки кипения растворителей).
-*   **Physics Penalties:** Sample weights увеличиваются для образцов с нарушениями физических constraints ($a_0 = 28.86 \cdot W_0$, $E = E_0/3$).
-*   **Robustness:** `CatBoost` эффективно работает с категориальными данными без One-Hot кодирования.
-*   **Uncertainty Quantification:** Ансамбль из 5 моделей даёт оценку неопределённости ($\sigma$).
+*   **Physicochemical Constraints:** NSGA-II учитывает жёсткие ограничения через `constraints_func` (температурная монотонность, стехиометрия, точки кипения).
+*   **Physics Penalties:** Sample weights увеличиваются для образцов с нарушениями ($a_0 = 28.86 \cdot W_0$, $E = E_0/3$).
+*   **CatBoost:** Нативная работа с категориальными фичами без One-Hot кодирования.
 
 ---
 
 ## 6. Тестирование
 
 ```bash
-# Все тесты
 PYTHONPATH=src python -m pytest tests/ -v
 ```
 
-**Покрытие:** базовые юнит-тесты по валидации данных, инженерии признаков и расчёту молярных масс.
+**Покрытие:** 7 unit-тестов по валидации данных, инженерии признаков и расчёту молярных масс.
