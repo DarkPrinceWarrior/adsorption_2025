@@ -50,6 +50,7 @@ def test_add_thermodynamic_features_preserves_sources():
         'Т.син., °С': [100.0, 150.0],
         'E, кДж/моль': [10.0, 12.0],
         'K_equilibrium': [np.nan, 2.0],
+        'Delta_G': [np.nan, -3.0],
     })
     add_thermodynamic_features(df)
 

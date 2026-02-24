@@ -14,6 +14,7 @@ import joblib
 import optuna
 import pandas as pd
 import numpy as np
+from math import erf, sqrt, exp, pi as PI_CONST
 from typing import Dict, List, Tuple, Optional
 from catboost import CatBoostRegressor, Pool
 
@@ -49,12 +50,13 @@ class AdsorbentOptimizer:
     def __init__(self, 
                  models_dir: str, 
                  data_path: str, 
-                 n_trials: int = 200):
+                 n_trials: int = 200,
+                 strict_validation: bool = False):
         
         self.models_dir = models_dir
         self.data_path = data_path
         self.n_trials = n_trials
-        self.strict_validation = False
+        self.strict_validation = strict_validation
         
         # Load Models
         self.models = self._load_models()
@@ -62,7 +64,7 @@ class AdsorbentOptimizer:
         
         # Load Reference Data & Lookups
         print(f"Loading reference data from {data_path}...")
-        validation_mode = "strict" if getattr(self, "strict_validation", False) else "warn"
+        validation_mode = "strict" if self.strict_validation else "warn"
         self.df_ref = load_dataset(data_path, validation_mode=validation_mode)
         self.lookup_tables = build_lookup_tables(self.df_ref)
         
@@ -353,8 +355,6 @@ class AdsorbentOptimizer:
         loss = 0.0
         predictions = {}
         uncertainties = {}
-        ei_terms = []
-        pi_terms = []
         eps = 1e-8
         
         for target_name, target_val in targets.items():
@@ -405,23 +405,8 @@ class AdsorbentOptimizer:
                 err_term = ((mean_pred - target_val) / scale) ** 2
                 sigma_term = (calibrated_sigma / scale) ** 2
 
-                # EI / PI components (maximize improvement -> minimize negative EI/PI)
-                z = (abs(target_val - mean_pred) + eps) / (calibrated_sigma + eps)
-                from math import erf, sqrt, exp, pi
-                cdf = 0.5 * (1 + erf(-z / sqrt(2)))  # P(improvement)
-                pdf = (1 / sqrt(2 * pi)) * exp(-0.5 * z * z)
-                ei = (abs(target_val - mean_pred)) * cdf + calibrated_sigma * pdf
-                pi = cdf
-                ei_terms.append(ei)
-                pi_terms.append(pi)
-
                 term = weights.get(target_name, 1.0) * (err_term + LAMBDA_UNCERTAINTY * sigma_term)
                 loss += term
-
-        # Combine EI/PI into acquisition penalty (encourage improvement & low sigma)
-        if ei_terms:
-            # Use mean negative EI and PI as additional terms
-            loss += LAMBDA_UNCERTAINTY * (np.mean(ei_terms) + np.mean(pi_terms))
 
         # Physics penalty using available predictions
         if predictions:
@@ -526,9 +511,9 @@ def main():
     optimizer = AdsorbentOptimizer(
         models_dir=args.models,
         data_path="data/SEC_SYN_with_features_enriched.csv",
-        n_trials=args.trials
+        n_trials=args.trials,
+        strict_validation=args.strict_validation,
     )
-    optimizer.strict_validation = args.strict_validation
     
     df_results = optimizer.optimize(targets)
     

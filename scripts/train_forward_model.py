@@ -26,6 +26,7 @@ from sklearn.isotonic import IsotonicRegression
 
 from adsorb_synthesis.data_processing import load_dataset, build_lookup_tables, prepare_forward_dataset
 from adsorb_synthesis.constants import RANDOM_SEED, FORWARD_MODEL_TARGETS, RARE_METALS_THRESHOLD
+from adsorb_synthesis.config import CATBOOST_CONFIG, FORWARD_MODEL_CONFIG
 from adsorb_synthesis.feature_selection import (
     select_features_advanced,
     get_curated_features
@@ -81,9 +82,9 @@ def train_forward_models(
     os.makedirs(output_dir, exist_ok=True)
     calibrators = {}
     
-    # CV ensemble parameters
-    n_splits = 5
-    PHYSICS_PENALTY_WEIGHT = 1.0
+    # CV ensemble parameters (from config)
+    n_splits = FORWARD_MODEL_CONFIG.n_ensemble_splits
+    PHYSICS_PENALTY_WEIGHT = FORWARD_MODEL_CONFIG.physics_penalty_weight
     
     for target in FORWARD_MODEL_TARGETS:
         print(f"\n=== Training ENSEMBLE for target: {target} ===")
@@ -123,9 +124,9 @@ def train_forward_models(
             X[cat_features + curated_numeric],
             y_target,
             categorical_cols=cat_features,
-            corr_threshold=0.85,
-            vif_threshold=10.0,
-            max_features=15,
+            corr_threshold=FORWARD_MODEL_CONFIG.feature_selection_corr_threshold,
+            vif_threshold=FORWARD_MODEL_CONFIG.feature_selection_vif_threshold,
+            max_features=FORWARD_MODEL_CONFIG.feature_selection_max_features,
             verbose=False
         )
         n_removed = len(selection_report['removed_correlation']) + len(selection_report['removed_vif'])
@@ -149,17 +150,7 @@ def train_forward_models(
             w_val = sample_weights_full[val_idx]
 
             model = CatBoostRegressor(
-                iterations=iterations,
-                learning_rate=0.05,
-                depth=6,
-                l2_leaf_reg=1.0,
-                min_data_in_leaf=1,
-                subsample=0.8,
-                colsample_bylevel=0.8,
-                loss_function='RMSE',
-                random_seed=seed,
-                verbose=False,
-                allow_writing_files=False,
+                **CATBOOST_CONFIG.to_params(random_state=seed),
                 cat_features=cat_features_sel
             )
 
@@ -167,7 +158,7 @@ def train_forward_models(
                 X_train_sel, y_train_target,
                 sample_weight=w_train,
                 eval_set=(X_val_sel, y_val_target),
-                early_stopping_rounds=100,
+                early_stopping_rounds=FORWARD_MODEL_CONFIG.early_stopping_rounds,
                 use_best_model=True
             )
 
