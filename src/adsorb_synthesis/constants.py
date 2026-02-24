@@ -289,12 +289,16 @@ FORWARD_MODEL_TARGETS = [
 
 # Features derived from inputs that are safe to use in Forward Model
 # (Physical descriptors of ingredients known BEFORE synthesis)
+# P4.1: Removed LIGAND_3D_FEATURES and LIGAND_2D_FEATURES.
+# With only 4 unique ligands, continuous 3D/2D descriptors degenerate into a
+# 4-row lookup table — CatBoost memorises the 4 values, creating illusory
+# informativeness.  The categorical 'Лиганд' feature already captures ligand
+# identity; carboxyl_groups and molecular_weight (in LIGAND_DESCRIPTOR_FEATURES)
+# provide the meaningful continuous signal.
 FORWARD_MODEL_AUGMENTED_FEATURES = (
     METAL_DESCRIPTOR_FEATURES + 
     METAL_COORD_FEATURES +
     LIGAND_DESCRIPTOR_FEATURES + 
-    LIGAND_3D_FEATURES +
-    LIGAND_2D_FEATURES +
     SOLVENT_DESCRIPTOR_FEATURES +
     INTERACTION_FEATURES +
     ['Tрег, ᵒС']  # Regeneration temperature

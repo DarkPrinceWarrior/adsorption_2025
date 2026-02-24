@@ -375,6 +375,8 @@ FEATURE_GROUPS = {
         'n_кислоты',                          # Correlated with m
         'R_mass',                             # Correlated with R_molar
         'C_ligand',                           # Correlated with C_metal
+        'Vsyn_m',                             # P4.2: = V/m_salt, inverse of C_metal
+        'log_C_ligand',                       # P4.2: Correlated with log_C_metal
     ],
     'temperature_primary': [
         'Т.син., °С',                         # Synthesis temperature

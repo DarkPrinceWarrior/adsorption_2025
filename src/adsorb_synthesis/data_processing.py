@@ -409,8 +409,8 @@ def build_lookup_tables(df: pd.DataFrame, include_extended: bool = True) -> Look
     Args:
         df: Dataset with all descriptor columns.
         include_extended: If True, include advanced features (METAL_COORD_FEATURES,
-            LIGAND_3D_FEATURES, LIGAND_2D_FEATURES, INTERACTION_FEATURES).
-            These are required for forward model inference.
+            INTERACTION_FEATURES).  LIGAND_3D/2D features are included
+            opportunistically but no longer required (P4.1).
     
     Returns:
         LookupTables with metal, ligand, and solvent descriptors.
@@ -426,7 +426,8 @@ def build_lookup_tables(df: pd.DataFrame, include_extended: bool = True) -> Look
         for feat in METAL_COORD_FEATURES:
             if feat in df.columns:
                 metal_features.append(feat)
-        # Add ligand geometry features if present
+        # P4.1: Ligand 3D/2D features are no longer required (degenerate with
+        # only 4 ligands), but include them opportunistically for backward compat.
         for feat in LIGAND_3D_FEATURES + LIGAND_2D_FEATURES:
             if feat in df.columns:
                 ligand_features.append(feat)
@@ -450,10 +451,9 @@ def build_lookup_tables(df: pd.DataFrame, include_extended: bool = True) -> Look
         if cols:
             raise ValueError(f"Dataset is missing required columns {sorted(cols)} for {entity} lookup")
     if include_extended:
+        # P4.1: Only metal_coord and interaction are required; ligand_3d/2d are optional
         missing_extended: Dict[str, Iterable[str]] = {
             "metal_coord": _missing_columns(df, METAL_COORD_FEATURES),
-            "ligand_3d": _missing_columns(df, LIGAND_3D_FEATURES),
-            "ligand_2d": _missing_columns(df, LIGAND_2D_FEATURES),
             "interaction": _missing_columns(df, INTERACTION_FEATURES),
         }
         missing_block = {k: v for k, v in missing_extended.items() if v}
