@@ -1,4 +1,4 @@
-# Wave 2 Decision Memo
+# Wave 2 / Wave 3 Decision Memo
 
 Дата фиксации: **8 марта 2026**
 
@@ -10,7 +10,10 @@
 * `BoFire` vs `BoTorch` vs `BayBE` для inverse stage
 * `direct inverse` как отдельный baseline класса `target -> recipe`
 
-Основание: полный прогон suite в [artifacts/wave2_runs/selection_20260308](/home/ruslan_safaev/adsorb_synth/adsorb_synthesis/artifacts/wave2_runs/selection_20260308).
+Основание:
+
+* исходный runnable suite в [artifacts/wave2_runs/selection_20260308](/home/ruslan_safaev/adsorb_synth/adsorb_synthesis/artifacts/wave2_runs/selection_20260308)
+* внешний `chemistry-split` holdout и финальный native inverse benchmark в [artifacts/wave3_benchmark_native_final](/home/ruslan_safaev/adsorb_synth/adsorb_synthesis/artifacts/wave3_benchmark_native_final)
 
 ## Итоговое решение
 
@@ -29,7 +32,7 @@
 
 ## Почему выбран CatBoost
 
-На полном benchmark run `CatBoost` лучше `TabPFN` по всем трем target-ам:
+На внутреннем benchmark run `CatBoost` лучше `TabPFN` по всем трём target-ам:
 
 * `E0`: `R2_oof = 0.8100` vs `0.8025`
 * `x0`: `R2_oof = 0.8174` vs `0.8054`
@@ -41,15 +44,22 @@
 * внешний `chemistry-split` holdout используется как основной внешний критерий forward-сравнения
 * `TabPFN` тяжелее operationally и не даёт преимущества на текущем датасете
 
+По внешнему holdout обе модели показывают отрицательный `R2`, то есть текущая проблема уже не в orchestration, а в слабой `out-of-chemistry` generalization. Тем не менее:
+
+* `CatBoost` лучше `TabPFN` на `E0` и `x0`
+* по `Sme` `TabPFN` чуть лучше, но без production-grade interval UQ
+
+Поэтому production default после wave 3 не меняется: `CatBoost + MAPIE`.
+
 ## Почему выбран BoFire
 
 На benchmark для target-профиля `E0=15, x0=0.5, Sme=100`:
 
-* `BoFire best_score_pool = 0.1648`
+* `BoFire best_score_pool = 0.1541`
 * `BoTorch best_score_pool = 0.1783`
 * `BayBE best_score_pool = 0.1842`
 
-У всех трёх backend-ов feasibility была `1.0`, но `BoFire` дал лучший score и после wave 3 остаётся canonical native production optimizer. Historical wrapper `BoFire domain + Optuna` сохранён отдельно как `run_bofire_optuna_legacy.py`.
+У всех трёх backend-ов feasibility была `1.0`, но `BoFire` дал лучший score и наиболее широкий shortlist по chemistry coverage (`5` chemistry groups). После wave 3 он остаётся canonical native production optimizer. Historical wrapper `BoFire domain + Optuna` сохранён отдельно как `run_bofire_optuna_legacy.py`.
 
 ## Почему direct inverse не выбран как основной путь
 
@@ -57,15 +67,15 @@
 
 * feasibility после repair/recheck: `1.000`
 * recheck MAE:
-  * `E0 = 3.1159`
-  * `x0 = 0.0668`
-  * `Sme = 64.7440`
+  * `E0 = 7.6023`
+  * `x0 = 0.1733`
+  * `Sme = 126.0685`
 
 То есть baseline способен выдавать допустимые рецепты, но не выигрывает у связки `forward surrogate + optimizer` как механизма подбора рецепта под target values.
 
 ## Практический вывод
 
-Если нужна рабочая схема сейчас:
+Если нужна рабочая схема сейчас, после всех трёх волн:
 
 1. обучать production forward pipeline на `CatBoost`
 2. валидировать internal CV calibration через `validate_uncertainty.py`

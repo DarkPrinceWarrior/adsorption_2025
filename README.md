@@ -12,7 +12,7 @@
 
 ## Рекомендованный стек
 
-По состоянию на **8 марта 2026** после полного `wave2`-suite рекомендуемый рабочий стек такой:
+По состоянию на **8 марта 2026** после полного `wave2`-suite, внешнего `chemistry-split` holdout и финального native `BoFire` benchmark рекомендуемый рабочий стек такой:
 
 *   **Forward backend:** `CatBoost`
 *   **Uncertainty Quantification:** `MAPIE` intervals
@@ -258,6 +258,7 @@ add_salt_mass_features(df)  # inplace=True (по умолчанию)
 *   **BoTorch:** рабочий research backend, но пока уступает BoFire по `best_score_pool`.
 *   **BayBE:** рабочий campaign backend для low-data loop, но не лучший production optimizer.
 *   **Direct inverse:** полезный benchmark, но не рекомендуется как основной способ подбора рецепта.
+*   **Wave 3 вывод:** главный remaining bottleneck теперь в chemistry generalization данных, а не в orchestration pipeline.
 
 ---
 
