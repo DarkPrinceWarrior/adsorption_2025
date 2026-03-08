@@ -74,6 +74,41 @@ def select_curated_features(
     return selected_features, report
 
 
+def prepare_tabpfn_regression_frame(
+    X: pd.DataFrame,
+    *,
+    candidate_features: Optional[Sequence[str]] = None,
+) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """Build a numeric-only feature matrix for TabPFN regression.
+
+    TabPFN expects scalar tabular values. We keep only numeric and boolean
+    features, coerce them to numeric dtypes, and drop constant columns that can
+    destabilize small-data fits.
+    """
+    if candidate_features is None:
+        candidate_features = list(X.columns)
+
+    selected_columns = [column for column in candidate_features if column in X.columns]
+    numeric_frame = X[selected_columns].select_dtypes(include=[np.number, "bool"]).copy()
+    for column in numeric_frame.columns:
+        if pd.api.types.is_bool_dtype(numeric_frame[column]):
+            numeric_frame[column] = numeric_frame[column].astype(float)
+
+    numeric_frame = numeric_frame.apply(pd.to_numeric, errors="coerce")
+    dropped_constant = [
+        column
+        for column in numeric_frame.columns
+        if numeric_frame[column].nunique(dropna=False) <= 1
+    ]
+    if dropped_constant:
+        numeric_frame = numeric_frame.drop(columns=dropped_constant)
+
+    if numeric_frame.shape[1] == 0:
+        raise ValueError("TabPFN backend requires at least one non-constant numeric feature.")
+
+    return numeric_frame, list(numeric_frame.columns), dropped_constant
+
+
 class PrecomputedSplitCV(BaseCrossValidator):
     """A lightweight cross-validator backed by already-materialized splits."""
 

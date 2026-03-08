@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train forward models with nested feature selection and CV-based intervals."""
+"""Train forward models with backend-specific challengers."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from mapie.regression import CrossConformalRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import StratifiedKFold
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from adsorb_synthesis.config import FORWARD_MODEL_CONFIG, get_catboost_config
 from adsorb_synthesis.constants import FORWARD_MODEL_TARGETS, RANDOM_SEED
@@ -31,8 +31,11 @@ from adsorb_synthesis.forward_modeling import (
     SelectedFeatureCatBoostRegressor,
     build_stratification_key,
     compute_quality_weights,
+    prepare_tabpfn_regression_frame,
     select_curated_features,
 )
+
+SUPPORTED_BACKENDS = ("catboost", "tabpfn")
 
 
 def _override_iterations(params: Dict, iterations: int | None) -> Dict:
@@ -40,6 +43,14 @@ def _override_iterations(params: Dict, iterations: int | None) -> Dict:
     if iterations is not None:
         updated["iterations"] = iterations
     return updated
+
+
+def _safe_target_name(target: str) -> str:
+    return target.replace("/", "_").replace(" ", "_")
+
+
+def _resolve_backend_output_dir(output_dir: str, backend: str, use_subdirs: bool) -> str:
+    return os.path.join(output_dir, backend) if use_subdirs else output_dir
 
 
 def _feature_selection_for_fold(
@@ -62,7 +73,67 @@ def _feature_selection_for_fold(
     )
 
 
-def train_forward_models(
+def _build_training_context(
+    data_path: str,
+    *,
+    validation_mode: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str], np.ndarray]:
+    print(f"Loading dataset from {data_path}...")
+    df_raw = load_dataset(data_path, validation_mode=validation_mode)
+    lookup_tables = build_lookup_tables(df_raw)
+    X, y = prepare_forward_dataset(df_raw, lookup_tables=lookup_tables)
+    cat_features = [col for col in X.columns if X[col].dtype.name in ["object", "category"]]
+    sample_weights = compute_quality_weights(
+        df_raw.reindex(X.index),
+        penalty_weight=FORWARD_MODEL_CONFIG.physics_penalty_weight,
+        minimum_weight=FORWARD_MODEL_CONFIG.minimum_sample_weight,
+    ).to_numpy(dtype=float)
+    return df_raw, X, y, cat_features, sample_weights
+
+
+def _write_backend_metadata(
+    output_dir: str,
+    *,
+    metrics: Dict[str, Dict],
+    feature_meta: Dict[str, Dict],
+    uq_models: Dict[str, object] | None = None,
+) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "metrics.json"), "w", encoding="utf-8") as handle:
+        json.dump(metrics, handle, indent=2, ensure_ascii=False)
+    joblib.dump(feature_meta, os.path.join(output_dir, "feature_meta.joblib"))
+    if uq_models is not None:
+        joblib.dump(uq_models, os.path.join(output_dir, "uncertainty_calibrators.joblib"))
+
+
+def _import_tabpfn():
+    os.environ.setdefault("TABPFN_DISABLE_TELEMETRY", "1")
+    try:
+        from tabpfn import TabPFNRegressor  # type: ignore
+    except ImportError as exc:  # pragma: no cover - depends on optional dependency
+        raise RuntimeError(
+            "TabPFN backend requires the optional `tabpfn` package. "
+            "Install it with `.venv/bin/pip install tabpfn` or use `--backend catboost`."
+        ) from exc
+    return TabPFNRegressor
+
+
+def _fit_tabpfn_model(model, X_train: pd.DataFrame, y_train: pd.Series) -> None:
+    try:
+        model.fit(X_train, y_train.to_numpy(dtype=float))
+    except RuntimeError as exc:
+        message = str(exc)
+        if "HuggingFace authentication error" in message or "accept its terms" in message:
+            raise RuntimeError(
+                "TabPFN 6.4.1 requires access to the gated Prior-Labs/tabpfn_2_5 weights. "
+                "Accept the model terms at https://huggingface.co/Prior-Labs/tabpfn_2_5 "
+                "and authenticate with `hf auth login` or HF_TOKEN before running the "
+                "TabPFN backend."
+            ) from exc
+        raise
+
+
+def train_catboost_models(
     data_path: str,
     output_dir: str,
     *,
@@ -70,22 +141,16 @@ def train_forward_models(
     validation_mode: str = "warn",
     use_feature_selection: bool = True,
 ) -> None:
-    print(f"Loading dataset from {data_path}...")
-    df_raw = load_dataset(data_path, validation_mode=validation_mode)
-    lookup_tables = build_lookup_tables(df_raw)
-    X, y = prepare_forward_dataset(df_raw, lookup_tables=lookup_tables)
-
-    cat_features = [col for col in X.columns if X[col].dtype.name in ['object', 'category']]
-    sample_weights = compute_quality_weights(
-        df_raw.reindex(X.index),
-        penalty_weight=FORWARD_MODEL_CONFIG.physics_penalty_weight,
-        minimum_weight=FORWARD_MODEL_CONFIG.minimum_sample_weight,
-    ).to_numpy(dtype=float)
+    _, X, y, cat_features, sample_weights = _build_training_context(
+        data_path,
+        validation_mode=validation_mode,
+    )
 
     os.makedirs(output_dir, exist_ok=True)
     metrics: Dict[str, Dict] = {}
     uq_models: Dict[str, object] = {}
     feature_meta: Dict[str, Dict] = {
+        "backend": "catboost",
         "all_feature_names": list(X.columns),
         "categorical_features": cat_features,
         "targets": {},
@@ -96,7 +161,7 @@ def train_forward_models(
             print(f"Skipping {target}: target not present in dataset.")
             continue
 
-        print(f"\n=== Training target: {target} ===")
+        print(f"\n=== Training target: {target} [catboost] ===")
         y_target = y[target]
         strat_key = build_stratification_key(X, y_target)
         outer_cv = StratifiedKFold(
@@ -166,7 +231,7 @@ def train_forward_models(
 
         production_models = []
         model_paths = []
-        safe_target = target.replace('/', '_').replace(' ', '_')
+        safe_target = _safe_target_name(target)
         for member_idx in range(FORWARD_MODEL_CONFIG.n_ensemble_members):
             member_seed = RANDOM_SEED + (member_idx + 1) * FORWARD_MODEL_CONFIG.ensemble_seed_step
             model = CatBoostRegressor(
@@ -228,7 +293,12 @@ def train_forward_models(
         y_lo = interval_bounds[:, 0]
         y_hi = interval_bounds[:, 1]
         interval_width = y_hi - y_lo
-        coverage = float(np.mean((y_target.to_numpy(dtype=float) >= y_lo) & (y_target.to_numpy(dtype=float) <= y_hi)))
+        coverage = float(
+            np.mean(
+                (y_target.to_numpy(dtype=float) >= y_lo)
+                & (y_target.to_numpy(dtype=float) <= y_hi)
+            )
+        )
         uq_models[target] = uq_model
 
         predictions_df = pd.DataFrame({
@@ -250,6 +320,7 @@ def train_forward_models(
             "model_paths": model_paths,
         }
         metrics[target] = {
+            "backend": "catboost",
             "R2": float(r2_oof),
             "R2_oof": float(r2_oof),
             "RMSE": rmse_oof,
@@ -278,18 +349,168 @@ def train_forward_models(
             f"coverage={coverage:.1%} width={np.mean(interval_width):.4f}"
         )
 
-    with open(os.path.join(output_dir, "metrics.json"), "w", encoding="utf-8") as handle:
-        json.dump(metrics, handle, indent=2, ensure_ascii=False)
-    joblib.dump(uq_models, os.path.join(output_dir, "uncertainty_calibrators.joblib"))
-    joblib.dump(feature_meta, os.path.join(output_dir, "feature_meta.joblib"))
-    print(f"\nTraining complete. Models and intervals saved to {output_dir}")
+    _write_backend_metadata(
+        output_dir,
+        metrics=metrics,
+        feature_meta=feature_meta,
+        uq_models=uq_models,
+    )
+    print(f"\nTraining complete. CatBoost models and intervals saved to {output_dir}")
 
 
-if __name__ == "__main__":
+def train_tabpfn_models(
+    data_path: str,
+    output_dir: str,
+    *,
+    validation_mode: str = "warn",
+    use_feature_selection: bool = True,
+) -> None:
+    TabPFNRegressor = _import_tabpfn()
+    _, X, y, cat_features, _ = _build_training_context(
+        data_path,
+        validation_mode=validation_mode,
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+    metrics: Dict[str, Dict] = {}
+    feature_meta: Dict[str, Dict] = {
+        "backend": "tabpfn",
+        "all_feature_names": list(X.columns),
+        "categorical_features": cat_features,
+        "targets": {},
+    }
+
+    for target in FORWARD_MODEL_TARGETS:
+        if target not in y.columns:
+            print(f"Skipping {target}: target not present in dataset.")
+            continue
+
+        print(f"\n=== Training target: {target} [tabpfn] ===")
+        y_target = y[target]
+        strat_key = build_stratification_key(X, y_target)
+        outer_cv = StratifiedKFold(
+            n_splits=FORWARD_MODEL_CONFIG.n_ensemble_splits,
+            shuffle=True,
+            random_state=RANDOM_SEED,
+        )
+        cv_splits = list(outer_cv.split(X, strat_key))
+        oof_preds = np.full(len(X), np.nan, dtype=float)
+        fold_ids = np.full(len(X), -1, dtype=int)
+        fold_feature_sets: List[List[str]] = []
+        dropped_constant_features: List[str] = []
+
+        for fold_idx, (train_idx, valid_idx) in enumerate(cv_splits):
+            X_train = X.iloc[train_idx]
+            y_train = y_target.iloc[train_idx]
+            X_valid = X.iloc[valid_idx]
+
+            selected_features, _ = _feature_selection_for_fold(
+                X_train,
+                y_train,
+                cat_features,
+                use_feature_selection=use_feature_selection,
+            )
+            X_train_tabpfn, tabpfn_features, dropped_constant = prepare_tabpfn_regression_frame(
+                X_train,
+                candidate_features=selected_features,
+            )
+            X_valid_tabpfn, _, _ = prepare_tabpfn_regression_frame(
+                X_valid,
+                candidate_features=tabpfn_features,
+            )
+            fold_feature_sets.append(tabpfn_features)
+            dropped_constant_features.extend(dropped_constant)
+
+            model = TabPFNRegressor()
+            _fit_tabpfn_model(model, X_train_tabpfn, y_train)
+            oof_preds[valid_idx] = np.asarray(model.predict(X_valid_tabpfn), dtype=float)
+            fold_ids[valid_idx] = fold_idx
+
+        r2_oof = r2_score(y_target, oof_preds)
+        rmse_oof = float(np.sqrt(mean_squared_error(y_target, oof_preds)))
+        mae_oof = float(mean_absolute_error(y_target, oof_preds))
+        print(f"  OOF R2={r2_oof:.4f} RMSE={rmse_oof:.4f} MAE={mae_oof:.4f}")
+
+        selected_features_full, _ = _feature_selection_for_fold(
+            X,
+            y_target,
+            cat_features,
+            use_feature_selection=use_feature_selection,
+        )
+        X_tabpfn_full, tabpfn_features_full, dropped_constant_full = prepare_tabpfn_regression_frame(
+            X,
+            candidate_features=selected_features_full,
+        )
+        dropped_constant_features.extend(dropped_constant_full)
+
+        production_model = TabPFNRegressor()
+        _fit_tabpfn_model(production_model, X_tabpfn_full, y_target)
+        prod_mean = np.asarray(production_model.predict(X_tabpfn_full), dtype=float)
+        r2_prod = r2_score(y_target, prod_mean)
+        rmse_prod = float(np.sqrt(mean_squared_error(y_target, prod_mean)))
+        mae_prod = float(mean_absolute_error(y_target, prod_mean))
+
+        safe_target = _safe_target_name(target)
+        model_path = os.path.join(output_dir, f"tabpfn_{safe_target}.joblib")
+        joblib.dump(production_model, model_path)
+
+        predictions_df = pd.DataFrame({
+            "y_actual": y_target.to_numpy(dtype=float),
+            "y_oof": oof_preds,
+            "fold_id": fold_ids,
+            "y_prod_mean": prod_mean,
+            "y_interval_center": np.full(len(X), np.nan, dtype=float),
+            "y_lo": np.full(len(X), np.nan, dtype=float),
+            "y_hi": np.full(len(X), np.nan, dtype=float),
+            "interval_width": np.full(len(X), np.nan, dtype=float),
+        })
+        predictions_path = os.path.join(output_dir, f"predictions_{safe_target}.csv")
+        predictions_df.to_csv(predictions_path, index=False)
+
+        dedup_dropped = sorted(set(dropped_constant_features))
+        feature_meta["targets"][target] = {
+            "selected_features": tabpfn_features_full,
+            "categorical_features": [],
+            "dropped_constant_features": dedup_dropped,
+            "model_paths": [model_path],
+        }
+        metrics[target] = {
+            "backend": "tabpfn",
+            "R2": float(r2_oof),
+            "R2_oof": float(r2_oof),
+            "RMSE": rmse_oof,
+            "RMSE_oof": rmse_oof,
+            "MAE": mae_oof,
+            "MAE_oof": mae_oof,
+            "R2_production": float(r2_prod),
+            "RMSE_production": rmse_prod,
+            "MAE_production": mae_prod,
+            "selected_features": tabpfn_features_full,
+            "fold_feature_sets": fold_feature_sets,
+            "dropped_constant_features": dedup_dropped,
+            "interval_confidence_level": None,
+            "interval_coverage": None,
+            "interval_width_mean": None,
+            "cv_folds": FORWARD_MODEL_CONFIG.n_ensemble_splits,
+            "ensemble_members": 1,
+        }
+
+        print(f"  Production R2={r2_prod:.4f} RMSE={rmse_prod:.4f} (TabPFN challenger)")
+
+    _write_backend_metadata(
+        output_dir,
+        metrics=metrics,
+        feature_meta=feature_meta,
+    )
+    print(f"\nTraining complete. TabPFN models saved to {output_dir}")
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="Train forward models for adsorbent synthesis.")
     parser.add_argument("--data", type=str, default="data/SEC_SYN_with_features_enriched.csv")
     parser.add_argument("--output", type=str, default="artifacts/forward_models")
     parser.add_argument("--iterations", type=int, default=None, help="Override CatBoost iterations.")
+    parser.add_argument("--backend", choices=["catboost", "tabpfn", "all"], default="catboost")
     parser.add_argument("--no-feature-selection", action="store_true")
     parser.add_argument(
         "--validation-mode",
@@ -299,10 +520,30 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    train_forward_models(
-        args.data,
-        args.output,
-        iterations=args.iterations,
-        validation_mode=args.validation_mode,
-        use_feature_selection=not args.no_feature_selection,
-    )
+    use_subdirs = args.backend == "all"
+    backends = SUPPORTED_BACKENDS if args.backend == "all" else (args.backend,)
+    for backend in backends:
+        backend_output_dir = _resolve_backend_output_dir(args.output, backend, use_subdirs)
+        if backend == "catboost":
+            train_catboost_models(
+                args.data,
+                backend_output_dir,
+                iterations=args.iterations,
+                validation_mode=args.validation_mode,
+                use_feature_selection=not args.no_feature_selection,
+            )
+        elif backend == "tabpfn":
+            if args.iterations is not None:
+                print("Warning: --iterations is ignored for the TabPFN backend.")
+            train_tabpfn_models(
+                args.data,
+                backend_output_dir,
+                validation_mode=args.validation_mode,
+                use_feature_selection=not args.no_feature_selection,
+            )
+        else:  # pragma: no cover - protected by argparse choices
+            raise ValueError(f"Unsupported backend: {backend}")
+
+
+if __name__ == "__main__":
+    main()

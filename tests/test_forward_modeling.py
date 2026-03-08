@@ -2,7 +2,10 @@ import numpy as np
 import pandas as pd
 
 from src.adsorb_synthesis.data_processing import add_interaction_features
-from src.adsorb_synthesis.forward_modeling import select_curated_features
+from src.adsorb_synthesis.forward_modeling import (
+    prepare_tabpfn_regression_frame,
+    select_curated_features,
+)
 
 
 def test_add_interaction_features_is_row_level_for_same_metal():
@@ -51,3 +54,20 @@ def test_select_curated_features_keeps_primary_features():
     assert "C_metal" in selected_features
     assert "R_mass" not in report["available_keep_features"]
     assert "R_mass" not in selected_features
+
+
+def test_prepare_tabpfn_regression_frame_keeps_only_numeric_nonconstant_columns():
+    x = pd.DataFrame({
+        "numeric_a": [1.0, 2.0, 3.0],
+        "numeric_b": [5, 6, 7],
+        "bool_flag": [True, False, True],
+        "category": ["Cu", "Zn", "Fe"],
+        "constant": [4.2, 4.2, 4.2],
+    })
+
+    numeric_frame, selected_features, dropped_constant = prepare_tabpfn_regression_frame(x)
+
+    assert selected_features == ["numeric_a", "numeric_b", "bool_flag"]
+    assert dropped_constant == ["constant"]
+    assert list(numeric_frame.columns) == selected_features
+    assert numeric_frame["bool_flag"].dtype.kind == "f"

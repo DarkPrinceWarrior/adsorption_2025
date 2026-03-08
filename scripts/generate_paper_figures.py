@@ -38,6 +38,7 @@ COLORS = {
     "secondary": "#A23B72",
     "accent": "#F18F01",
     "success": "#C73E1D",
+    "neutral": "#6C757D",
 }
 
 
@@ -46,69 +47,179 @@ def load_metrics(metrics_path: str) -> dict:
         return json.load(handle)
 
 
-def plot_model_performance(metrics: dict, output_dir: str) -> None:
-    targets = list(metrics.keys())
-    r2_oof = [float(metrics[target].get("R2_oof", metrics[target].get("R2", np.nan))) for target in targets]
-    r2_prod = [float(metrics[target].get("R2_production", np.nan)) for target in targets]
-    labels = [target.replace(", ", "\n") for target in targets]
+def infer_backend_name(models_dir: str, metrics: dict) -> str:
+    payloads = list(metrics.values())
+    backend = payloads[0].get("backend") if payloads else None
+    if backend:
+        return str(backend)
+    if any(name.startswith("catboost_") and name.endswith(".cbm") for name in os.listdir(models_dir)):
+        return "catboost"
+    return os.path.basename(os.path.normpath(models_dir)) or "model"
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+
+def collect_model_runs(model_paths: list[str]) -> list[dict]:
+    runs: list[dict] = []
+    seen: set[str] = set()
+    for path in model_paths:
+        candidate = os.path.abspath(path)
+        if not os.path.isdir(candidate):
+            raise FileNotFoundError(f"Model path not found: {candidate}")
+        metrics_path = os.path.join(candidate, "metrics.json")
+        if os.path.exists(metrics_path):
+            if candidate not in seen:
+                metrics = load_metrics(metrics_path)
+                runs.append({
+                    "backend": infer_backend_name(candidate, metrics),
+                    "models_dir": candidate,
+                    "metrics": metrics,
+                })
+                seen.add(candidate)
+            continue
+
+        for entry in sorted(os.listdir(candidate)):
+            subdir = os.path.join(candidate, entry)
+            subdir_metrics = os.path.join(subdir, "metrics.json")
+            if not os.path.isdir(subdir) or not os.path.exists(subdir_metrics):
+                continue
+            subdir = os.path.abspath(subdir)
+            if subdir in seen:
+                continue
+            metrics = load_metrics(subdir_metrics)
+            runs.append({
+                "backend": infer_backend_name(subdir, metrics),
+                "models_dir": subdir,
+                "metrics": metrics,
+            })
+            seen.add(subdir)
+    if not runs:
+        raise FileNotFoundError("No model artifacts with metrics.json were found.")
+    return runs
+
+
+def collect_targets(runs: list[dict]) -> list[str]:
+    targets: list[str] = []
+    for run in runs:
+        for target in run["metrics"].keys():
+            if target not in targets:
+                targets.append(target)
+    return targets
+
+
+def metric_as_float(payload: dict, key: str) -> float:
+    value = payload.get(key, np.nan)
+    return np.nan if value is None else float(value)
+
+
+def plot_model_performance(runs: list[dict], output_dir: str) -> None:
+    targets = collect_targets(runs)
+    labels = [target.replace(", ", "\n") for target in targets]
+    backends = [run["backend"] for run in runs]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     x = np.arange(len(targets))
-    width = 0.35
-    ax.bar(x - width / 2, r2_oof, width, label="OOF", color=COLORS["primary"], alpha=0.85)
-    ax.bar(x + width / 2, r2_prod, width, label="Production", color=COLORS["secondary"], alpha=0.85)
-    ax.set_ylabel("R²")
-    ax.set_xlabel("Target")
-    ax.set_title("Forward Model Performance")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.legend(loc="upper right")
-    ax.set_ylim(0, 1.05)
+    width = 0.8 / max(len(runs), 1)
+    palette = [COLORS["primary"], COLORS["secondary"], COLORS["accent"], COLORS["success"]]
+
+    for idx, run in enumerate(runs):
+        color = palette[idx % len(palette)]
+        offset = (idx - (len(runs) - 1) / 2.0) * width
+        metrics = run["metrics"]
+        r2_oof = [
+            metric_as_float(metrics.get(target, {}), "R2_oof")
+            if metrics.get(target, {}).get("R2_oof") is not None
+            else metric_as_float(metrics.get(target, {}), "R2")
+            for target in targets
+        ]
+        r2_prod = [metric_as_float(metrics.get(target, {}), "R2_production") for target in targets]
+        axes[0].bar(x + offset, r2_oof, width, label=run["backend"], color=color, alpha=0.85)
+        axes[1].bar(x + offset, r2_prod, width, label=run["backend"], color=color, alpha=0.85)
+
+    axes[0].set_ylabel("R²")
+    axes[0].set_xlabel("Target")
+    axes[0].set_title("OOF Performance")
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(labels)
+    axes[0].set_ylim(0, 1.05)
+
+    axes[1].set_ylabel("R²")
+    axes[1].set_xlabel("Target")
+    axes[1].set_title("Production Performance")
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(labels)
+    axes[1].set_ylim(0, 1.05)
+    axes[1].legend(loc="upper right")
+
+    if len(backends) == 1:
+        axes[0].legend(loc="upper right")
+
     plt.tight_layout()
     fig.savefig(os.path.join(output_dir, "fig1_model_performance.png"))
     fig.savefig(os.path.join(output_dir, "fig1_model_performance.pdf"))
     plt.close(fig)
 
 
-def plot_parity_plots(models_dir: str, metrics: dict, output_dir: str) -> None:
-    n_targets = len(metrics)
-    n_cols = min(3, n_targets)
-    n_rows = (n_targets + n_cols - 1) // n_cols
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
+def plot_parity_plots(runs: list[dict], output_dir: str) -> None:
+    targets = collect_targets(runs)
+    n_targets = len(targets)
+    n_cols = max(1, len(runs))
+    n_rows = n_targets
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 4 * n_rows))
     axes = np.atleast_2d(axes)
 
-    for idx, target in enumerate(metrics.keys()):
-        row, col = divmod(idx, n_cols)
-        ax = axes[row, col]
-        safe_target = target.replace('/', '_').replace(' ', '_')
-        predictions_path = os.path.join(models_dir, f"predictions_{safe_target}.csv")
-        if not os.path.exists(predictions_path):
-            ax.set_visible(False)
-            continue
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes.item()]])
+    elif n_rows == 1:
+        axes = axes.reshape(1, -1)
+    elif n_cols == 1:
+        axes = axes.reshape(-1, 1)
 
-        preds_df = pd.read_csv(predictions_path)
-        y_true = preds_df["y_actual"].to_numpy(dtype=float)
-        y_pred = preds_df["y_oof"].to_numpy(dtype=float)
-        center = preds_df.get("y_interval_center", preds_df["y_oof"]).to_numpy(dtype=float)
-        yerr = (preds_df["interval_width"].to_numpy(dtype=float) / 2.0)
+    palette = [COLORS["primary"], COLORS["secondary"], COLORS["accent"], COLORS["success"]]
 
-        ax.scatter(y_true, y_pred, alpha=0.65, s=30, c=COLORS["primary"], edgecolors="white", linewidth=0.5)
-        ax.errorbar(y_true, center, yerr=yerr, fmt="none", alpha=0.2, color=COLORS["secondary"])
+    for row, target in enumerate(targets):
+        for col, run in enumerate(runs):
+            ax = axes[row, col]
+            safe_target = target.replace("/", "_").replace(" ", "_")
+            predictions_path = os.path.join(run["models_dir"], f"predictions_{safe_target}.csv")
+            if not os.path.exists(predictions_path):
+                ax.set_visible(False)
+                continue
 
-        lim_min = min(np.nanmin(y_true), np.nanmin(y_pred))
-        lim_max = max(np.nanmax(y_true), np.nanmax(y_pred))
-        pad = (lim_max - lim_min) * 0.05 if lim_max > lim_min else 1.0
-        lims = [lim_min - pad, lim_max + pad]
-        ax.plot(lims, lims, "k--", alpha=0.75)
-        ax.set_xlim(lims)
-        ax.set_ylim(lims)
-        ax.set_xlabel("Actual")
-        ax.set_ylabel("OOF prediction")
-        ax.set_title(f"{target}\nR²={metrics[target].get('R2_oof', np.nan):.3f}")
+            preds_df = pd.read_csv(predictions_path)
+            y_true = preds_df["y_actual"].to_numpy(dtype=float)
+            y_pred = preds_df["y_oof"].to_numpy(dtype=float)
+            center_series = preds_df.get("y_interval_center", preds_df["y_oof"])
+            center = center_series.to_numpy(dtype=float)
+            yerr = None
+            if "interval_width" in preds_df.columns:
+                interval_width = preds_df["interval_width"].to_numpy(dtype=float)
+                if np.isfinite(interval_width).any():
+                    yerr = interval_width / 2.0
 
-    for idx in range(n_targets, n_rows * n_cols):
-        row, col = divmod(idx, n_cols)
-        axes[row, col].set_visible(False)
+            color = palette[col % len(palette)]
+            ax.scatter(y_true, y_pred, alpha=0.65, s=30, c=color, edgecolors="white", linewidth=0.5)
+            if yerr is not None:
+                finite_mask = np.isfinite(y_true) & np.isfinite(center) & np.isfinite(yerr)
+                if finite_mask.any():
+                    ax.errorbar(
+                        y_true[finite_mask],
+                        center[finite_mask],
+                        yerr=yerr[finite_mask],
+                        fmt="none",
+                        alpha=0.18,
+                        color=COLORS["neutral"],
+                    )
+
+            lim_min = min(np.nanmin(y_true), np.nanmin(y_pred))
+            lim_max = max(np.nanmax(y_true), np.nanmax(y_pred))
+            pad = (lim_max - lim_min) * 0.05 if lim_max > lim_min else 1.0
+            lims = [lim_min - pad, lim_max + pad]
+            ax.plot(lims, lims, "k--", alpha=0.75)
+            ax.set_xlim(lims)
+            ax.set_ylim(lims)
+            ax.set_xlabel("Actual")
+            ax.set_ylabel("OOF prediction")
+            score = run["metrics"].get(target, {}).get("R2_oof", np.nan)
+            ax.set_title(f"{run['backend']} | {target}\nR²={score:.3f}")
 
     plt.tight_layout()
     fig.savefig(os.path.join(output_dir, "fig2_parity_plots.png"))
@@ -116,7 +227,13 @@ def plot_parity_plots(models_dir: str, metrics: dict, output_dir: str) -> None:
     plt.close(fig)
 
 
-def plot_feature_importance(models_dir: str, metrics: dict, output_dir: str) -> None:
+def plot_feature_importance(runs: list[dict], output_dir: str) -> None:
+    catboost_runs = [run for run in runs if run["backend"] == "catboost"]
+    if not catboost_runs:
+        return
+    run = catboost_runs[0]
+    models_dir = run["models_dir"]
+    metrics = run["metrics"]
     n_targets = len(metrics)
     n_cols = min(2, n_targets)
     n_rows = (n_targets + n_cols - 1) // n_cols
@@ -142,7 +259,7 @@ def plot_feature_importance(models_dir: str, metrics: dict, output_dir: str) -> 
         ax.set_yticks(range(len(top_idx)))
         ax.set_yticklabels(top_features, fontsize=8)
         ax.set_xlabel("Importance")
-        ax.set_title(target)
+        ax.set_title(f"{target} ({run['backend']})")
 
     for idx in range(n_targets, n_rows * n_cols):
         row, col = divmod(idx, n_cols)
@@ -180,27 +297,44 @@ def plot_target_distributions(data_path: str, metrics: dict, output_dir: str) ->
     plt.close(fig)
 
 
-def plot_uncertainty_analysis(metrics: dict, output_dir: str) -> None:
-    targets = list(metrics.keys())
-    widths = [float(metrics[target].get("interval_width_mean", np.nan)) for target in targets]
-    coverages = [float(metrics[target].get("interval_coverage", np.nan)) for target in targets]
+def plot_uncertainty_analysis(runs: list[dict], output_dir: str) -> None:
+    targets = collect_targets(runs)
     labels = [target.replace(", ", "\n") for target in targets]
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     x = np.arange(len(targets))
-    axes[0].bar(x, widths, color=COLORS["primary"], alpha=0.8)
+    width = 0.8 / max(len(runs), 1)
+    palette = [COLORS["primary"], COLORS["secondary"], COLORS["accent"], COLORS["success"]]
+    plotted = False
+
+    for idx, run in enumerate(runs):
+        metrics = run["metrics"]
+        widths = [metric_as_float(metrics.get(target, {}), "interval_width_mean") for target in targets]
+        coverages = [metric_as_float(metrics.get(target, {}), "interval_coverage") for target in targets]
+        if not np.isfinite(widths).any() and not np.isfinite(coverages).any():
+            continue
+        plotted = True
+        offset = (idx - (len(runs) - 1) / 2.0) * width
+        color = palette[idx % len(palette)]
+        axes[0].bar(x + offset, widths, width, color=color, alpha=0.8, label=run["backend"])
+        axes[1].bar(x + offset, coverages, width, color=color, alpha=0.8, label=run["backend"])
+
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(labels)
     axes[0].set_ylabel("Mean interval width")
     axes[0].set_title("Prediction interval width")
 
-    axes[1].bar(x, coverages, color=COLORS["secondary"], alpha=0.8)
     axes[1].axhline(0.9, linestyle="--", color="black", linewidth=1.5)
     axes[1].set_xticks(x)
     axes[1].set_xticklabels(labels)
     axes[1].set_ylim(0, 1.05)
     axes[1].set_ylabel("Empirical coverage")
     axes[1].set_title("Interval coverage")
+    if plotted:
+        axes[1].legend(loc="upper right")
+    else:
+        axes[0].text(0.5, 0.5, "No interval UQ available", ha="center", va="center", transform=axes[0].transAxes)
+        axes[1].text(0.5, 0.5, "No interval UQ available", ha="center", va="center", transform=axes[1].transAxes)
 
     plt.tight_layout()
     fig.savefig(os.path.join(output_dir, "fig6_uncertainty_analysis.png"))
@@ -208,11 +342,12 @@ def plot_uncertainty_analysis(metrics: dict, output_dir: str) -> None:
     plt.close(fig)
 
 
-def plot_correlation_heatmap(data_path: str, metrics: dict, output_dir: str) -> None:
+def plot_correlation_heatmap(data_path: str, runs: list[dict], output_dir: str) -> None:
     df = pd.read_csv(data_path)
     all_features = []
-    for payload in metrics.values():
-        all_features.extend(payload.get("selected_features", []))
+    for run in runs:
+        for payload in run["metrics"].values():
+            all_features.extend(payload.get("selected_features", []))
     common_features = pd.Series(all_features).value_counts()
     numeric_features = [
         feature for feature in common_features.index
@@ -244,22 +379,23 @@ def plot_correlation_heatmap(data_path: str, metrics: dict, output_dir: str) -> 
     plt.close(fig)
 
 
-def generate_all_figures(data_path: str, models_dir: str, output_dir: str) -> None:
+def generate_all_figures(data_path: str, model_paths: list[str], output_dir: str) -> None:
     os.makedirs(output_dir, exist_ok=True)
-    metrics = load_metrics(os.path.join(models_dir, "metrics.json"))
-    plot_model_performance(metrics, output_dir)
-    plot_parity_plots(models_dir, metrics, output_dir)
-    plot_feature_importance(models_dir, metrics, output_dir)
-    plot_target_distributions(data_path, metrics, output_dir)
-    plot_uncertainty_analysis(metrics, output_dir)
-    plot_correlation_heatmap(data_path, metrics, output_dir)
+    runs = collect_model_runs(model_paths)
+    reference_metrics = runs[0]["metrics"]
+    plot_model_performance(runs, output_dir)
+    plot_parity_plots(runs, output_dir)
+    plot_feature_importance(runs, output_dir)
+    plot_target_distributions(data_path, reference_metrics, output_dir)
+    plot_uncertainty_analysis(runs, output_dir)
+    plot_correlation_heatmap(data_path, runs, output_dir)
     print(f"Figures saved to {output_dir}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate paper figures.")
     parser.add_argument("--data", type=str, default="data/SEC_SYN_with_features_enriched.csv")
-    parser.add_argument("--models", type=str, default="artifacts/forward_models")
+    parser.add_argument("--models", nargs="+", default=["artifacts/forward_models"])
     parser.add_argument("--output", type=str, default="artifacts/figures")
     args = parser.parse_args()
     generate_all_figures(args.data, args.models, args.output)
