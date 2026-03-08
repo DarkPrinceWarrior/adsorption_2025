@@ -22,11 +22,13 @@ DEFAULT_INVERSE_SHORTLISTS = [
     "artifacts/predictions_bofire.csv",
     "artifacts/predictions_botorch.csv",
     "artifacts/predictions_baybe.csv",
+    "artifacts/inverse_direct/predictions.csv",
 ]
 DEFAULT_INVERSE_POOLS = [
     "artifacts/predictions_bofire_all.csv",
     "artifacts/predictions_botorch_all.csv",
     "artifacts/predictions_baybe_history.csv",
+    "artifacts/inverse_direct/predictions.csv",
 ]
 
 
@@ -49,6 +51,8 @@ def infer_inverse_backend(path: Path, df: pd.DataFrame) -> str:
     if "backend" in df.columns and not df["backend"].dropna().empty:
         return str(df["backend"].dropna().iloc[0])
     name = path.stem.lower()
+    if "inverse_direct" in name or "direct" in name:
+        return "inverse_direct"
     if "bofire" in name:
         return "bofire"
     if "botorch" in name:
