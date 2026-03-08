@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate interval-based uncertainty artifacts."""
+"""Internal CV-calibration diagnostic for interval-based uncertainty artifacts."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def validate_uncertainty(models_dir: str, output_dir: str) -> None:
 
         empirical_coverage = float(np.mean((y_true >= y_lo) & (y_true <= y_hi)))
         mean_width = float(np.mean(interval_width))
-        print(f"\nValidating {target}...")
+        print(f"\nValidating {target} (internal CV calibration diagnostic)...")
         print(f"  Coverage: {empirical_coverage:.1%}")
         print(f"  Mean interval width: {mean_width:.4f}")
 
@@ -129,7 +129,9 @@ def validate_uncertainty(models_dir: str, output_dir: str) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Validate interval-based uncertainty artifacts.")
+    parser = argparse.ArgumentParser(
+        description="Validate interval-based uncertainty artifacts as an internal CV-calibration diagnostic.",
+    )
     parser.add_argument("--models-dir", "--models", dest="models_dir", default="artifacts/forward_models")
     parser.add_argument("--output-dir", "--output", dest="output_dir", default="artifacts/plots")
     args = parser.parse_args()

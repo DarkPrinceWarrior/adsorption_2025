@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Target-oriented inverse design via native BoFire ask/tell strategy."""
+"""Historical BoFire-domain + Optuna-TPE search backend."""
 
 from __future__ import annotations
 
@@ -10,11 +10,11 @@ from typing import Dict
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from adsorb_synthesis.inverse_optimization import NativeBofireOptimizer
+from adsorb_synthesis.inverse_optimization import LegacyOptunaBofireOptimizer
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Target-oriented inverse design via native BoFire strategy.")
+    parser = argparse.ArgumentParser(description="Historical BoFire domain models with Optuna-TPE search.")
     parser.add_argument("--E0", type=float, help="Target E0 (kJ/mol)")
     parser.add_argument("--x0", type=float, help="Target x0 (nm)")
     parser.add_argument("--Sme", type=float, help="Target Sme (m2/g)")
@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument("--min-distance", type=float, default=0.03)
     parser.add_argument("--data", type=str, default="data/SEC_SYN_with_features_enriched.csv")
     parser.add_argument("--models-dir", "--models", dest="models_dir", type=str, default="artifacts/forward_models")
-    parser.add_argument("--output", type=str, default="artifacts/predictions_bofire.csv")
+    parser.add_argument("--output", type=str, default="artifacts/predictions_bofire_optuna_legacy.csv")
     parser.add_argument("--all-output", type=str, help="Optional path to save the full searched candidate pool.")
     parser.add_argument("--strict-validation", action="store_true")
     args = parser.parse_args()
@@ -40,7 +40,7 @@ def main() -> None:
     if not targets:
         raise SystemExit("Specify at least one target via --E0, --x0, or --Sme.")
 
-    optimizer = NativeBofireOptimizer(
+    optimizer = LegacyOptunaBofireOptimizer(
         models_dir=args.models_dir,
         data_path=args.data,
         n_trials=args.trials,

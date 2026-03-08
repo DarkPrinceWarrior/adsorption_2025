@@ -31,6 +31,7 @@ from adsorb_synthesis.forward_modeling import (
     SelectedFeatureCatBoostRegressor,
     build_stratification_key,
     compute_quality_weights,
+    prepare_tabpfn_inference_frame,
     prepare_tabpfn_regression_frame,
     select_curated_features,
 )
@@ -414,10 +415,7 @@ def train_tabpfn_models(
                 X_train,
                 candidate_features=selected_features,
             )
-            X_valid_tabpfn, _, _ = prepare_tabpfn_regression_frame(
-                X_valid,
-                candidate_features=tabpfn_features,
-            )
+            X_valid_tabpfn = prepare_tabpfn_inference_frame(X_valid, tabpfn_features)
             fold_feature_sets.append(tabpfn_features)
             dropped_constant_features.extend(dropped_constant)
 

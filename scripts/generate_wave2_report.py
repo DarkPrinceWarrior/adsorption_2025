@@ -73,12 +73,11 @@ def _infer_inverse_metrics_path(shortlist_path: str) -> Optional[Path]:
     return None
 
 
-def _load_inverse_direct_metrics(inverse_benchmark: pd.DataFrame) -> Optional[Dict[str, object]]:
-    direct_rows = inverse_benchmark.loc[inverse_benchmark["backend"] == "inverse_direct"]
-    if direct_rows.empty:
+def _load_inverse_direct_metrics(inverse_direct_benchmark: pd.DataFrame) -> Optional[Dict[str, object]]:
+    if inverse_direct_benchmark.empty:
         return None
-    metrics_path = _infer_inverse_metrics_path(str(direct_rows.iloc[0]["shortlist_path"]))
-    if metrics_path is None:
+    metrics_path = Path(str(inverse_direct_benchmark.iloc[0].get("metrics_path", "")))
+    if not metrics_path.exists():
         return None
     with open(metrics_path, "r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -87,9 +86,10 @@ def _load_inverse_direct_metrics(inverse_benchmark: pd.DataFrame) -> Optional[Di
 def plot_forward_report(forward_benchmark: pd.DataFrame, output_dir: Path) -> None:
     if forward_benchmark.empty:
         return
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     pivot_oof = forward_benchmark.pivot(index="target", columns="backend", values="R2_oof")
     pivot_prod = forward_benchmark.pivot(index="target", columns="backend", values="R2_production")
+    pivot_holdout = forward_benchmark.pivot(index="target", columns="backend", values="R2_holdout")
 
     sns.heatmap(pivot_oof, annot=True, fmt=".3f", cmap="Blues", vmin=0, vmax=1, ax=axes[0])
     axes[0].set_title("Forward OOF R²")
@@ -101,13 +101,17 @@ def plot_forward_report(forward_benchmark: pd.DataFrame, output_dir: Path) -> No
     axes[1].set_xlabel("Backend")
     axes[1].set_ylabel("")
 
+    sns.heatmap(pivot_holdout, annot=True, fmt=".3f", cmap="Oranges", vmin=0, vmax=1, ax=axes[2])
+    axes[2].set_title("Forward External Holdout R²")
+    axes[2].set_xlabel("Backend")
+    axes[2].set_ylabel("")
+
     fig.savefig(output_dir / "wave2_forward_overview.png")
     fig.savefig(output_dir / "wave2_forward_overview.pdf")
     plt.close(fig)
 
 
-def plot_inverse_optimizer_report(inverse_benchmark: pd.DataFrame, output_dir: Path) -> None:
-    optimizer_df = inverse_benchmark.loc[inverse_benchmark["backend"] != "inverse_direct"].copy()
+def plot_inverse_optimizer_report(optimizer_df: pd.DataFrame, output_dir: Path) -> None:
     if optimizer_df.empty:
         return
 
@@ -193,7 +197,8 @@ def plot_direct_inverse_report(metrics: Dict[str, object], output_dir: Path) -> 
 
 def build_summary(
     forward_benchmark: pd.DataFrame,
-    inverse_benchmark: pd.DataFrame,
+    optimizer_benchmark: pd.DataFrame,
+    inverse_direct_benchmark: pd.DataFrame,
     inverse_direct_metrics: Optional[Dict[str, object]],
 ) -> str:
     lines = [
@@ -204,41 +209,41 @@ def build_summary(
     if not forward_benchmark.empty:
         lines.extend(["## Forward", ""])
         for target, target_df in forward_benchmark.groupby("target", sort=False):
-            ordered = target_df.sort_values("R2_oof", ascending=False).reset_index(drop=True)
+            score_column = "R2_holdout" if target_df["R2_holdout"].notna().any() else "R2_oof"
+            ordered = target_df.sort_values(score_column, ascending=False).reset_index(drop=True)
             winner = ordered.iloc[0]
             loser = ordered.iloc[-1]
-            delta = _safe_float(winner["R2_oof"]) - _safe_float(loser["R2_oof"])
+            delta = _safe_float(winner[score_column]) - _safe_float(loser[score_column])
             lines.append(
-                f"- `{target}`: лучший backend `{winner['backend']}` с OOF R² `{winner['R2_oof']:.4f}`; "
+                f"- `{target}`: лучший backend `{winner['backend']}` по `{score_column}` = `{winner[score_column]:.4f}`; "
                 f"разрыв до худшего `{delta:.4f}`."
             )
         lines.append("")
 
-    if not inverse_benchmark.empty:
-        lines.extend(["## Inverse", ""])
-        optimizer_df = inverse_benchmark.loc[inverse_benchmark["backend"] != "inverse_direct"].copy()
-        if not optimizer_df.empty:
-            best_inverse = optimizer_df.sort_values("best_score_pool", ascending=True).iloc[0]
-            diverse_inverse = optimizer_df.sort_values("unique_chemistries_shortlist", ascending=False).iloc[0]
-            lines.append(
-                f"- Лучший optimizer по `best_score_pool`: `{best_inverse['backend']}` "
-                f"(`{best_inverse['best_score_pool']:.4f}`)."
-            )
-            lines.append(
-                f"- Самый разнообразный shortlist по chemistry coverage: `{diverse_inverse['backend']}` "
-                f"(`{int(diverse_inverse['unique_chemistries_shortlist'])}` chemistry groups)."
-            )
-        direct_row = inverse_benchmark.loc[inverse_benchmark["backend"] == "inverse_direct"]
-        if not direct_row.empty:
-            direct = direct_row.iloc[0]
-            lines.append(
-                f"- `inverse_direct` нужно трактовать отдельно от optimizer-ов: "
-                f"это row-wise benchmark baseline с feasibility `{direct['pool_feasibility_rate']:.3f}`."
-            )
+    if not optimizer_benchmark.empty:
+        lines.extend(["## Inverse Optimizers", ""])
+        best_inverse = optimizer_benchmark.sort_values("best_score_pool", ascending=True).iloc[0]
+        diverse_inverse = optimizer_benchmark.sort_values("unique_chemistries_shortlist", ascending=False).iloc[0]
+        lines.append(
+            f"- Лучший optimizer по `best_score_pool`: `{best_inverse['backend']}` "
+            f"(`{best_inverse['best_score_pool']:.4f}`)."
+        )
+        lines.append(
+            f"- Самый разнообразный shortlist по chemistry coverage: `{diverse_inverse['backend']}` "
+            f"(`{int(diverse_inverse['unique_chemistries_shortlist'])}` chemistry groups)."
+        )
+        lines.append("")
+
+    if not inverse_direct_benchmark.empty:
+        direct = inverse_direct_benchmark.iloc[0]
+        lines.extend(["## Direct Inverse", ""])
+        lines.append(
+            f"- `inverse_direct` трактуется отдельно от optimizer-ов: "
+            f"это benchmark baseline с feasibility `{direct['feasibility_rate']:.3f}`."
+        )
         lines.append("")
 
     if inverse_direct_metrics:
-        lines.extend(["## Direct Inverse", ""])
         target_mae = inverse_direct_metrics.get("target_mae_recheck", {})
         categorical_accuracy = inverse_direct_metrics.get("categorical_accuracy", {})
         for target_name, value in target_mae.items():
@@ -260,21 +265,23 @@ def generate_wave2_report(benchmark_dir: str, output_dir: str) -> None:
     output_path.mkdir(parents=True, exist_ok=True)
 
     forward_benchmark = _load_csv(benchmark_path / "forward_benchmark.csv")
-    inverse_benchmark = _load_csv(benchmark_path / "inverse_benchmark.csv")
-    inverse_direct_metrics = _load_inverse_direct_metrics(inverse_benchmark)
+    optimizer_benchmark = _load_csv(benchmark_path / "inverse_optimizer_benchmark.csv") if (benchmark_path / "inverse_optimizer_benchmark.csv").exists() else _load_csv(benchmark_path / "inverse_benchmark.csv")
+    inverse_direct_benchmark = _load_csv(benchmark_path / "inverse_direct_benchmark.csv") if (benchmark_path / "inverse_direct_benchmark.csv").exists() else pd.DataFrame()
+    inverse_direct_metrics = _load_inverse_direct_metrics(inverse_direct_benchmark)
 
     plot_forward_report(forward_benchmark, output_path)
-    plot_inverse_optimizer_report(inverse_benchmark, output_path)
+    plot_inverse_optimizer_report(optimizer_benchmark, output_path)
     if inverse_direct_metrics is not None:
         plot_direct_inverse_report(inverse_direct_metrics, output_path)
 
-    summary_md = build_summary(forward_benchmark, inverse_benchmark, inverse_direct_metrics)
+    summary_md = build_summary(forward_benchmark, optimizer_benchmark, inverse_direct_benchmark, inverse_direct_metrics)
     summary_path = output_path / "wave2_summary.md"
     summary_path.write_text(summary_md, encoding="utf-8")
 
     summary_json = {
         "forward_rows": int(len(forward_benchmark)),
-        "inverse_rows": int(len(inverse_benchmark)),
+        "inverse_optimizer_rows": int(len(optimizer_benchmark)),
+        "inverse_direct_rows": int(len(inverse_direct_benchmark)),
         "has_inverse_direct_metrics": inverse_direct_metrics is not None,
     }
     with open(output_path / "wave2_summary.json", "w", encoding="utf-8") as handle:

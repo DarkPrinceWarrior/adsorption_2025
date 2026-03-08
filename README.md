@@ -5,7 +5,7 @@
 
 В основе подхода лежит production-core pipeline с отдельными research challengers:
 1.  **Production Forward Model:** `CatBoost + MAPIE` с fold-local feature selection и OOF/production артефактами.
-2.  **Production Inverse Design:** practical optimizer на `BoFire`-based domain/constraint layer.
+2.  **Production Inverse Design:** native `BoFire` strategy loop с practical shortlist/output schema.
 3.  **Wave 2 Research Branches:** `TabPFN`, `BoTorch`, `BayBE`, `direct inverse`, единый benchmark и comparative report.
 
 ---
@@ -16,7 +16,7 @@
 
 *   **Forward backend:** `CatBoost`
 *   **Uncertainty Quantification:** `MAPIE` intervals
-*   **Основной inverse backend:** `run_bofire_opt.py`
+*   **Основной inverse backend:** `run_bofire_opt.py` (native `BoFire`)
 *   **Research optimizer:** `run_botorch_mobo.py`
 *   **Campaign backend:** `run_baybe_campaign.py`
 *   **Direct inverse:** только benchmark baseline, не основной workflow
@@ -41,19 +41,24 @@
     *   $S_{me}$ [м²/г] — Удельная поверхность мезопор.
 
 ### Оценка неопределенности (Uncertainty Quantification)
-Production-ветка использует **CV-based conformal intervals через MAPIE**:
+Production-ветка использует **CV-based conformal intervals через MAPIE**. Разделение такое:
+
+*   **Internal CV calibration:** `validate_uncertainty.py`
+*   **External chemistry holdout:** `evaluate_forward_holdout.py`
+
+Production-ветка использует:
 
 1.  **Fold-local CatBoost pipeline:** outer-CV без leakage из feature selection.
 2.  **Cross-Conformal Regression:** интервалы `y_lo/y_hi` строятся через `MAPIE` по той же CV-схеме.
 3.  **Единые артефакты:** `predictions_<target>.csv` содержат `y_actual`, `y_oof`, `y_prod_mean`, `y_lo`, `y_hi`, `interval_width`.
-4.  **Validation layer:** `validate_uncertainty.py` проверяет empirical coverage и rejection curve по `interval_width`.
+4.  **Validation layer:** `validate_uncertainty.py` проверяет empirical coverage и rejection curve по `interval_width` как internal CV diagnostic.
 
 ### Multi-Objective Bayesian Optimization
-Production inverse stage теперь строится не вокруг legacy `NSGA-II`, а вокруг **target-oriented practical optimization**:
+Production inverse stage теперь строится не вокруг legacy `NSGA-II`, а вокруг **target-oriented native `BoFire` optimization**:
 *   Основной workflow: `run_bofire_opt.py`
 *   Явные constraints: temperature order, boiling point, stoichiometry, bounds по `E0`
 *   Выход: shortlist кандидатов с `score`, `feasible`, prediction intervals и diagnostics
-*   Legacy `run_bayes_opt.py` сохранён как historical baseline
+*   Historical fallbacks: `run_bofire_optuna_legacy.py` и `run_bayes_opt.py`
 
 ---
 
@@ -108,14 +113,24 @@ PYTHONPATH=src python scripts/train_forward_model.py \
 *   `predictions_*.csv` — OOF-предсказания + интервалы `y_lo/y_hi`
 
 ### Шаг 3: Валидация UQ
-Скрипт строит **Rejection Plots** и проверяет **Interval Coverage**:
+Скрипт строит **Rejection Plots** и проверяет **Interval Coverage** как internal CV calibration diagnostic:
 ```bash
 PYTHONPATH=src python scripts/validate_uncertainty.py
 ```
 *Результат:* `artifacts/plots/uncertainty_rejection_plots.png`.
 
+### Шаг 3b: Внешний chemistry holdout
+Для внешней оценки используйте deterministic split по `Металл|Лиганд`:
+```bash
+PYTHONPATH=src python scripts/evaluate_forward_holdout.py \
+    --data data/SEC_SYN_with_features_enriched.csv \
+    --output-dir artifacts/forward_holdout \
+    --backend all
+```
+*Результат:* `artifacts/forward_holdout/split_manifest.json` + per-backend holdout metrics/predictions.
+
 ### Шаг 4: Production inverse design
-Задайте желаемые СЭХ — target-oriented optimizer на `BoFire` domain models построит ранжированный shortlist кандидатов.
+Задайте желаемые СЭХ — target-oriented native `BoFire` optimizer построит ранжированный shortlist кандидатов.
 
 ```bash
 PYTHONPATH=src python scripts/run_bofire_opt.py \
@@ -135,6 +150,11 @@ PYTHONPATH=src python scripts/run_bofire_opt.py \
 *   `--all-output`: опциональный путь для сохранения полного пула просмотренных кандидатов.
 
 *Результат:* CSV с небольшим diverse shortlist кандидатов, включая условия синтеза, предсказанные свойства, интервалы `Pred_*_lo/hi`, `feasible`, `constraint_reasons`, итоговый `score` и `search_rank` исходного поиска.
+
+Historical fallback прежней реализации:
+```bash
+PYTHONPATH=src python scripts/run_bofire_optuna_legacy.py ...
+```
 
 ### Шаг 5: Wave 2 comparative workflow
 Если нужно сравнить runnable research-ветки второй волны:
@@ -156,7 +176,7 @@ PYTHONPATH=src python scripts/run_wave2_suite.py \
 ```
 
 Скрипт:
-*   досчитает `TabPFN`, `BayBE`, `direct inverse`, если артефактов нет;
+*   досчитает `TabPFN`, внешний chemistry holdout, `BayBE`, `direct inverse`, если артефактов нет;
 *   соберёт `benchmark_wave2.py`;
 *   создаст comparative report через `generate_wave2_report.py`.
 
@@ -170,14 +190,16 @@ PYTHONPATH=src python scripts/run_wave2_suite.py \
 │   ├── tune_hyperparams.py       # Шаг 1: Optuna HP tuning (5-fold CV)
 │   ├── train_forward_model.py    # Шаг 2: Nested selection + production ensemble + MAPIE
 │   ├── validate_uncertainty.py   # Шаг 3: UQ валидация (rejection plots + interval coverage)
-│   ├── run_bofire_opt.py         # Шаг 4: Production inverse design
+│   ├── evaluate_forward_holdout.py # Шаг 3b: внешний chemistry holdout
+│   ├── run_bofire_opt.py         # Шаг 4: Native BoFire production inverse design
+│   ├── run_bofire_optuna_legacy.py # Historical BoFire+Optuna wrapper
 │   ├── run_botorch_mobo.py       # Research inverse optimizer
 │   ├── run_baybe_campaign.py     # Campaign-oriented optimizer scaffold
 │   ├── train_inverse_direct.py   # Direct inverse benchmark baseline
 │   ├── benchmark_wave2.py        # Comparative benchmark layer
 │   ├── generate_wave2_report.py  # Comparative report layer
 │   ├── run_wave2_suite.py        # Orchestrator for runnable wave 2
-│   ├── run_bayes_opt.py          # Legacy baseline (Optuna NSGA-II)
+│   ├── run_bayes_opt.py          # Historical baseline (Optuna NSGA-II)
 │   └── generate_paper_figures.py # Фигуры для статьи/отчета
 ├── src/
 │   └── adsorb_synthesis/
@@ -187,7 +209,7 @@ PYTHONPATH=src python scripts/run_wave2_suite.py \
 │       ├── data_validation.py    # Валидация физических ограничений
 │       ├── feature_selection.py  # Feature Selection (VIF, корреляции, domain knowledge)
 │       └── physics_losses.py     # Физические constraints и penalties
-├── tests/                        # Unit-тесты (7 тестов)
+├── tests/                        # Unit + regression tests
 ├── data/                         # Экспериментальные датасеты (380 образцов)
 └── artifacts/                    # Модели, метрики, графики, результаты BO
 ```
@@ -232,7 +254,7 @@ add_salt_mass_features(df)  # inplace=True (по умолчанию)
 ### Wave 2 Status
 *   **CatBoost:** текущий production default.
 *   **TabPFN:** challenger backend; на текущем датасете слабее CatBoost, особенно по `Sme`.
-*   **BoFire:** лучший inverse backend на текущем benchmark run.
+*   **BoFire:** текущий production default; native strategy loop.
 *   **BoTorch:** рабочий research backend, но пока уступает BoFire по `best_score_pool`.
 *   **BayBE:** рабочий campaign backend для low-data loop, но не лучший production optimizer.
 *   **Direct inverse:** полезный benchmark, но не рекомендуется как основной способ подбора рецепта.
@@ -245,4 +267,4 @@ add_salt_mass_features(df)  # inplace=True (по умолчанию)
 PYTHONPATH=src python -m pytest tests/ -v
 ```
 
-**Покрытие:** unit-тесты по валидации данных, инженерии признаков и расчёту молярных масс + smoke/regression проверки через runnable scripts.
+**Покрытие:** unit-тесты по валидации данных, engineering/pipeline helpers и chemistry holdout split + smoke/regression проверки через runnable scripts.

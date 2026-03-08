@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Builds a mixed-type correlation matrix for key synthesis and adsorption features
-in data/SEC_SYN_with_features.csv. Numeric pairs use Spearman correlation,
-categorical-numeric pairs use correlation ratio (eta), and categorical pairs use
-Cramer's V. Outputs a CSV with coefficients and a heatmap PNG.
-"""
+"""Build mixed-type correlation matrices for current or historical target sets."""
 from __future__ import annotations
 
 import argparse
@@ -18,8 +13,25 @@ import pandas as pd
 import seaborn as sns
 from scipy.stats import chi2_contingency, spearmanr
 
-# Columns the user requested to analyze (keep the original naming)
-COLUMNS_OF_INTEREST: Sequence[str] = (
+from adsorb_synthesis.data_processing import load_dataset
+
+CURRENT_COLUMNS_OF_INTEREST: Sequence[str] = (
+    "Tрег, ᵒС",
+    "E0, кДж/моль",
+    "х0, нм",
+    "Sme, м2/г",
+    "Металл",
+    "Лиганд",
+    "Растворитель",
+    "m (соли), г",
+    "m(кис-ты), г",
+    "Т.син., °С",
+    "Т суш., °С",
+    "Vсин. (р-ля), мл",
+    "R_molar",
+)
+
+LEGACY_COLUMNS_OF_INTEREST: Sequence[str] = (
     "Tрег, ᵒС",
     "W0, см3/г",
     "E0, кДж/моль",
@@ -46,7 +58,7 @@ CATEGORICAL_COLUMNS = {"Металл", "Лиганд", "Растворитель
 
 def parse_args() -> argparse.Namespace:
     repo_root = Path(__file__).resolve().parents[1]
-    default_input = repo_root / "data" / "SEC_SYN_with_features.csv"
+    default_input = repo_root / "data" / "SEC_SYN_with_features_enriched.csv"
     default_output = repo_root / "analysis_results"
 
     parser = argparse.ArgumentParser(
@@ -66,6 +78,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=default_output,
         help=f"Directory for outputs (default: {default_output})",
+    )
+    parser.add_argument(
+        "--column-set",
+        choices=["current", "legacy"],
+        default="current",
+        help="Choose the current E0/x0/Sme target set or the historical legacy analysis set.",
     )
     return parser.parse_args()
 
@@ -196,8 +214,13 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    df_raw = pd.read_csv(args.input)
-    selected_columns: List[str] = list(COLUMNS_OF_INTEREST)
+    if args.column_set == "current":
+        df_raw = load_dataset(str(args.input), validation_mode="warn")
+    else:
+        df_raw = pd.read_csv(args.input)
+    selected_columns: List[str] = list(
+        CURRENT_COLUMNS_OF_INTEREST if args.column_set == "current" else LEGACY_COLUMNS_OF_INTEREST
+    )
     missing = [c for c in selected_columns if c not in df_raw.columns]
     if missing:
         raise SystemExit(f"Missing required columns in dataset: {missing}")
@@ -205,8 +228,9 @@ def main() -> None:
     df = prepare_dataframe(df_raw[selected_columns])
     corr_matrix = build_correlation_matrix(df, selected_columns)
 
-    csv_path = args.output_dir / "mixed_correlation_matrix.csv"
-    heatmap_path = args.output_dir / "mixed_correlation_heatmap.png"
+    suffix = args.column_set
+    csv_path = args.output_dir / f"mixed_correlation_matrix_{suffix}.csv"
+    heatmap_path = args.output_dir / f"mixed_correlation_heatmap_{suffix}.png"
 
     corr_matrix.to_csv(csv_path, float_format="%.4f")
     plot_heatmap(corr_matrix, heatmap_path)

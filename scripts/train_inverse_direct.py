@@ -17,17 +17,14 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.model_selection import KFold
 
 SCRIPT_DIR = os.path.dirname(__file__)
-if SCRIPT_DIR not in sys.path:
-    sys.path.append(SCRIPT_DIR)
 sys.path.append(os.path.join(SCRIPT_DIR, "..", "src"))
-
-from run_bofire_opt import BofireAdsorbentOptimizer  # noqa: E402
 
 from adsorb_synthesis.constants import (  # noqa: E402
     FORWARD_MODEL_TARGETS,
     RANDOM_SEED,
 )
 from adsorb_synthesis.data_processing import load_dataset  # noqa: E402
+from adsorb_synthesis.inverse_optimization import AdsorbentOptimizerContext  # noqa: E402
 
 
 TARGET_COLUMNS = list(FORWARD_MODEL_TARGETS)
@@ -67,7 +64,7 @@ class DirectInverseBaseline:
 
         validation_mode = "strict" if strict_validation else "warn"
         self.df = load_dataset(data_path, validation_mode=validation_mode).reset_index(drop=True)
-        self.forward_recheck = BofireAdsorbentOptimizer(
+        self.forward_recheck = AdsorbentOptimizerContext(
             models_dir=models_dir,
             data_path=data_path,
             n_trials=1,

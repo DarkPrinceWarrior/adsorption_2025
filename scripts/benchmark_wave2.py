@@ -7,7 +7,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -17,6 +17,10 @@ FORWARD_TARGETS = ["E0, кДж/моль", "х0, нм", "Sme, м2/г"]
 DEFAULT_FORWARD_PATHS = [
     "artifacts/forward_models",
     "artifacts/tabpfn_smoke_v641",
+]
+DEFAULT_FORWARD_HOLDOUT_PATHS = [
+    "artifacts/forward_holdout/catboost",
+    "artifacts/forward_holdout/tabpfn",
 ]
 DEFAULT_INVERSE_SHORTLISTS = [
     "artifacts/predictions_bofire.csv",
@@ -45,6 +49,21 @@ def infer_forward_backend(models_dir: Path, metrics: dict) -> str:
     if any(path.name.startswith("catboost_") and path.suffix == ".cbm" for path in models_dir.iterdir()):
         return "catboost"
     return models_dir.name or "forward_model"
+
+
+def load_forward_holdouts(paths: Iterable[str]) -> Dict[str, dict]:
+    runs: Dict[str, dict] = {}
+    for raw_path in paths:
+        candidate = Path(raw_path).resolve()
+        if not candidate.exists():
+            continue
+        metric_file = candidate / "holdout_metrics.json"
+        if not metric_file.exists():
+            continue
+        payload = json.loads(metric_file.read_text(encoding="utf-8"))
+        backend = str(payload.get("backend") or candidate.name)
+        runs[backend] = payload
+    return runs
 
 
 def infer_inverse_backend(path: Path, df: pd.DataFrame) -> str:
@@ -87,7 +106,7 @@ def load_forward_runs(paths: Iterable[str]) -> List[dict]:
     return runs
 
 
-def build_forward_benchmark(runs: List[dict]) -> pd.DataFrame:
+def build_forward_benchmark(runs: List[dict], holdouts: Dict[str, dict]) -> pd.DataFrame:
     rows: List[dict] = []
     for run in runs:
         backend = run["backend"]
@@ -96,6 +115,7 @@ def build_forward_benchmark(runs: List[dict]) -> pd.DataFrame:
             if target not in metrics:
                 continue
             payload = metrics[target]
+            holdout_payload = holdouts.get(backend, {}).get(target, {})
             rows.append({
                 "backend": backend,
                 "target": target,
@@ -107,6 +127,13 @@ def build_forward_benchmark(runs: List[dict]) -> pd.DataFrame:
                 "MAE_production": _metric_as_float(payload, "MAE_production"),
                 "interval_coverage": _metric_as_float(payload, "interval_coverage"),
                 "interval_width_mean": _metric_as_float(payload, "interval_width_mean"),
+                "R2_holdout": _metric_as_float(holdout_payload, "R2_holdout"),
+                "RMSE_holdout": _metric_as_float(holdout_payload, "RMSE_holdout"),
+                "MAE_holdout": _metric_as_float(holdout_payload, "MAE_holdout"),
+                "holdout_interval_coverage": _metric_as_float(holdout_payload, "holdout_interval_coverage"),
+                "holdout_interval_width_mean": _metric_as_float(holdout_payload, "holdout_interval_width_mean"),
+                "holdout_rows": holdout_payload.get("holdout_rows"),
+                "holdout_interval_supported": holdout_payload.get("interval_supported"),
                 "n_selected_features": len(payload.get("selected_features", [])),
                 "ensemble_members": payload.get("ensemble_members"),
                 "cv_folds": payload.get("cv_folds"),
@@ -148,8 +175,34 @@ def _read_existing_csvs(paths: Iterable[str]) -> Dict[str, pd.DataFrame]:
     return tables
 
 
-def build_inverse_benchmark(shortlists: Dict[str, pd.DataFrame], pools: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    rows: List[dict] = []
+def _load_inverse_direct_row(path_str: str, df: pd.DataFrame) -> dict:
+    path = Path(path_str)
+    metrics_path = path.parent / "metrics.json"
+    payload = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.exists() else {}
+    feasibility = float(pd.to_numeric(df.get("feasible"), errors="coerce").fillna(0).astype(bool).mean()) if not df.empty else np.nan
+    row = {
+        "backend": "inverse_direct",
+        "predictions_path": str(path),
+        "metrics_path": str(metrics_path) if metrics_path.exists() else "",
+        "rows": int(len(df)),
+        "feasibility_rate": feasibility,
+        "mean_score": float(pd.to_numeric(df.get("score"), errors="coerce").mean()) if "score" in df.columns and len(df) else np.nan,
+    }
+    target_mae = payload.get("target_mae_recheck", {})
+    for key, value in target_mae.items():
+        row[f"recheck_mae::{key}"] = value
+    categorical_accuracy = payload.get("categorical_accuracy", {})
+    for key, value in categorical_accuracy.items():
+        row[f"categorical_accuracy::{key}"] = value
+    return row
+
+
+def build_inverse_benchmarks(
+    shortlists: Dict[str, pd.DataFrame],
+    pools: Dict[str, pd.DataFrame],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    optimizer_rows: List[dict] = []
+    direct_rows: List[dict] = []
     shortlist_by_backend = {
         infer_inverse_backend(Path(path_str), df): (Path(path_str), df)
         for path_str, df in shortlists.items()
@@ -168,6 +221,10 @@ def build_inverse_benchmark(shortlists: Dict[str, pd.DataFrame], pools: Dict[str
         reference = shortlist if shortlist is not None else pool
         if reference is None or reference.empty:
             continue
+        if backend == "inverse_direct":
+            source_path, source_df = shortlist_entry if shortlist_entry is not None else pool_entry
+            direct_rows.append(_load_inverse_direct_row(str(source_path), source_df))
+            continue
 
         shortlist_df = shortlist if shortlist is not None else reference
         pool_df = pool if pool is not None else reference
@@ -177,7 +234,7 @@ def build_inverse_benchmark(shortlists: Dict[str, pd.DataFrame], pools: Dict[str
         shortlist_feasible_df = shortlist_df.loc[shortlist_feasible] if not shortlist_feasible.empty else shortlist_df.iloc[0:0]
         pool_feasible_df = pool_df.loc[pool_feasible] if not pool_feasible.empty else pool_df.iloc[0:0]
 
-        rows.append({
+        optimizer_rows.append({
             "backend": backend,
             "shortlist_path": str(shortlist_entry[0]) if shortlist_entry is not None else "",
             "pool_path": str(pool_entry[0]) if pool_entry is not None else "",
@@ -195,9 +252,9 @@ def build_inverse_benchmark(shortlists: Dict[str, pd.DataFrame], pools: Dict[str
             "interval_width_total_mean_pool": float(pd.to_numeric(pool_df.get("interval_width_total"), errors="coerce").mean()) if "interval_width_total" in pool_df.columns and len(pool_df) else np.nan,
             "selection_mode": str(shortlist_df.get("selection_mode", pd.Series(["shortlist"])).iloc[0]) if len(shortlist_df) else "shortlist",
         })
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values("backend").reset_index(drop=True)
+    optimizer_df = pd.DataFrame(optimizer_rows).sort_values("backend").reset_index(drop=True) if optimizer_rows else pd.DataFrame()
+    direct_df = pd.DataFrame(direct_rows).sort_values("backend").reset_index(drop=True) if direct_rows else pd.DataFrame()
+    return optimizer_df, direct_df
 
 
 def print_forward_summary(df: pd.DataFrame) -> None:
@@ -210,70 +267,92 @@ def print_forward_summary(df: pd.DataFrame) -> None:
         if target_df.empty:
             continue
         print(f"  {target}")
-        for _, row in target_df.sort_values("R2_oof", ascending=False).iterrows():
+        sort_column = "R2_holdout" if target_df["R2_holdout"].notna().any() else "R2_oof"
+        for _, row in target_df.sort_values(sort_column, ascending=False).iterrows():
             coverage = row["interval_coverage"]
             coverage_str = "NA" if pd.isna(coverage) else f"{coverage:.3f}"
+            holdout_str = "NA" if pd.isna(row["R2_holdout"]) else f"{row['R2_holdout']:.4f}"
             print(
                 f"    {row['backend']}: "
                 f"R2_oof={row['R2_oof']:.4f} "
                 f"RMSE_oof={row['RMSE_oof']:.4f} "
                 f"R2_prod={row['R2_production']:.4f} "
+                f"R2_holdout={holdout_str} "
                 f"coverage={coverage_str}"
             )
 
 
-def print_inverse_summary(df: pd.DataFrame) -> None:
-    if df.empty:
+def print_inverse_summary(optimizer_df: pd.DataFrame, direct_df: pd.DataFrame) -> None:
+    if optimizer_df.empty and direct_df.empty:
         print("Inverse benchmark: no runs found")
         return
-    print("Inverse benchmark:")
-    for _, row in df.sort_values("best_score_pool").iterrows():
-        print(
-            f"  {row['backend']}: "
-            f"pool={int(row['pool_size'])} "
-            f"shortlist={int(row['shortlist_size'])} "
-            f"feasible_pool={row['pool_feasibility_rate']:.3f} "
-            f"best_score={row['best_score_pool']:.4f} "
-            f"chemistries={int(row['unique_chemistries_shortlist'])} "
-            f"processes={int(row['unique_processes_shortlist'])}"
-        )
+    if not optimizer_df.empty:
+        print("Inverse optimizer benchmark:")
+        for _, row in optimizer_df.sort_values("best_score_pool").iterrows():
+            print(
+                f"  {row['backend']}: "
+                f"pool={int(row['pool_size'])} "
+                f"shortlist={int(row['shortlist_size'])} "
+                f"feasible_pool={row['pool_feasibility_rate']:.3f} "
+                f"best_score={row['best_score_pool']:.4f} "
+                f"chemistries={int(row['unique_chemistries_shortlist'])} "
+                f"processes={int(row['unique_processes_shortlist'])}"
+            )
+    if not direct_df.empty:
+        print("Direct inverse benchmark:")
+        for _, row in direct_df.iterrows():
+            print(
+                f"  {row['backend']}: "
+                f"rows={int(row['rows'])} "
+                f"feasibility={row['feasibility_rate']:.3f} "
+                f"mean_score={row['mean_score']:.4f}"
+            )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Aggregate wave 2 forward and inverse benchmark artifacts.")
     parser.add_argument("--forward-models", nargs="+", default=DEFAULT_FORWARD_PATHS)
+    parser.add_argument("--forward-holdouts", nargs="+", default=DEFAULT_FORWARD_HOLDOUT_PATHS)
     parser.add_argument("--inverse-shortlists", nargs="+", default=DEFAULT_INVERSE_SHORTLISTS)
     parser.add_argument("--inverse-pools", nargs="+", default=DEFAULT_INVERSE_POOLS)
     parser.add_argument("--output-dir", type=str, default="artifacts/wave2_benchmark")
     args = parser.parse_args()
 
     forward_runs = load_forward_runs(args.forward_models)
-    forward_benchmark = build_forward_benchmark(forward_runs)
+    forward_holdouts = load_forward_holdouts(args.forward_holdouts)
+    forward_benchmark = build_forward_benchmark(forward_runs, forward_holdouts)
 
     inverse_shortlists = _read_existing_csvs(args.inverse_shortlists)
     inverse_pools = _read_existing_csvs(args.inverse_pools)
-    inverse_benchmark = build_inverse_benchmark(inverse_shortlists, inverse_pools)
+    inverse_optimizer_benchmark, inverse_direct_benchmark = build_inverse_benchmarks(inverse_shortlists, inverse_pools)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     forward_path = output_dir / "forward_benchmark.csv"
     inverse_path = output_dir / "inverse_benchmark.csv"
+    inverse_optimizer_path = output_dir / "inverse_optimizer_benchmark.csv"
+    inverse_direct_path = output_dir / "inverse_direct_benchmark.csv"
     summary_path = output_dir / "benchmark_summary.json"
 
     forward_benchmark.to_csv(forward_path, index=False)
-    inverse_benchmark.to_csv(inverse_path, index=False)
+    inverse_optimizer_benchmark.to_csv(inverse_path, index=False)
+    inverse_optimizer_benchmark.to_csv(inverse_optimizer_path, index=False)
+    inverse_direct_benchmark.to_csv(inverse_direct_path, index=False)
     summary = {
         "forward_rows": int(len(forward_benchmark)),
-        "inverse_rows": int(len(inverse_benchmark)),
+        "inverse_optimizer_rows": int(len(inverse_optimizer_benchmark)),
+        "inverse_direct_rows": int(len(inverse_direct_benchmark)),
         "forward_backends": sorted(forward_benchmark["backend"].dropna().astype(str).unique().tolist()) if not forward_benchmark.empty else [],
-        "inverse_backends": sorted(inverse_benchmark["backend"].dropna().astype(str).unique().tolist()) if not inverse_benchmark.empty else [],
+        "inverse_optimizer_backends": sorted(inverse_optimizer_benchmark["backend"].dropna().astype(str).unique().tolist()) if not inverse_optimizer_benchmark.empty else [],
+        "inverse_direct_backends": sorted(inverse_direct_benchmark["backend"].dropna().astype(str).unique().tolist()) if not inverse_direct_benchmark.empty else [],
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print_forward_summary(forward_benchmark)
-    print_inverse_summary(inverse_benchmark)
+    print_inverse_summary(inverse_optimizer_benchmark, inverse_direct_benchmark)
     print(f"Saved forward benchmark to {forward_path}")
-    print(f"Saved inverse benchmark to {inverse_path}")
+    print(f"Saved inverse optimizer benchmark to {inverse_path}")
+    print(f"Saved inverse direct benchmark to {inverse_direct_path}")
     print(f"Saved summary to {summary_path}")
 
 

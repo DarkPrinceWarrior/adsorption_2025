@@ -18,7 +18,7 @@
 
 * **Forward:** `CatBoost`
 * **UQ:** `MAPIE`
-* **Inverse:** `BoFire`
+* **Inverse:** `BoFire` (native strategy loop)
 
 ### Статус остальных веток
 
@@ -38,6 +38,7 @@
 Дополнительно:
 
 * у `CatBoost` уже встроен production-ready interval UQ через `MAPIE`
+* внешний `chemistry-split` holdout используется как основной внешний критерий forward-сравнения
 * `TabPFN` тяжелее operationally и не даёт преимущества на текущем датасете
 
 ## Почему выбран BoFire
@@ -48,7 +49,7 @@
 * `BoTorch best_score_pool = 0.1783`
 * `BayBE best_score_pool = 0.1842`
 
-У всех трёх backend-ов feasibility была `1.0`, но `BoFire` дал лучший score и остаётся самым практичным production optimizer.
+У всех трёх backend-ов feasibility была `1.0`, но `BoFire` дал лучший score и после wave 3 остаётся canonical native production optimizer. Historical wrapper `BoFire domain + Optuna` сохранён отдельно как `run_bofire_optuna_legacy.py`.
 
 ## Почему direct inverse не выбран как основной путь
 
@@ -67,8 +68,9 @@
 Если нужна рабочая схема сейчас:
 
 1. обучать production forward pipeline на `CatBoost`
-2. валидировать интервалы через `validate_uncertainty.py`
-3. подбирать рецепты через `run_bofire_opt.py`
+2. валидировать internal CV calibration через `validate_uncertainty.py`
+3. проверять внешний split через `evaluate_forward_holdout.py`
+4. подбирать рецепты через `run_bofire_opt.py`
 
 Остальные ветки сохраняются в репозитории как:
 

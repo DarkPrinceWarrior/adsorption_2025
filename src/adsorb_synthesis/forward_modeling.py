@@ -109,6 +109,19 @@ def prepare_tabpfn_regression_frame(
     return numeric_frame, list(numeric_frame.columns), dropped_constant
 
 
+def prepare_tabpfn_inference_frame(
+    X: pd.DataFrame,
+    feature_columns: Sequence[str],
+) -> pd.DataFrame:
+    """Align an inference frame to the numeric feature columns used during training."""
+    numeric_frame = X.loc[:, [column for column in feature_columns if column in X.columns]].copy()
+    for column in numeric_frame.columns:
+        if pd.api.types.is_bool_dtype(numeric_frame[column]):
+            numeric_frame[column] = numeric_frame[column].astype(float)
+    numeric_frame = numeric_frame.apply(pd.to_numeric, errors="coerce")
+    return numeric_frame.reindex(columns=list(feature_columns))
+
+
 class PrecomputedSplitCV(BaseCrossValidator):
     """A lightweight cross-validator backed by already-materialized splits."""
 
