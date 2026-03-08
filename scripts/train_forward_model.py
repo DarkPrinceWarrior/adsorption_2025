@@ -1,289 +1,308 @@
 #!/usr/bin/env python3
-"""
-Train the Forward Model (Simulator) for Bayesian Optimization.
+"""Train forward models with nested feature selection and CV-based intervals."""
 
-This script implements 'Stage 2: Forward Model Creation' from the BO plan.
-It trains separate CatBoost regressors for each target property:
-Recipe (Inputs) -> Physical Properties (Outputs).
-"""
+from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
-from typing import Dict
-import numpy as np
-
-# Add src to path to import project modules
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
+from typing import Dict, List, Tuple
 
 import joblib
+import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from mapie.regression import CrossConformalRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import StratifiedKFold
 
-from adsorb_synthesis.data_processing import load_dataset, build_lookup_tables, prepare_forward_dataset
-from adsorb_synthesis.constants import RANDOM_SEED, FORWARD_MODEL_TARGETS, RARE_METALS_THRESHOLD
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
+
 from adsorb_synthesis.config import FORWARD_MODEL_CONFIG, get_catboost_config
-from adsorb_synthesis.feature_selection import (
-    select_features_advanced,
-    get_curated_features
+from adsorb_synthesis.constants import FORWARD_MODEL_TARGETS, RANDOM_SEED
+from adsorb_synthesis.data_processing import (
+    build_lookup_tables,
+    load_dataset,
+    prepare_forward_dataset,
 )
-from adsorb_synthesis.physics_losses import compute_physics_penalty
+from adsorb_synthesis.forward_modeling import (
+    PrecomputedSplitCV,
+    SelectedFeatureCatBoostRegressor,
+    build_stratification_key,
+    compute_quality_weights,
+    select_curated_features,
+)
+
+
+def _override_iterations(params: Dict, iterations: int | None) -> Dict:
+    updated = dict(params)
+    if iterations is not None:
+        updated["iterations"] = iterations
+    return updated
+
+
+def _feature_selection_for_fold(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    categorical_cols: List[str],
+    *,
+    use_feature_selection: bool,
+) -> Tuple[List[str], Dict]:
+    if not use_feature_selection:
+        return list(X_train.columns), {"removed_correlation": [], "removed_vif": []}
+    return select_curated_features(
+        X_train,
+        y_train,
+        categorical_cols,
+        corr_threshold=FORWARD_MODEL_CONFIG.feature_selection_corr_threshold,
+        vif_threshold=FORWARD_MODEL_CONFIG.feature_selection_vif_threshold,
+        max_features=FORWARD_MODEL_CONFIG.feature_selection_max_features,
+        verbose=False,
+    )
 
 
 def train_forward_models(
     data_path: str,
     output_dir: str,
-    test_size: float = 0.2,
-    iterations: int = 1000,
-    validation_mode: str = "warn"
-):
+    *,
+    iterations: int | None = None,
+    validation_mode: str = "warn",
+    use_feature_selection: bool = True,
+) -> None:
     print(f"Loading dataset from {data_path}...")
-    # Load raw data with standard enrichment
     df_raw = load_dataset(data_path, validation_mode=validation_mode)
-    
-    # Build lookups for descriptors (Metal, Ligand, Solvent)
     lookup_tables = build_lookup_tables(df_raw)
-    
-    # Prepare X (Recipe) and y (Properties) specifically for the Forward Model
-    print("Preparing Forward Model dataset (Data Flip)...")
     X, y = prepare_forward_dataset(df_raw, lookup_tables=lookup_tables)
-    
-    print(f"Dataset shape: X={X.shape}, y={y.shape}")
-    print(f"Features in X: {list(X.columns)}")
-    
-    # Identify categorical features for CatBoost
+
     cat_features = [col for col in X.columns if X[col].dtype.name in ['object', 'category']]
-    print(f"Categorical features found: {cat_features}")
-    
-    metrics = {}
-    models = {} # target -> list of model paths
+    sample_weights = compute_quality_weights(
+        df_raw.reindex(X.index),
+        penalty_weight=FORWARD_MODEL_CONFIG.physics_penalty_weight,
+        minimum_weight=FORWARD_MODEL_CONFIG.minimum_sample_weight,
+    ).to_numpy(dtype=float)
+
     os.makedirs(output_dir, exist_ok=True)
-    calibrators = {}
-    
-    # CV ensemble parameters (from config)
-    n_splits = FORWARD_MODEL_CONFIG.n_ensemble_splits
-    PHYSICS_PENALTY_WEIGHT = FORWARD_MODEL_CONFIG.physics_penalty_weight
-    
+    metrics: Dict[str, Dict] = {}
+    uq_models: Dict[str, object] = {}
+    feature_meta: Dict[str, Dict] = {
+        "all_feature_names": list(X.columns),
+        "categorical_features": cat_features,
+        "targets": {},
+    }
+
     for target in FORWARD_MODEL_TARGETS:
-        print(f"\n=== Training ENSEMBLE for target: {target} ===")
-        
         if target not in y.columns:
-            print(f"Skipping {target}: not found in targets.")
+            print(f"Skipping {target}: target not present in dataset.")
             continue
 
+        print(f"\n=== Training target: {target} ===")
         y_target = y[target]
-
-        # Stratification key (Metal + target bins)
-        if 'Металл' in X.columns:
-            metal_counts = X['Металл'].value_counts()
-            rare_metals = metal_counts[metal_counts < RARE_METALS_THRESHOLD].index.tolist()
-            metal_group = X['Металл'].apply(lambda m: 'Other' if m in rare_metals else m)
-        else:
-            metal_group = pd.Series(['Unknown'] * len(X), index=X.index)
-        try:
-            target_bins = pd.qcut(y_target, q=4, labels=['Q1', 'Q2', 'Q3', 'Q4'], duplicates='drop')
-        except ValueError:
-            target_bins = pd.Series(['All'] * len(y_target), index=y_target.index)
-        strat_key = metal_group.astype(str) + '_' + target_bins.astype(str)
-
-        # Physics penalty as sample weight proxy
-        physics_penalty = compute_physics_penalty(df_raw)
-        physics_penalty = physics_penalty.reindex(X.index).fillna(0.0)
-        sample_weights_full = 1.0 + PHYSICS_PENALTY_WEIGHT * physics_penalty.values
-        print(f"  Mean physics penalty weight: {np.mean(sample_weights_full):.3f}")
-        
-        # Create CV splits BEFORE feature selection to avoid data leakage.
-        # Feature selection will only see fold-0's training data.
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
-        cv_splits = list(skf.split(X, strat_key))
-        fs_train_idx = cv_splits[0][0]  # fold-0 train indices for feature selection
-
-        # Feature Selection (on fold-0 train data only — no leakage)
-        print(f"  Advanced Feature Selection for {target} (on fold-0 train, n={len(fs_train_idx)})...")
-        keep_features, drop_features = get_curated_features()
-        available_drop = [f for f in drop_features if f in X.columns]
-        numeric_cols = [c for c in X.columns if c not in cat_features]
-        curated_numeric = [c for c in numeric_cols if c not in available_drop]
-        selected_features, selection_report = select_features_advanced(
-            X.iloc[fs_train_idx][cat_features + curated_numeric],
-            y_target.iloc[fs_train_idx],
-            categorical_cols=cat_features,
-            corr_threshold=FORWARD_MODEL_CONFIG.feature_selection_corr_threshold,
-            vif_threshold=FORWARD_MODEL_CONFIG.feature_selection_vif_threshold,
-            max_features=FORWARD_MODEL_CONFIG.feature_selection_max_features,
-            verbose=False
+        strat_key = build_stratification_key(X, y_target)
+        outer_cv = StratifiedKFold(
+            n_splits=FORWARD_MODEL_CONFIG.n_ensemble_splits,
+            shuffle=True,
+            random_state=RANDOM_SEED,
         )
-        n_removed = len(selection_report['removed_correlation']) + len(selection_report['removed_vif'])
-        print(f"    Removed {n_removed} multicollinear features")
-        print(f"    Selected {len(selected_features)} features: {selected_features[:5]}...")
-        cat_features_sel = [c for c in selected_features if c in cat_features]
-
-        # Per-target tuned hyperparameters (falls back to default if not tuned)
-        cb_config = get_catboost_config(target)
-        print(f"  CatBoost config: iter={cb_config.iterations}, lr={cb_config.learning_rate}, "
-              f"depth={cb_config.depth}")
-
-        # =====================================================================
-        # Phase 1: CV loop — honest OOF metrics (fold models are temporary)
-        # =====================================================================
+        cv_splits = list(outer_cv.split(X, strat_key))
         oof_preds = np.full(len(X), np.nan, dtype=float)
+        fold_ids = np.full(len(X), -1, dtype=int)
+        fold_feature_sets: List[List[str]] = []
+        removed_corr_total = 0
+        removed_vif_total = 0
 
-        for fold_idx, (train_idx, val_idx) in enumerate(cv_splits):
-            seed = RANDOM_SEED + fold_idx
-            print(f"  CV Fold {fold_idx+1}/{n_splits} (seed={seed})...")
-            X_train_sel = X.iloc[train_idx][selected_features]
-            X_val_sel = X.iloc[val_idx][selected_features]
-            y_train_target = y_target.iloc[train_idx]
-            y_val_target = y_target.iloc[val_idx]
-            w_train = sample_weights_full[train_idx]
+        cb_params = _override_iterations(
+            get_catboost_config(target).to_params(random_state=RANDOM_SEED),
+            iterations,
+        )
+        cb_params.pop("random_seed", None)
+        cb_params["verbose"] = False
+        cb_params["allow_writing_files"] = False
 
-            fold_model = CatBoostRegressor(
-                **cb_config.to_params(random_state=seed),
-                cat_features=cat_features_sel
+        for fold_idx, (train_idx, valid_idx) in enumerate(cv_splits):
+            X_train = X.iloc[train_idx]
+            y_train = y_target.iloc[train_idx]
+            X_valid = X.iloc[valid_idx]
+            y_valid = y_target.iloc[valid_idx]
+            selected_features, selection_report = _feature_selection_for_fold(
+                X_train,
+                y_train,
+                cat_features,
+                use_feature_selection=use_feature_selection,
             )
-            fold_model.fit(
-                X_train_sel, y_train_target,
-                sample_weight=w_train,
-                eval_set=(X_val_sel, y_val_target),
-                early_stopping_rounds=FORWARD_MODEL_CONFIG.early_stopping_rounds,
-                use_best_model=True
-            )
-            oof_preds[val_idx] = fold_model.predict(X_val_sel)
+            fold_feature_sets.append(selected_features)
+            removed_corr_total += len(selection_report.get("removed_correlation", []))
+            removed_vif_total += len(selection_report.get("removed_vif", []))
+            selected_cat_features = [feature for feature in selected_features if feature in cat_features]
 
-        r2_oof = r2_score(y_target, oof_preds)
-        rmse_oof = np.sqrt(mean_squared_error(y_target, oof_preds))
-        mae_oof = mean_absolute_error(y_target, oof_preds)
-        print(f"  CV OOF R2: {r2_oof:.4f}, RMSE: {rmse_oof:.4f}, MAE: {mae_oof:.4f}")
-
-        # =====================================================================
-        # Phase 2: Production Deep Ensemble — N models on 100% data
-        # =====================================================================
-        n_members = FORWARD_MODEL_CONFIG.n_ensemble_members
-        seed_step = FORWARD_MODEL_CONFIG.ensemble_seed_step
-        print(f"  Training production ensemble ({n_members} members on full data)...")
-        safe_target = target.replace('/', '_').replace(' ', '_')
-        model_paths = []
-        prod_models = []
-
-        for m_idx in range(n_members):
-            seed = RANDOM_SEED + (m_idx + 1) * seed_step
             model = CatBoostRegressor(
-                **cb_config.to_params(random_state=seed),
-                cat_features=cat_features_sel
+                **cb_params,
+                random_seed=RANDOM_SEED + fold_idx,
+                cat_features=selected_cat_features,
             )
             model.fit(
-                X[selected_features], y_target,
-                sample_weight=sample_weights_full,
+                X_train[selected_features],
+                y_train,
+                sample_weight=sample_weights[train_idx],
+                eval_set=(X_valid[selected_features], y_valid),
+                early_stopping_rounds=FORWARD_MODEL_CONFIG.early_stopping_rounds,
+                use_best_model=True,
             )
-            model_path = os.path.join(output_dir, f"catboost_{safe_target}_ens{m_idx}.cbm")
+            oof_preds[valid_idx] = model.predict(X_valid[selected_features])
+            fold_ids[valid_idx] = fold_idx
+
+        r2_oof = r2_score(y_target, oof_preds)
+        rmse_oof = float(np.sqrt(mean_squared_error(y_target, oof_preds)))
+        mae_oof = float(mean_absolute_error(y_target, oof_preds))
+        print(f"  OOF R2={r2_oof:.4f} RMSE={rmse_oof:.4f} MAE={mae_oof:.4f}")
+
+        selected_features_full, full_selection_report = _feature_selection_for_fold(
+            X,
+            y_target,
+            cat_features,
+            use_feature_selection=use_feature_selection,
+        )
+        selected_cat_full = [feature for feature in selected_features_full if feature in cat_features]
+
+        production_models = []
+        model_paths = []
+        safe_target = target.replace('/', '_').replace(' ', '_')
+        for member_idx in range(FORWARD_MODEL_CONFIG.n_ensemble_members):
+            member_seed = RANDOM_SEED + (member_idx + 1) * FORWARD_MODEL_CONFIG.ensemble_seed_step
+            model = CatBoostRegressor(
+                **cb_params,
+                random_seed=member_seed,
+                cat_features=selected_cat_full,
+            )
+            model.fit(
+                X[selected_features_full],
+                y_target,
+                sample_weight=sample_weights,
+            )
+            model_path = os.path.join(output_dir, f"catboost_{safe_target}_ens{member_idx}.cbm")
             model.save_model(model_path)
+            production_models.append(model)
             model_paths.append(model_path)
-            prod_models.append(model)
 
-        # Production ensemble predictions (on training data — for diagnostics)
-        prod_preds = np.stack([m.predict(X[selected_features]) for m in prod_models], axis=1)
-        prod_mean = np.mean(prod_preds, axis=1)
-        prod_sigma = np.std(prod_preds, axis=1)
-
+        prod_predictions = np.stack(
+            [model.predict(X[selected_features_full]) for model in production_models],
+            axis=1,
+        )
+        prod_mean = prod_predictions.mean(axis=1)
         r2_prod = r2_score(y_target, prod_mean)
-        rmse_prod = np.sqrt(mean_squared_error(y_target, prod_mean))
-        mae_prod = mean_absolute_error(y_target, prod_mean)
-        print(f"  Production Ensemble R2: {r2_prod:.4f}, RMSE: {rmse_prod:.4f}, MAE: {mae_prod:.4f}")
-        print(f"  Avg Ensemble σ: {np.mean(prod_sigma):.4f}")
+        rmse_prod = float(np.sqrt(mean_squared_error(y_target, prod_mean)))
+        mae_prod = float(mean_absolute_error(y_target, prod_mean))
 
-        models[target] = model_paths
+        if use_feature_selection:
+            estimator = SelectedFeatureCatBoostRegressor(
+                catboost_params=cb_params,
+                categorical_cols=cat_features,
+                corr_threshold=FORWARD_MODEL_CONFIG.feature_selection_corr_threshold,
+                vif_threshold=FORWARD_MODEL_CONFIG.feature_selection_vif_threshold,
+                max_features=FORWARD_MODEL_CONFIG.feature_selection_max_features,
+            )
+        else:
+            estimator = SelectedFeatureCatBoostRegressor(
+                catboost_params=cb_params,
+                categorical_cols=cat_features,
+                corr_threshold=1.0,
+                vif_threshold=float("inf"),
+                max_features=max(1, len(X.columns)),
+            )
 
-        # =====================================================================
-        # Phase 3: Conformal calibration from OOF residuals
-        # =====================================================================
-        alpha = FORWARD_MODEL_CONFIG.conformal_alpha
-        oof_residuals = np.abs(y_target.values - oof_preds)
-        # Normalized scores: honest residual / production sigma
-        eps = 1e-8
-        norm_scores = oof_residuals / (prod_sigma + eps)
-        # Finite-sample corrected quantile (Vovk et al.)
-        n_cal = len(norm_scores)
-        q_level = min((1 - alpha) * (1 + 1 / n_cal), 1.0)
-        conformal_q = float(np.quantile(norm_scores, q_level))
+        confidence_level = 1.0 - FORWARD_MODEL_CONFIG.conformal_alpha
+        uq_model = CrossConformalRegressor(
+            estimator=estimator,
+            confidence_level=confidence_level,
+            method=FORWARD_MODEL_CONFIG.mapie_method,
+            cv=PrecomputedSplitCV(cv_splits),
+            random_state=RANDOM_SEED,
+        )
+        uq_model.fit_conformalize(
+            X,
+            y_target,
+            fit_params={"sample_weight": sample_weights},
+        )
+        interval_center, interval_bounds = uq_model.predict_interval(X, aggregate_predictions="mean")
+        interval_bounds = np.asarray(interval_bounds, dtype=float).squeeze(-1)
+        y_lo = interval_bounds[:, 0]
+        y_hi = interval_bounds[:, 1]
+        interval_width = y_hi - y_lo
+        coverage = float(np.mean((y_target.to_numpy(dtype=float) >= y_lo) & (y_target.to_numpy(dtype=float) <= y_hi)))
+        uq_models[target] = uq_model
 
-        # Marginal (non-normalized) quantile as fallback
-        marginal_q = float(np.quantile(oof_residuals, q_level))
-
-        print(f"  Conformal quantile (α={alpha}): q={conformal_q:.4f} "
-              f"(marginal={marginal_q:.4f})")
-
-        calibrators[target] = {
-            "type": "conformal",
-            "conformal_q": conformal_q,
-            "marginal_q": marginal_q,
-            "alpha": alpha,
-            "n_calibration": n_cal,
-        }
-
-        # Save predictions (OOF + production)
         predictions_df = pd.DataFrame({
-            'y_actual': y_target.values,
-            'y_oof': oof_preds,
-            'y_prod_mean': prod_mean,
-            'y_prod_sigma': prod_sigma,
-            'oof_residual': oof_residuals,
-            'norm_score': norm_scores,
+            "y_actual": y_target.to_numpy(dtype=float),
+            "y_oof": oof_preds,
+            "fold_id": fold_ids,
+            "y_prod_mean": prod_mean,
+            "y_interval_center": np.asarray(interval_center, dtype=float),
+            "y_lo": y_lo,
+            "y_hi": y_hi,
+            "interval_width": interval_width,
         })
         predictions_path = os.path.join(output_dir, f"predictions_{safe_target}.csv")
         predictions_df.to_csv(predictions_path, index=False)
-        print(f"  Saved predictions: {predictions_path}")
 
-        physics_features = [f for f in selected_features if any(x in f for x in 
-            ['metal_coord', 'ligand_3d', 'ligand_2d', 'Size_Ratio', 'Electronegativity_Diff', 'Jahn_Teller'])]
-
+        feature_meta["targets"][target] = {
+            "selected_features": selected_features_full,
+            "categorical_features": selected_cat_full,
+            "model_paths": model_paths,
+        }
         metrics[target] = {
-            "R2": r2_oof,
-            "R2_oof": r2_oof,
-            "R2_production": r2_prod,
+            "R2": float(r2_oof),
+            "R2_oof": float(r2_oof),
             "RMSE": rmse_oof,
-            "MAE": mae_oof,
             "RMSE_oof": rmse_oof,
+            "MAE": mae_oof,
             "MAE_oof": mae_oof,
+            "R2_production": float(r2_prod),
             "RMSE_production": rmse_prod,
             "MAE_production": mae_prod,
-            "selected_features": selected_features,
-            "physics_features": physics_features,
-            "n_removed_multicollinear": n_removed,
-            "Ensemble_Sigma_Mean": float(np.mean(prod_sigma)),
-            "Conformal_q": conformal_q,
-            "Conformal_alpha": alpha,
-            "cv_folds": n_splits,
-            "ensemble_members": n_members,
+            "selected_features": selected_features_full,
+            "fold_feature_sets": fold_feature_sets,
+            "n_removed_multicollinear_oof": int(removed_corr_total + removed_vif_total),
+            "n_removed_multicollinear_full": int(
+                len(full_selection_report.get("removed_correlation", []))
+                + len(full_selection_report.get("removed_vif", []))
+            ),
+            "interval_confidence_level": confidence_level,
+            "interval_coverage": coverage,
+            "interval_width_mean": float(np.mean(interval_width)),
+            "cv_folds": FORWARD_MODEL_CONFIG.n_ensemble_splits,
+            "ensemble_members": FORWARD_MODEL_CONFIG.n_ensemble_members,
         }
 
-    # Save metrics summary
-    metrics_path = os.path.join(output_dir, "metrics.json")
-    with open(metrics_path, 'w', encoding='utf-8') as f:
-        json.dump(metrics, f, indent=4, ensure_ascii=False)
-    # Save uncertainty calibrators (if any)
-    if 'calibrators' in locals():
-        joblib.dump(calibrators, os.path.join(output_dir, "uncertainty_calibrators.joblib"))
-        
-    print(f"\nTraining complete. Models saved to {output_dir}")
-    
-    # Save feature names to ensure consistent inference later
-    feature_meta = {
-        "feature_names": list(X.columns),
-        "cat_features": cat_features
-    }
+        print(
+            f"  Production R2={r2_prod:.4f} RMSE={rmse_prod:.4f} "
+            f"coverage={coverage:.1%} width={np.mean(interval_width):.4f}"
+        )
+
+    with open(os.path.join(output_dir, "metrics.json"), "w", encoding="utf-8") as handle:
+        json.dump(metrics, handle, indent=2, ensure_ascii=False)
+    joblib.dump(uq_models, os.path.join(output_dir, "uncertainty_calibrators.joblib"))
     joblib.dump(feature_meta, os.path.join(output_dir, "feature_meta.joblib"))
+    print(f"\nTraining complete. Models and intervals saved to {output_dir}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Forward Models for Adsorbent Synthesis")
-    parser.add_argument("--data", type=str, default="data/SEC_SYN_with_features_enriched.csv", help="Path to input CSV")
-    parser.add_argument("--output", type=str, default="artifacts/forward_models", help="Directory to save models")
-    parser.add_argument("--iterations", type=int, default=1000, help="CatBoost iterations")
-    parser.add_argument("--no-feature-selection", action="store_true", help="Disable feature selection, use all features")
-    parser.add_argument("--validation-mode", type=str, default="warn", choices=["warn", "strict"], help="Validation mode for dataset loading")
-    
+    parser = argparse.ArgumentParser(description="Train forward models for adsorbent synthesis.")
+    parser.add_argument("--data", type=str, default="data/SEC_SYN_with_features_enriched.csv")
+    parser.add_argument("--output", type=str, default="artifacts/forward_models")
+    parser.add_argument("--iterations", type=int, default=None, help="Override CatBoost iterations.")
+    parser.add_argument("--no-feature-selection", action="store_true")
+    parser.add_argument(
+        "--validation-mode",
+        type=str,
+        default="warn",
+        choices=["warn", "strict"],
+    )
     args = parser.parse_args()
-    
-    train_forward_models(args.data, args.output, iterations=args.iterations, validation_mode=args.validation_mode)
+
+    train_forward_models(
+        args.data,
+        args.output,
+        iterations=args.iterations,
+        validation_mode=args.validation_mode,
+        use_feature_selection=not args.no_feature_selection,
+    )

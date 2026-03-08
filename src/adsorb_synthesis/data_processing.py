@@ -128,10 +128,19 @@ def prepare_forward_dataset(
     
     # 4b. Copy NEW physicochemical descriptors if present in df
     # These are computed by scripts/enrich_descriptors.py
-    new_descriptor_cols = METAL_COORD_FEATURES + LIGAND_3D_FEATURES + LIGAND_2D_FEATURES + INTERACTION_FEATURES
+    new_descriptor_cols = METAL_COORD_FEATURES + LIGAND_3D_FEATURES + LIGAND_2D_FEATURES
     for col in new_descriptor_cols:
         if col in df.columns and col not in X.columns:
             X[col] = df.loc[X.index, col].values
+
+    add_interaction_features(X, inplace=True)
+    for col in INTERACTION_FEATURES:
+        if col in df.columns:
+            if col not in X.columns:
+                X[col] = df.loc[X.index, col].values
+            else:
+                fallback_values = df.loc[X.index, col].values
+                X[col] = X[col].where(X[col].notna(), fallback_values)
             
     # 5. Prepare Targets
     missing_targets = [col for col in FORWARD_MODEL_TARGETS if col not in df.columns]
@@ -181,6 +190,7 @@ def load_dataset(
     
     add_solvent_polar_descriptors(df)
     add_physicochemical_descriptors(df)
+    add_interaction_features(df)
 
     validate_SEH_data(df, mode=validation_mode)
     validate_synthesis_data(df, boiling_points=SOLVENT_BOILING_POINTS_C, mode=validation_mode)
@@ -409,7 +419,7 @@ def build_lookup_tables(df: pd.DataFrame, include_extended: bool = True) -> Look
     Args:
         df: Dataset with all descriptor columns.
         include_extended: If True, include advanced features (METAL_COORD_FEATURES,
-            INTERACTION_FEATURES).  LIGAND_3D/2D features are included
+            interaction features are computed row-wise later. LIGAND_3D/2D features are included
             opportunistically but no longer required (P4.1).
     
     Returns:
@@ -431,12 +441,6 @@ def build_lookup_tables(df: pd.DataFrame, include_extended: bool = True) -> Look
         for feat in LIGAND_3D_FEATURES + LIGAND_2D_FEATURES:
             if feat in df.columns:
                 ligand_features.append(feat)
-        # Add interaction features (need both metal and ligand for context)
-        for feat in INTERACTION_FEATURES:
-            if feat in df.columns:
-                # Interaction features go to metal table (primary key)
-                metal_features.append(feat)
-    
     # Remove duplicates while preserving order
     metal_features = list(dict.fromkeys(metal_features))
     ligand_features = list(dict.fromkeys(ligand_features))
@@ -451,10 +455,10 @@ def build_lookup_tables(df: pd.DataFrame, include_extended: bool = True) -> Look
         if cols:
             raise ValueError(f"Dataset is missing required columns {sorted(cols)} for {entity} lookup")
     if include_extended:
-        # P4.1: Only metal_coord and interaction are required; ligand_3d/2d are optional
+        # P4.1: Only metal_coord is required for lookup construction; interaction
+        # features are recomputed row-wise after lookup merges.
         missing_extended: Dict[str, Iterable[str]] = {
             "metal_coord": _missing_columns(df, METAL_COORD_FEATURES),
-            "interaction": _missing_columns(df, INTERACTION_FEATURES),
         }
         missing_block = {k: v for k, v in missing_extended.items() if v}
         if missing_block:
@@ -626,6 +630,37 @@ def add_physicochemical_descriptors(df: pd.DataFrame, *, inplace: bool = True) -
         
         df['Reactor_Loading_g_mL'] = (m_salt + m_acid) / vol_ml
     
+    if not inplace:
+        return df
+    return None
+
+
+@overload
+def add_interaction_features(df: pd.DataFrame, *, inplace: Literal[True] = ...) -> None: ...
+@overload
+def add_interaction_features(df: pd.DataFrame, *, inplace: Literal[False]) -> pd.DataFrame: ...
+
+def add_interaction_features(df: pd.DataFrame, *, inplace: bool = True) -> Optional[pd.DataFrame]:
+    """Recompute metal-ligand interaction descriptors on the row level."""
+    if not inplace:
+        df = df.copy()
+
+    if {
+        'ionic_radius_pm (metal_coord)',
+        'RadiusOfGyration (ligand_3d)',
+    }.issubset(df.columns):
+        metal_radius = pd.to_numeric(df['ionic_radius_pm (metal_coord)'], errors='coerce')
+        ligand_size = pd.to_numeric(df['RadiusOfGyration (ligand_3d)'], errors='coerce').replace(0, np.nan)
+        df['Metal_Ligand_Size_Ratio'] = (metal_radius / 100.0) / ligand_size
+
+    if 'electronegativity_pauling (metal_coord)' in df.columns:
+        metal_en = pd.to_numeric(df['electronegativity_pauling (metal_coord)'], errors='coerce')
+        df['Metal_O_Electronegativity_Diff'] = 3.44 - metal_en
+
+    if 'd_electrons (metal_coord)' in df.columns:
+        d_electrons = pd.to_numeric(df['d_electrons (metal_coord)'], errors='coerce')
+        df['Jahn_Teller_Active'] = d_electrons.isin([4, 9]).astype(int)
+
     if not inplace:
         return df
     return None

@@ -37,12 +37,6 @@ def load_and_preprocess_data(filepath):
     lookup_tables = build_lookup_tables(df_raw)
     X, y = prepare_forward_dataset(df_raw, lookup_tables=lookup_tables)
     
-    # Rename targets for cleaner plots
-    y = y.rename(columns={
-        'W0, см3/г': 'W0',
-        'SБЭТ, м2/г': 'Sbet',
-    })
-    
     # Also add Solvent column for coloring scatter plots
     X['Solvent'] = df_raw.loc[X.index, 'Растворитель']
     
@@ -51,9 +45,10 @@ def load_and_preprocess_data(filepath):
 def get_feature_groups(X, y):
     """
     Get ALL numeric features from X (exactly as used in training).
-    Targets: only W0 and Sbet.
+    Targets: the current forward-model targets.
     """
-    targets = ['W0', 'Sbet']
+    targets = ['E0, кДж/моль', 'х0, нм', 'Sme, м2/г']
+    targets = [target for target in targets if target in y.columns]
     
     # Get ALL numeric features from X (excluding categorical)
     valid_features = []
@@ -76,7 +71,9 @@ def plot_correlation_heatmap(X, y, features, targets, output_dir):
     corr_matrix = df_combined.corr()
     
     # Extract only the Feature vs Target part
-    target_corr = corr_matrix.loc[features, targets].sort_values(by='W0', ascending=False)
+    target_corr = corr_matrix.loc[features, targets]
+    sort_by = targets[0]
+    target_corr = target_corr.sort_values(by=sort_by, ascending=False)
     
     plt.figure(figsize=(12, len(features) * 0.35 + 3))
     
@@ -93,7 +90,7 @@ def plot_correlation_heatmap(X, y, features, targets, output_dir):
         linecolor='lightgray'
     )
     
-    plt.title('All Input Features Correlation with W0 & Sbet', pad=20, fontweight='bold')
+    plt.title('All Input Features Correlation with Forward Targets', pad=20, fontweight='bold')
     plt.tight_layout()
     
     save_path = os.path.join(output_dir, 'correlation_heatmap.png')

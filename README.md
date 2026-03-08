@@ -69,11 +69,11 @@ PYTHONPATH=src python scripts/enrich_descriptors.py \
 ```
 
 ### Шаг 1: Тюнинг гиперпараметров (опционально)
-Автоматический подбор гиперпараметров CatBoost для каждого таргета через Optuna (5-fold CV):
+Автоматический подбор гиперпараметров CatBoost для каждого таргета через Optuna с fold-local feature selection:
 ```bash
 PYTHONPATH=src python scripts/tune_hyperparams.py \
     --data data/SEC_SYN_with_features_enriched.csv \
-    --n-trials 80
+    --trials 80
 ```
 *Результат:* `artifacts/best_hyperparams.json` + snippet для `config.py`.
 
@@ -85,43 +85,38 @@ PYTHONPATH=src python scripts/train_forward_model.py \
 ```
 *Результат:* В `artifacts/forward_models/`:
 *   15 моделей CatBoost (5 ensemble members × 3 таргета)
-*   `metrics.json` — OOF и production метрики
-*   `uncertainty_calibrators.joblib` — conformal калибраторы
-*   `predictions_*.csv` — OOF-предсказания для каждого таргета
+*   `metrics.json` — OOF, production и interval-метрики
+*   `uncertainty_calibrators.joblib` — CV-based conformal модели MAPIE
+*   `predictions_*.csv` — OOF-предсказания + интервалы `y_lo/y_hi`
 
 ### Шаг 3: Валидация UQ
-Скрипт строит **Rejection Plots** и проверяет **Conformal Coverage**:
+Скрипт строит **Rejection Plots** и проверяет **Interval Coverage**:
 ```bash
 PYTHONPATH=src python scripts/validate_uncertainty.py
 ```
 *Результат:* `artifacts/plots/uncertainty_rejection_plots.png`.
 
-*Актуальные метрики (5-fold OOF CV, per-target tuned HP):*
-
-| Таргет | OOF R² | OOF RMSE | Conformal Coverage (90% nom.) | MAE drop (top-50%) |
-|--------|--------|----------|-------------------------------|---------------------|
-| $E_0$  | 0.792  | 4.98     | 98.7%                         | −54%                |
-| $x_0$  | 0.821  | 0.094    | 98.7%                         | −44%                |
-| $S_{me}$ | 0.777 | 88.1    | 100%                          | −54%                |
-
 ### Шаг 4: Поиск рецепта (Inverse Design)
-Задайте желаемые СЭХ — алгоритм NSGA-II построит Pareto-фронт оптимальных рецептов.
+Задайте желаемые СЭХ — target-oriented optimizer на BoFire domain models построит ранжированный список кандидатов.
 
 ```bash
-PYTHONPATH=src python scripts/run_bayes_opt.py \
+PYTHONPATH=src python scripts/run_bofire_opt.py \
     --E0 15.0 \
     --x0 0.5 \
     --Sme 100.0 \
     --trials 300 \
-    --output artifacts/predictions_bo.csv
+    --shortlist-size 12 \
+    --output artifacts/predictions_bofire.csv
 ```
 
 **Аргументы:**
 *   `--E0`, `--x0`, `--Sme`: целевые значения свойств.
-*   `--trials`: количество итераций NSGA-II (рекомендуется 200–500).
-*   `--output`: путь к файлу результатов.
+*   `--trials`: бюджет поиска, то есть сколько кандидатов optimizer просмотрит внутри.
+*   `--shortlist-size`: сколько diverse-кандидатов сохранить в итоговый CSV.
+*   `--output`: путь к итоговому shortlist CSV.
+*   `--all-output`: опциональный путь для сохранения полного пула просмотренных кандидатов.
 
-*Результат:* CSV с Pareto-оптимальными рецептами, включая условия синтеза, предсказанные свойства (`Pred_E0`, `Pred_x0`, `Pred_Sme`), неопределённость (`Pred_Uncertainty_*`) и scalar loss для ранжирования.
+*Результат:* CSV с небольшим diverse shortlist кандидатов, включая условия синтеза, предсказанные свойства, интервалы `Pred_*_lo/hi`, `feasible`, `constraint_reasons`, итоговый `score` и `search_rank` исходного поиска.
 
 ---
 
@@ -131,9 +126,10 @@ PYTHONPATH=src python scripts/run_bayes_opt.py \
 ├── scripts/
 │   ├── enrich_descriptors.py     # Шаг 0: Обогащение датасета (RDKit + коорд. химия)
 │   ├── tune_hyperparams.py       # Шаг 1: Optuna HP tuning (5-fold CV)
-│   ├── train_forward_model.py    # Шаг 2: Deep Ensemble + Conformal Calibration
-│   ├── validate_uncertainty.py   # Шаг 3: UQ валидация (rejection plots + coverage)
-│   ├── run_bayes_opt.py          # Шаг 4: Multi-Objective BO (NSGA-II)
+│   ├── train_forward_model.py    # Шаг 2: Nested selection + production ensemble + MAPIE
+│   ├── validate_uncertainty.py   # Шаг 3: UQ валидация (rejection plots + interval coverage)
+│   ├── run_bofire_opt.py         # Шаг 4: Target-oriented inverse design
+│   ├── run_bayes_opt.py          # Legacy baseline (Optuna NSGA-II)
 │   └── generate_paper_figures.py # Фигуры для статьи/отчета
 ├── src/
 │   └── adsorb_synthesis/
@@ -154,8 +150,9 @@ PYTHONPATH=src python scripts/run_bayes_opt.py \
 Для каждого таргета автоматически:
 1. **Domain-driven curation:** Экспертный список keep/drop фичей (дедупликация обратных признаков: `Vsyn_m` ↔ `C_metal`, `R_mass` ↔ `R_molar`)
 2. **Удаление мультиколлинеарности:** Фичи с |r| > 0.85 и VIF > 10 убираются итеративно
-3. **Permutation Importance:** Финальный отбор топ-15 фич
-4. **No data leakage:** Feature selection выполняется только на fold-0 train data
+3. **Hard keep policy:** curated physics features принудительно сохраняются, если доступны
+4. **Permutation Importance:** Финальный отбор топ-15 гибких фич
+5. **No data leakage:** feature selection выполняется отдельно внутри каждого outer fold
 
 > **Примечание:** RDKit-дескрипторы лиганда (3D geometry, 2D topological) исключены из модели — при 4 уникальных лигандах они вырождаются в lookup-таблицу из 4 строк. Категориальный признак `Лиганд` + `carboxyl_groups` + `molecular_weight` достаточны.
 

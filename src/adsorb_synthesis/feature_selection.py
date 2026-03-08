@@ -8,7 +8,7 @@ This module implements a robust feature selection pipeline:
 """
 from __future__ import annotations
 
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Sequence
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
@@ -20,6 +20,7 @@ def remove_highly_correlated(
     X: pd.DataFrame,
     y: pd.Series,
     threshold: float = 0.90,
+    protected_features: Optional[Sequence[str]] = None,
     verbose: bool = True
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
@@ -42,6 +43,7 @@ def remove_highly_correlated(
     target_corr = X.corrwith(y).abs()
     
     # Track features to remove
+    protected = set(protected_features or [])
     removed = []
     features_to_check = list(X.columns)
     
@@ -71,7 +73,22 @@ def remove_highly_correlated(
         corr1 = target_corr.get(feat1, 0)
         corr2 = target_corr.get(feat2, 0)
         
-        if corr1 >= corr2:
+        if feat1 in protected and feat2 in protected:
+            remaining = [f for f in features_to_check if f not in {feat1, feat2}]
+            if remaining:
+                candidate_corr = target_corr.reindex(remaining).fillna(-np.inf)
+                to_remove = candidate_corr.idxmin()
+                kept = feat1 if to_remove != feat1 else feat2
+            else:
+                to_remove = feat2
+                kept = feat1
+        elif feat1 in protected:
+            to_remove = feat2
+            kept = feat1
+        elif feat2 in protected:
+            to_remove = feat1
+            kept = feat2
+        elif corr1 >= corr2:
             to_remove = feat2
             kept = feat1
         else:
@@ -83,7 +100,8 @@ def remove_highly_correlated(
                   f"target_corr: {target_corr.get(to_remove, 0):.3f} vs {target_corr.get(kept, 0):.3f})")
         
         removed.append(to_remove)
-        
+        features_to_check = [f for f in features_to_check if f != to_remove]
+
         # Update matrices
         corr_matrix = corr_matrix.drop(columns=[to_remove], index=[to_remove])
         target_corr = target_corr.drop(to_remove, errors='ignore')
@@ -119,6 +137,7 @@ def remove_high_vif_iterative(
     X: pd.DataFrame,
     y: pd.Series,
     vif_threshold: float = 10.0,
+    protected_features: Optional[Sequence[str]] = None,
     verbose: bool = True
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
@@ -135,6 +154,7 @@ def remove_high_vif_iterative(
         X_reduced: DataFrame with reduced features
         removed: List of removed feature names
     """
+    protected = set(protected_features or [])
     removed = []
     X_current = X.copy()
     
@@ -157,7 +177,11 @@ def remove_high_vif_iterative(
             break
             
         # Remove the one with lowest target correlation
-        target_corr = X_current[high_vif].corrwith(y).abs()
+        removable = [feature for feature in high_vif if feature not in protected]
+        if not removable:
+            break
+
+        target_corr = X_current[removable].corrwith(y).abs()
         to_remove = target_corr.idxmin()
         
         if verbose:
@@ -219,6 +243,7 @@ def select_features_advanced(
     X: pd.DataFrame,
     y: pd.Series,
     categorical_cols: List[str] = None,
+    hard_keep_features: Optional[Sequence[str]] = None,
     corr_threshold: float = 0.85,
     vif_threshold: float = 10.0,
     min_importance: float = 0.001,
@@ -251,10 +276,13 @@ def select_features_advanced(
     """
     if categorical_cols is None:
         categorical_cols = []
-    
+    hard_keep_features = list(dict.fromkeys(hard_keep_features or []))
+    protected_numeric = [f for f in hard_keep_features if f in X.columns and f not in categorical_cols]
+
     report = {
         'initial_features': len(X.columns),
         'categorical_preserved': categorical_cols,
+        'hard_keep_features': hard_keep_features,
         'removed_correlation': [],
         'removed_vif': [],
         'importance_ranking': None
@@ -280,7 +308,11 @@ def select_features_advanced(
         print(f"\n[Step 1] Removing features with correlation > {corr_threshold}")
     
     X_reduced, removed_corr = remove_highly_correlated(
-        X_numeric, y, threshold=corr_threshold, verbose=verbose
+        X_numeric,
+        y,
+        threshold=corr_threshold,
+        protected_features=protected_numeric,
+        verbose=verbose,
     )
     report['removed_correlation'] = removed_corr
     
@@ -292,7 +324,11 @@ def select_features_advanced(
         print(f"\n[Step 2] Removing features with VIF > {vif_threshold}")
     
     X_reduced, removed_vif = remove_high_vif_iterative(
-        X_reduced, y, vif_threshold=vif_threshold, verbose=verbose
+        X_reduced,
+        y,
+        vif_threshold=vif_threshold,
+        protected_features=protected_numeric,
+        verbose=verbose,
     )
     report['removed_vif'] = removed_vif
     
@@ -310,9 +346,11 @@ def select_features_advanced(
     important_features = importance_df[
         importance_df['Importance_Mean'] > min_importance
     ]['Feature'].tolist()
-    
-    # Limit to max_features
-    important_features = important_features[:max_features]
+
+    flexible_features = [
+        feature for feature in important_features if feature not in protected_numeric
+    ][:max_features]
+    important_features = list(dict.fromkeys(protected_numeric + flexible_features))
     
     if verbose:
         print(f"  Top {len(important_features)} features by importance:")

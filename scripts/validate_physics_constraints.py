@@ -89,9 +89,9 @@ def main():
     
     print()
     print("Next steps:")
-    print("  1. Train models with physics-informed loss: python scripts/train_inverse_design.py --data data/SEC_SYN_with_features.csv --output artifacts")
-    print("  2. Physics loss is now enabled by default for metal and ligand stages")
-    print("  3. Monitor training metrics to see impact of physics constraints")
+    print("  1. Train forward models: python scripts/train_forward_model.py --data data/SEC_SYN_with_features_enriched.csv")
+    print("  2. Validate interval-based uncertainty: python scripts/validate_uncertainty.py")
+    print("  3. Run inverse design: python scripts/run_bofire_opt.py --E0 15 --x0 0.5 --Sme 100")
 
 
 if __name__ == "__main__":

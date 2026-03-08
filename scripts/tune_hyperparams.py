@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
-"""
-Hyperparameter tuning for CatBoost Forward Models using Optuna.
+"""Tune CatBoost forward-model hyperparameters with fold-local feature selection."""
 
-Tunes CatBoost hyperparameters via 5-fold CV, then prints the best
-configuration for updating config.py.
-
-Usage:
-    python scripts/tune_hyperparams.py --data data/SEC_SYN_with_features_enriched.csv
-    python scripts/tune_hyperparams.py --trials 100 --target "E0, кДж/моль"
-"""
+from __future__ import annotations
 
 import argparse
 import json
@@ -17,194 +10,144 @@ import sys
 from typing import Dict
 
 import numpy as np
-
-# Add src to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
-
 import optuna
 import pandas as pd
 from catboost import CatBoostRegressor
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import StratifiedKFold
 
-from adsorb_synthesis.data_processing import (
-    load_dataset, build_lookup_tables, prepare_forward_dataset,
-)
-from adsorb_synthesis.constants import (
-    RANDOM_SEED, FORWARD_MODEL_TARGETS, RARE_METALS_THRESHOLD,
-)
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
+
 from adsorb_synthesis.config import FORWARD_MODEL_CONFIG
-from adsorb_synthesis.feature_selection import (
-    select_features_advanced, get_curated_features,
+from adsorb_synthesis.constants import FORWARD_MODEL_TARGETS, RANDOM_SEED
+from adsorb_synthesis.data_processing import (
+    build_lookup_tables,
+    load_dataset,
+    prepare_forward_dataset,
 )
-from adsorb_synthesis.physics_losses import compute_physics_penalty
+from adsorb_synthesis.forward_modeling import (
+    build_stratification_key,
+    compute_quality_weights,
+    select_curated_features,
+)
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-
-def _build_strat_key(X: pd.DataFrame, y_target: pd.Series) -> pd.Series:
-    if 'Металл' in X.columns:
-        metal_counts = X['Металл'].value_counts()
-        rare = metal_counts[metal_counts < RARE_METALS_THRESHOLD].index.tolist()
-        metal_group = X['Металл'].apply(lambda m: 'Other' if m in rare else m)
-    else:
-        metal_group = pd.Series(['Unknown'] * len(X), index=X.index)
-    try:
-        bins = pd.qcut(y_target, q=4, labels=['Q1', 'Q2', 'Q3', 'Q4'],
-                        duplicates='drop')
-    except ValueError:
-        bins = pd.Series(['All'] * len(y_target), index=y_target.index)
-    return metal_group.astype(str) + '_' + bins.astype(str)
 
 
 def tune_for_target(
     X: pd.DataFrame,
     y_target: pd.Series,
-    cat_features: list,
-    selected_features: list,
+    cat_features: list[str],
     sample_weights: np.ndarray,
     strat_key: pd.Series,
+    *,
     n_trials: int = 80,
     n_splits: int = 5,
 ) -> Dict:
-    """Run Optuna HP search for a single target, return best params."""
+    """Run Optuna tuning with per-fold feature selection."""
 
-    cat_features_sel = [c for c in selected_features if c in cat_features]
+    outer_cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
+    cv_splits = list(outer_cv.split(X, strat_key))
 
     def objective(trial: optuna.Trial) -> float:
         params = {
-            'iterations': trial.suggest_int('iterations', 400, 2000, step=100),
-            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.15,
-                                                  log=True),
-            'depth': trial.suggest_int('depth', 4, 8),
-            'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 0.1, 10.0,
-                                                log=True),
-            'min_data_in_leaf': trial.suggest_int('min_data_in_leaf', 1, 10),
-            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-            'colsample_bylevel': trial.suggest_float('colsample_bylevel',
-                                                      0.5, 1.0),
-            'loss_function': 'RMSE',
-            'random_seed': RANDOM_SEED,
-            'verbose': False,
-            'allow_writing_files': False,
+            "iterations": trial.suggest_int("iterations", 400, 2000, step=100),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+            "depth": trial.suggest_int("depth", 4, 8),
+            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 0.1, 10.0, log=True),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 1, 10),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.5, 1.0),
+            "loss_function": "RMSE",
+            "verbose": False,
+            "allow_writing_files": False,
         }
+        oof_predictions = np.full(len(X), np.nan, dtype=float)
 
-        skf = StratifiedKFold(n_splits=n_splits, shuffle=True,
-                              random_state=RANDOM_SEED)
-        oof = np.full(len(X), np.nan)
-
-        for fold_idx, (tr_idx, va_idx) in enumerate(skf.split(X, strat_key)):
-            model = CatBoostRegressor(**params, cat_features=cat_features_sel)
+        for fold_idx, (train_idx, valid_idx) in enumerate(cv_splits):
+            X_train = X.iloc[train_idx]
+            y_train = y_target.iloc[train_idx]
+            X_valid = X.iloc[valid_idx]
+            y_valid = y_target.iloc[valid_idx]
+            selected_features, _ = select_curated_features(
+                X_train,
+                y_train,
+                cat_features,
+                corr_threshold=FORWARD_MODEL_CONFIG.feature_selection_corr_threshold,
+                vif_threshold=FORWARD_MODEL_CONFIG.feature_selection_vif_threshold,
+                max_features=FORWARD_MODEL_CONFIG.feature_selection_max_features,
+                verbose=False,
+            )
+            selected_cat = [feature for feature in selected_features if feature in cat_features]
+            model = CatBoostRegressor(
+                **params,
+                random_seed=RANDOM_SEED + fold_idx,
+                cat_features=selected_cat,
+            )
             model.fit(
-                X.iloc[tr_idx][selected_features],
-                y_target.iloc[tr_idx],
-                sample_weight=sample_weights[tr_idx],
-                eval_set=(X.iloc[va_idx][selected_features],
-                          y_target.iloc[va_idx]),
-                early_stopping_rounds=80,
+                X_train[selected_features],
+                y_train,
+                sample_weight=sample_weights[train_idx],
+                eval_set=(X_valid[selected_features], y_valid),
+                early_stopping_rounds=FORWARD_MODEL_CONFIG.early_stopping_rounds,
                 use_best_model=True,
             )
-            oof[va_idx] = model.predict(X.iloc[va_idx][selected_features])
+            oof_predictions[valid_idx] = model.predict(X_valid[selected_features])
 
-        rmse = np.sqrt(mean_squared_error(y_target, oof))
-        return rmse
+        return float(np.sqrt(mean_squared_error(y_target, oof_predictions)))
 
-    study = optuna.create_study(direction='minimize',
-                                sampler=optuna.samplers.TPESampler(seed=42))
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
+    )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
-
     print(f"  Best RMSE: {study.best_value:.4f}")
     print(f"  Best params: {study.best_params}")
     return study.best_params
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Tune CatBoost hyperparameters for Forward Models")
-    parser.add_argument("--data", type=str,
-                        default="data/SEC_SYN_with_features_enriched.csv")
-    parser.add_argument("--trials", type=int, default=80,
-                        help="Optuna trials per target")
-    parser.add_argument("--target", type=str, default=None,
-                        help="Tune only this target (default: all)")
-    parser.add_argument("--output", type=str,
-                        default="artifacts/best_hyperparams.json",
-                        help="Save best params to JSON")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Tune CatBoost hyperparameters for forward models.")
+    parser.add_argument("--data", type=str, default="data/SEC_SYN_with_features_enriched.csv")
+    parser.add_argument("--trials", type=int, default=80)
+    parser.add_argument("--target", type=str, default=None)
+    parser.add_argument("--output", type=str, default="artifacts/best_hyperparams.json")
     args = parser.parse_args()
 
     print(f"Loading dataset from {args.data}...")
     df_raw = load_dataset(args.data)
     lookup_tables = build_lookup_tables(df_raw)
     X, y = prepare_forward_dataset(df_raw, lookup_tables=lookup_tables)
+    cat_features = [col for col in X.columns if X[col].dtype.name in ["object", "category"]]
+    sample_weights = compute_quality_weights(
+        df_raw.reindex(X.index),
+        penalty_weight=FORWARD_MODEL_CONFIG.physics_penalty_weight,
+        minimum_weight=FORWARD_MODEL_CONFIG.minimum_sample_weight,
+    ).to_numpy(dtype=float)
 
-    cat_features = [c for c in X.columns
-                    if X[c].dtype.name in ['object', 'category']]
-
-    physics_penalty = compute_physics_penalty(df_raw).reindex(X.index).fillna(0.0)
-    sample_weights = 1.0 + FORWARD_MODEL_CONFIG.physics_penalty_weight * physics_penalty.values
-
-    targets_to_tune = FORWARD_MODEL_TARGETS
-    if args.target:
-        targets_to_tune = [args.target]
-
-    all_best = {}
+    targets_to_tune = [args.target] if args.target else FORWARD_MODEL_TARGETS
+    all_best: Dict[str, Dict] = {}
 
     for target in targets_to_tune:
         if target not in y.columns:
-            print(f"Skipping {target}: not in dataset")
+            print(f"Skipping {target}: target missing in dataset.")
             continue
-
-        print(f"\n=== Tuning: {target} ({args.trials} trials) ===")
-        y_target = y[target]
-        strat_key = _build_strat_key(X, y_target)
-
-        # Feature selection (on fold-0 train — no leakage)
-        skf_fs = StratifiedKFold(n_splits=5, shuffle=True,
-                                 random_state=RANDOM_SEED)
-        fs_train_idx = list(skf_fs.split(X, strat_key))[0][0]
-
-        keep_features, drop_features = get_curated_features()
-        available_drop = [f for f in drop_features if f in X.columns]
-        numeric_cols = [c for c in X.columns if c not in cat_features]
-        curated_numeric = [c for c in numeric_cols if c not in available_drop]
-
-        selected_features, _ = select_features_advanced(
-            X.iloc[fs_train_idx][cat_features + curated_numeric],
-            y_target.iloc[fs_train_idx],
-            categorical_cols=cat_features,
-            corr_threshold=FORWARD_MODEL_CONFIG.feature_selection_corr_threshold,
-            vif_threshold=FORWARD_MODEL_CONFIG.feature_selection_vif_threshold,
-            max_features=FORWARD_MODEL_CONFIG.feature_selection_max_features,
-            verbose=False,
-        )
-
+        print(f"\n=== Tuning {target} ({args.trials} trials) ===")
         best = tune_for_target(
-            X, y_target, cat_features, selected_features,
-            sample_weights, strat_key,
+            X,
+            y[target],
+            cat_features,
+            sample_weights,
+            build_stratification_key(X, y[target]),
             n_trials=args.trials,
+            n_splits=FORWARD_MODEL_CONFIG.n_ensemble_splits,
         )
         all_best[target] = best
 
-    # Save
-    os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
-    with open(args.output, 'w', encoding='utf-8') as f:
-        json.dump(all_best, f, indent=2, ensure_ascii=False)
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    with open(args.output, "w", encoding="utf-8") as handle:
+        json.dump(all_best, handle, indent=2, ensure_ascii=False)
     print(f"\nBest hyperparameters saved to {args.output}")
-
-    # Print config.py suggestion
-    print("\n=== Suggested config.py update ===")
-    if all_best:
-        # Average across targets for a single config
-        keys = list(next(iter(all_best.values())).keys())
-        avg = {}
-        for k in keys:
-            vals = [all_best[t][k] for t in all_best if k in all_best[t]]
-            if isinstance(vals[0], (int, float)):
-                avg[k] = round(sum(vals) / len(vals), 4)
-        print("CatBoostConfig(")
-        for k, v in avg.items():
-            print(f"    {k}={v},")
-        print(")")
 
 
 if __name__ == "__main__":

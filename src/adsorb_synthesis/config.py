@@ -44,6 +44,7 @@ class ForwardModelConfig:
     n_ensemble_splits: int = 5
     early_stopping_rounds: int = 100
     physics_penalty_weight: float = 1.0
+    minimum_sample_weight: float = 0.2
     feature_selection_corr_threshold: float = 0.85
     feature_selection_vif_threshold: float = 10.0
     feature_selection_max_features: int = 15
@@ -54,6 +55,7 @@ class ForwardModelConfig:
 
     # Conformal prediction
     conformal_alpha: float = 0.10  # 90% prediction coverage
+    mapie_method: str = "plus"
 
 
 CATBOOST_CONFIG = CatBoostConfig()  # default fallback
