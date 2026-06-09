@@ -24,6 +24,7 @@ from .constants import (
     LIGAND_2D_FEATURES,
     INTERACTION_FEATURES,
     HYDRATION_MAP,
+    SCHEMA_CANONICAL_COLUMNS,
 )
 from .data_validation import (
     DEFAULT_VALIDATION_MODE,
@@ -126,9 +127,13 @@ def prepare_forward_dataset(
         if col in df.columns:
             X[col] = df.loc[X.index, col].values
     
-    # 4b. Copy NEW physicochemical descriptors if present in df
-    # These are computed by scripts/enrich_descriptors.py
-    new_descriptor_cols = METAL_COORD_FEATURES + LIGAND_3D_FEATURES + LIGAND_2D_FEATURES
+    # 4b. Copy NEW physicochemical descriptors if present in df.
+    # P4.1 (audit #5): inject ONLY metal coordination descriptors. LIGAND_3D/2D
+    # descriptors are intentionally NOT injected — with only 4 unique ligands they
+    # degenerate into a 4-row lookup that lets the model memorise ligand identity
+    # (illusory signal). The categorical 'Лиганд' + LIGAND_DESCRIPTOR_FEATURES
+    # already carry the meaningful ligand signal.
+    new_descriptor_cols = list(METAL_COORD_FEATURES)
     for col in new_descriptor_cols:
         if col in df.columns and col not in X.columns:
             X[col] = df.loc[X.index, col].values
@@ -163,6 +168,44 @@ def prepare_forward_dataset(
     return X, y
 
 
+# Latin -> Cyrillic homoglyph folding for robust column-name matching (audit #10).
+_HOMOGLYPH_FOLD = str.maketrans({
+    'A': 'А', 'B': 'В', 'C': 'С', 'E': 'Е', 'H': 'Н', 'K': 'К', 'M': 'М',
+    'O': 'О', 'P': 'Р', 'T': 'Т', 'X': 'Х', 'Y': 'У',
+    'a': 'а', 'c': 'с', 'e': 'е', 'k': 'к', 'o': 'о', 'p': 'р', 'x': 'х', 'y': 'у',
+})
+
+
+def _schema_key(name: str) -> str:
+    s = ' '.join(str(name).split())                       # collapse internal whitespace
+    s = s.replace('º', '°').replace('ᵒ', '°')  # º, ᵒ -> °
+    s = s.translate(_HOMOGLYPH_FOLD)                      # fold Latin homoglyphs to Cyrillic
+    return s.casefold()
+
+
+def normalize_synthesis_columns(df: pd.DataFrame, *, inplace: bool = True) -> Optional[pd.DataFrame]:
+    """Fold fragile column-name variants back to canonical names (audit #10).
+
+    Handles stray whitespace, degree-sign variants (°/º/ᵒ) and Latin/Cyrillic
+    homoglyphs so a benign Excel re-export does not silently break the pipeline.
+    Only renames a column when its normalized key matches a canonical name AND that
+    canonical name is not already present (never clobbers an existing column).
+    """
+    if not inplace:
+        df = df.copy()
+    canon_by_key = {_schema_key(c): c for c in SCHEMA_CANONICAL_COLUMNS}
+    rename: Dict[str, str] = {}
+    present = set(df.columns)
+    for col in df.columns:
+        target = canon_by_key.get(_schema_key(col))
+        if target is not None and target != col and target not in present:
+            rename[col] = target
+            present.add(target)
+    if rename:
+        df.rename(columns=rename, inplace=True)
+    return None if inplace else df
+
+
 def load_dataset(
     csv_path: str,
     *,
@@ -174,6 +217,9 @@ def load_dataset(
 
     df = pd.read_csv(csv_path)
     df = df.copy()
+
+    # Audit #10: fold fragile column-name variants to canonical names before use.
+    normalize_synthesis_columns(df)
 
     add_molar_mass_columns(df)
     
@@ -436,11 +482,10 @@ def build_lookup_tables(df: pd.DataFrame, include_extended: bool = True) -> Look
         for feat in METAL_COORD_FEATURES:
             if feat in df.columns:
                 metal_features.append(feat)
-        # P4.1: Ligand 3D/2D features are no longer required (degenerate with
-        # only 4 ligands), but include them opportunistically for backward compat.
-        for feat in LIGAND_3D_FEATURES + LIGAND_2D_FEATURES:
-            if feat in df.columns:
-                ligand_features.append(feat)
+        # P4.1 (audit #5): Ligand 3D/2D descriptors are intentionally EXCLUDED.
+        # With only 4 unique ligands they degenerate into a 4-row lookup that lets
+        # the model memorise ligand identity (illusory signal); the categorical
+        # 'Лиганд' + LIGAND_DESCRIPTOR_FEATURES already carry the ligand signal.
     # Remove duplicates while preserving order
     metal_features = list(dict.fromkeys(metal_features))
     ligand_features = list(dict.fromkeys(ligand_features))

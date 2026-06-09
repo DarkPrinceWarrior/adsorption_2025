@@ -9,7 +9,7 @@ from catboost import CatBoostRegressor
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.model_selection import BaseCrossValidator
 
-from .constants import RARE_METALS_THRESHOLD
+from .constants import FORWARD_MODEL_INPUTS, RARE_METALS_THRESHOLD
 from .feature_selection import get_curated_features, select_features_advanced
 from .physics_losses import compute_physics_penalty
 
@@ -27,6 +27,32 @@ def build_stratification_key(X: pd.DataFrame, y_target: pd.Series) -> pd.Series:
     except ValueError:
         bins = pd.Series(['All'] * len(y_target), index=y_target.index)
     return metal_group.astype(str) + '_' + bins.astype(str)
+
+
+def build_recipe_group_keys(X: pd.DataFrame, *, decimals: int = 6) -> pd.Series:
+    """Build a deterministic recipe-group id from the synthesis inputs.
+
+    Rows describing the same recipe (incl. replicate measurements with identical
+    inputs) get the same id so that group-aware CV never splits replicates across
+    train/validation folds — which would otherwise leak and inflate OOF metrics.
+    """
+    cols = [c for c in FORWARD_MODEL_INPUTS if c in X.columns]
+    if not cols:
+        return pd.Series([str(i) for i in range(len(X))], index=X.index, name="recipe_group")
+
+    parts: List[pd.Series] = []
+    for col in cols:
+        numeric = pd.to_numeric(X[col], errors="coerce")
+        if numeric.notna().any():
+            part = numeric.round(decimals).astype("string")
+        else:
+            part = X[col].astype("string")
+        parts.append(part.fillna("·"))
+
+    key = parts[0]
+    if len(parts) > 1:
+        key = key.str.cat(parts[1:], sep="|")
+    return pd.Series(key.to_numpy(), index=X.index, name="recipe_group")
 
 
 def compute_quality_weights(

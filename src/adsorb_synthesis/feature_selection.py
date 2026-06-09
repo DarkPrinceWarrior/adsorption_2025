@@ -371,6 +371,54 @@ def select_features_advanced(
     return selected_features, report
 
 
+def stability_select_features(
+    X: pd.DataFrame,
+    y: pd.Series,
+    categorical_cols: Optional[List[str]] = None,
+    *,
+    n_bootstraps: int = 30,
+    sample_frac: float = 0.8,
+    selection_threshold: float = 0.5,
+    seed: int = 42,
+    **advanced_kwargs,
+) -> Tuple[List[str], Dict[str, float]]:
+    """Stability selection (audit #8): run `select_features_advanced` over many
+    bootstrap subsamples and keep features chosen in at least `selection_threshold`
+    fraction of runs. Stabilizes the otherwise fold-dependent feature sets on this
+    small dataset, without changing the model itself.
+
+    Returns (stable_features, selection_frequency) where selection_frequency maps
+    every candidate numeric feature to the fraction of bootstraps that selected it.
+    Categorical columns are always kept (they are not subject to the frequency gate).
+    """
+    if categorical_cols is None:
+        categorical_cols = []
+    categorical_cols = [c for c in categorical_cols if c in X.columns]
+    numeric_cols = [c for c in X.columns if c not in categorical_cols]
+
+    rng = np.random.default_rng(seed)
+    counts: Dict[str, int] = {c: 0 for c in numeric_cols}
+    n = len(X)
+    size = max(2, int(round(n * sample_frac)))
+
+    for _ in range(n_bootstraps):
+        idx = rng.choice(n, size=size, replace=False)
+        X_b = X.iloc[idx]
+        y_b = y.iloc[idx]
+        selected, _ = select_features_advanced(
+            X_b, y_b, categorical_cols=list(categorical_cols), verbose=False, **advanced_kwargs
+        )
+        for feat in selected:
+            if feat in counts:
+                counts[feat] += 1
+
+    frequency = {c: counts[c] / n_bootstraps for c in numeric_cols}
+    stable_numeric = [c for c in numeric_cols if frequency[c] >= selection_threshold]
+    stable_numeric.sort(key=lambda c: frequency[c], reverse=True)
+    stable_features = list(categorical_cols) + stable_numeric
+    return stable_features, frequency
+
+
 # Pre-defined feature groups for domain knowledge
 FEATURE_GROUPS = {
     # Keep only one from each correlated group

@@ -17,6 +17,6 @@ cvxpy>=1.6.5,<1.8
 mordred>=1.2.0
 pymoo>=0.6.1.6
 shap>=0.46.0,<0.51
-tabpfn>=6.4.1
+tabpfn>=8.0.0
 botorch>=0.17.2
 baybe>=0.14.3

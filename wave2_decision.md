@@ -25,7 +25,7 @@
 
 ### Статус остальных веток
 
-* **TabPFN:** challenger, но не production default
+* **TabPFN:** `TabPFN-3` (`tabpfn>=8.0.0`) — challenger; на внутреннем CV ≈ `CatBoost`, но не production default (нет interval UQ). См. «Обновление Wave 4».
 * **BoTorch:** research optimizer
 * **BayBE:** campaign-oriented backend
 * **Direct inverse:** benchmark-only baseline
@@ -50,6 +50,27 @@
 * по `Sme` `TabPFN` чуть лучше, но без production-grade interval UQ
 
 Поэтому production default после wave 3 не меняется: `CatBoost + MAPIE`.
+
+## Обновление Wave 4: TabPFN-3 (9 июня 2026)
+
+После выхода `TabPFN-3` пакет `tabpfn` поднят до `>=8.0.0` (проверено на `8.0.7`); forward-бэкенд явно пинит `ModelVersion.V3` через `create_default_for_version`. Доступ к весам v3 требует разового принятия лицензии Prior Labs (`tabpfn-3-license-v1.0`) и ключа `TABPFN_TOKEN` с https://ux.priorlabs.ai — одного HF-токена недостаточно.
+
+Повторный forward-benchmark (тот же `chemistry-split`, holdout = 83 строки):
+
+| target | CatBoost `R2_oof` | TabPFN-3 `R2_oof` | CatBoost `R2_holdout` | TabPFN-3 `R2_holdout` |
+|--------|-------------------|-------------------|-----------------------|-----------------------|
+| `E0`   | 0.8100            | 0.8115            | -1.8618               | -2.9300               |
+| `x0`   | 0.8174            | 0.8041            | -2.8783               | -3.6091               |
+| `Sme`  | 0.7739            | 0.7370            | -0.9595               | -0.9293               |
+
+Выводы:
+
+* `TabPFN-3` совершил качественный скачок на внутреннем CV — с отрицательных `R2_oof` версии `6.4.1` (`E0 -3.43`, `x0 -3.46`, `Sme -0.91`) до паритета с `CatBoost`.
+* На внешнем `chemistry-split` holdout оба бэкенда по-прежнему дают отрицательный `R2`: смена forward-модели не решает `out-of-chemistry` generalization (вывод Wave 3 в силе).
+* `CatBoost` остаётся production default: чуть менее отрицателен по `E0`/`x0` на holdout и единственный с production-grade interval UQ (`MAPIE`); у `TabPFN`-бэкенда интервалов нет.
+* `TabPFN-3` повышается из явного аутсайдера до полноценного challenger.
+
+Артефакты прогона: `artifacts/forward_models_tabpfn3/` (full-fit) и `artifacts/forward_holdout_v3/` (chemistry-split).
 
 ## Почему выбран BoFire
 

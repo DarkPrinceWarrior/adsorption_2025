@@ -31,7 +31,12 @@ def test_validate_synthesis_data_strict_mode_raises_on_errors():
     })
 
     report = validate_synthesis_data(df, boiling_points={'DMF': 153.0}, mode="warn")
-    assert len(report.errors) == 3
+    # Audit #7/#9: exceeding the ATMOSPHERIC boiling point is a WARNING (sealed
+    # solvothermal synthesis legitimately exceeds it under autogenous pressure),
+    # not an error. Only the two non-physical mass/volume values are hard errors.
+    assert len(report.errors) == 2
+    assert {issue.column for issue in report.errors} == {'m(кис-ты), г', 'Vсин. (р-ля), мл'}
+    assert any('boiling point' in issue.message for issue in report.warnings)
 
     with pytest.raises(ValueError):
         validate_synthesis_data(df, boiling_points={'DMF': 153.0}, mode="strict")

@@ -1,13 +1,11 @@
-# Task Completion Checklist
+# Task Completion
 
-Before finishing code changes:
-1. Run the relevant focused tests when possible.
-2. For broad or shared changes, run the full test suite:
-```bash
-PYTHONPATH=src python -m pytest tests/ -v
-```
-3. If changing scripts that generate artifacts, verify the specific script path and CLI invocation from `README.md` or `--help` before running a long job.
-4. Check `git status --short` and only report changes related to the task.
-5. Do not revert unrelated dirty work. During onboarding, `.serena/` appeared as untracked after project activation.
-
-No separate lint/format command is documented in this repository. If formatting is needed, preserve the style already present in the file unless the user explicitly asks to introduce a formatter.
+1. Run focused relevant tests; for broad/shared changes run the full suite:
+   `PYTHONPATH=src python -m pytest tests/ -v`.
+2. For scripts that generate artifacts, confirm the exact script path and CLI from
+   `README.md` or `--help` before launching a long run.
+3. `git status --short`; report only task-related changes; do not revert unrelated dirty work.
+4. No lint/format/type-check command exists — preserve the existing file style unless
+   explicitly asked to introduce tooling.
+5. After bulk or file-generating changes, run `codegraph sync` (or `codegraph status`)
+   to refresh the index before relying on codegraph answers.

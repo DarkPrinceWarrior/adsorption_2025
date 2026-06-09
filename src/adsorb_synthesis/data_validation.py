@@ -8,7 +8,11 @@ from typing import Mapping, Optional
 import numpy as np
 import pandas as pd
 
-from .constants import DEFAULT_STOICHIOMETRY_BOUNDS, STOICHIOMETRY_TARGETS
+from .constants import (
+    STOICHIOMETRY_GLOBAL_BOUNDS,
+    STOICHIOMETRY_GROUP_FACTOR,
+    STOICHIOMETRY_GROUP_MIN_N,
+)
 
 DEFAULT_VALIDATION_MODE = "warn"
 VALIDATION_MODES = {"warn", "strict"}
@@ -215,7 +219,16 @@ def validate_synthesis_data(
         syn = pd.to_numeric(df[syn_temp_col], errors='coerce')
         solvent_series = df[solvent_col].astype(str).str.strip()
         lookup = {str(k).strip().lower(): v for k, v in boiling_points.items()}
-        boiling = solvent_series.str.lower().map(lookup)
+
+        def _mixture_boiling(name: str) -> float:
+            # Audit #9: for a solvent mixture (e.g. "ДМФА/Вода") use the LOWEST
+            # component boiling point — the most volatile component caps the
+            # achievable reflux temperature.
+            comps = [c.strip().lower() for c in str(name).split('/') if c.strip()]
+            vals = [lookup[c] for c in comps if c in lookup]
+            return float(min(vals)) if vals else np.nan
+
+        boiling = solvent_series.apply(_mixture_boiling)
         mask = syn.notna() & boiling.notna() & (syn >= boiling)
         for pos in np.where(mask)[0]:
             row = df.index[pos]
@@ -223,10 +236,14 @@ def validate_synthesis_data(
                 ValidationIssue(
                     row=row,
                     column=syn_temp_col,
-                    severity="error",
+                    # Audit #7/#9: exceeding the ATMOSPHERIC boiling point is normal
+                    # for sealed solvothermal synthesis (autogenous pressure), so this
+                    # is a WARNING (confirm sealed vessel), not a hard error.
+                    severity="warning",
                     message=(
-                        f"T_syn ({syn.iloc[pos]:.1f}°C) exceeds boiling point of "
-                        f"{df.at[row, solvent_col]} ({boiling.iloc[pos]:.1f}°C)"
+                        f"T_syn ({syn.iloc[pos]:.1f}°C) exceeds atmospheric boiling point "
+                        f"of {df.at[row, solvent_col]} ({boiling.iloc[pos]:.1f}°C) — "
+                        f"expected only if synthesis is sealed/solvothermal"
                     ),
                     actual=_safe_float(syn.iloc[pos]),
                     expected=_safe_float(boiling.iloc[pos]),
@@ -234,7 +251,12 @@ def validate_synthesis_data(
                 )
             )
 
-    # Stoichiometry checks (Metal/Ligand molar ratio)
+    # Stoichiometry checks (Metal/Ligand feed molar ratio) — audit #2.
+    # Policy: hard ERROR only for physically impossible ratios (global bounds);
+    # data-driven WARNING for per-group statistical outliers (Tukey fences).
+    # Framework formula ratios (STOICHIOMETRY_REFERENCE in constants) are
+    # documentation only — the lab's feed ratios legitimately differ (excess
+    # reagent / modulated synthesis), so we never gate against them.
     metal_col = 'Металл'
     ligand_col = 'Лиганд'
     ratio_col = 'R_molar'
@@ -245,57 +267,118 @@ def validate_synthesis_data(
     molar_salt_col = 'Молярка_соли'
     molar_acid_col = 'Молярка_кислоты'
 
+    def _row_ratio(idx) -> float:
+        if ratio_col in df.columns:
+            r = pd.to_numeric(df.at[idx, ratio_col], errors='coerce')
+            if np.isfinite(r):
+                return float(r)
+        n_salt = pd.to_numeric(df.at[idx, n_salt_col], errors='coerce') if n_salt_col in df.columns else np.nan
+        n_acid = pd.to_numeric(df.at[idx, n_acid_col], errors='coerce') if n_acid_col in df.columns else np.nan
+        if np.isfinite(n_salt) and np.isfinite(n_acid) and n_acid != 0:
+            return float(n_salt / n_acid)
+        if {salt_mass_col, acid_mass_col, molar_salt_col, molar_acid_col}.issubset(df.columns):
+            m_salt = pd.to_numeric(df.at[idx, salt_mass_col], errors='coerce')
+            m_acid = pd.to_numeric(df.at[idx, acid_mass_col], errors='coerce')
+            mw_salt = pd.to_numeric(df.at[idx, molar_salt_col], errors='coerce')
+            mw_acid = pd.to_numeric(df.at[idx, molar_acid_col], errors='coerce')
+            if (np.isfinite(m_salt) and np.isfinite(m_acid) and np.isfinite(mw_salt)
+                    and np.isfinite(mw_acid) and mw_acid != 0 and mw_salt != 0):
+                n_s = m_salt / mw_salt
+                n_a = m_acid / mw_acid
+                if n_a != 0:
+                    return float(n_s / n_a)
+        return float('nan')
+
     if metal_col in df.columns and ligand_col in df.columns:
+        ratios = {idx: _row_ratio(idx) for idx in df.index}
+        group_keys = df[metal_col].astype(str) + '|' + df[ligand_col].astype(str)
+        lo_global, hi_global = STOICHIOMETRY_GLOBAL_BOUNDS
+
+        # Per-group fences: wide multiplicative band around the group median, so
+        # only gross per-group deviations are flagged (intentional DOE sweeps pass).
+        fences: dict[str, tuple[float, float]] = {}
+        finite_by_group: dict[str, list[float]] = {}
+        for idx, value in ratios.items():
+            if np.isfinite(value):
+                finite_by_group.setdefault(group_keys.loc[idx], []).append(value)
+        for gkey, values in finite_by_group.items():
+            if len(values) >= STOICHIOMETRY_GROUP_MIN_N:
+                med = float(np.median(values))
+                if med > 0:
+                    fences[gkey] = (
+                        med / STOICHIOMETRY_GROUP_FACTOR,
+                        med * STOICHIOMETRY_GROUP_FACTOR,
+                    )
+
         for idx in df.index:
-            metal = df.at[idx, metal_col]
-            ligand = df.at[idx, ligand_col]
-
-            ratio_val = np.nan
-            # Prefer precomputed R_molar
-            if ratio_col in df.columns:
-                ratio_val = pd.to_numeric(df.at[idx, ratio_col], errors='coerce')
-            else:
-                # Try to derive from moles if present
-                n_salt = pd.to_numeric(df.at[idx, n_salt_col], errors='coerce') if n_salt_col in df.columns else np.nan
-                n_acid = pd.to_numeric(df.at[idx, n_acid_col], errors='coerce') if n_acid_col in df.columns else np.nan
-                if np.isfinite(n_salt) and np.isfinite(n_acid) and n_acid != 0:
-                    ratio_val = n_salt / n_acid
-                elif {salt_mass_col, acid_mass_col, molar_salt_col, molar_acid_col}.issubset(df.columns):
-                    m_salt = pd.to_numeric(df.at[idx, salt_mass_col], errors='coerce')
-                    m_acid = pd.to_numeric(df.at[idx, acid_mass_col], errors='coerce')
-                    mw_salt = pd.to_numeric(df.at[idx, molar_salt_col], errors='coerce')
-                    mw_acid = pd.to_numeric(df.at[idx, molar_acid_col], errors='coerce')
-                    if np.isfinite(m_salt) and np.isfinite(m_acid) and np.isfinite(mw_salt) and np.isfinite(mw_acid) and mw_acid != 0 and mw_salt != 0:
-                        n_salt = m_salt / mw_salt
-                        n_acid = m_acid / mw_acid
-                        if n_acid != 0:
-                            ratio_val = n_salt / n_acid
-
+            ratio_val = ratios[idx]
             if not np.isfinite(ratio_val):
                 continue
-
-            spec = STOICHIOMETRY_TARGETS.get((metal, ligand))
-            if spec:
-                target = spec.get("ratio")
-                tol = spec.get("tolerance", 0.1)
-                lower = target * (1 - tol)
-                upper = target * (1 + tol)
-            else:
-                lower, upper = DEFAULT_STOICHIOMETRY_BOUNDS
-
-            if ratio_val < lower or ratio_val > upper:
+            gkey = group_keys.loc[idx]
+            if ratio_val < lo_global or ratio_val > hi_global:
                 issues.append(
                     ValidationIssue(
                         row=idx,
                         column=ratio_col,
                         severity="error",
                         message=(
-                            f"R_molar={ratio_val:.3f} outside allowed range "
-                            f"[{lower:.3f}, {upper:.3f}] for ({metal}, {ligand})"
+                            f"R_molar={ratio_val:.3f} outside physical bounds "
+                            f"[{lo_global}, {hi_global}] for ({df.at[idx, metal_col]}, "
+                            f"{df.at[idx, ligand_col]})"
                         ),
                         actual=_safe_float(ratio_val),
                         expected=None,
                         delta=None,
+                    )
+                )
+                continue
+            fence = fences.get(gkey)
+            if fence is not None and (ratio_val < fence[0] or ratio_val > fence[1]):
+                issues.append(
+                    ValidationIssue(
+                        row=idx,
+                        column=ratio_col,
+                        severity="warning",
+                        message=(
+                            f"R_molar={ratio_val:.3f} is a feed-ratio outlier for {gkey} "
+                            f"(group fence [{fence[0]:.3f}, {fence[1]:.3f}])"
+                        ),
+                        actual=_safe_float(ratio_val),
+                        expected=None,
+                        delta=None,
+                    )
+                )
+
+    # Moles consistency (audit #11): if precomputed moles exist in the CSV, verify
+    # they match the canonical mass / molar-mass derivation within tolerance. This
+    # surfaces any divergence between the pre-computed and recomputed moles instead
+    # of letting the two sources silently disagree downstream.
+    for n_col, m_col, mw_col in (
+        ('n_соли', 'm (соли), г', 'Молярка_соли'),
+        ('n_кислоты', 'm(кис-ты), г', 'Молярка_кислоты'),
+    ):
+        if {n_col, m_col, mw_col}.issubset(df.columns):
+            n_pre = pd.to_numeric(df[n_col], errors='coerce')
+            m_vals = pd.to_numeric(df[m_col], errors='coerce')
+            mw_vals = pd.to_numeric(df[mw_col], errors='coerce').replace(0, np.nan)
+            n_derived = m_vals / mw_vals
+            denom = n_derived.abs().replace(0, np.nan)
+            rel = (n_pre - n_derived).abs() / denom
+            mask = (rel > 0.02) & np.isfinite(rel)
+            for pos in np.where(mask.to_numpy())[0]:
+                row = df.index[pos]
+                issues.append(
+                    ValidationIssue(
+                        row=row,
+                        column=n_col,
+                        severity="warning",
+                        message=(
+                            f"{n_col}={n_pre.iloc[pos]:.4g} diverges from mass/MW "
+                            f"derivation {n_derived.iloc[pos]:.4g} by {rel.iloc[pos] * 100:.1f}%"
+                        ),
+                        actual=_safe_float(n_pre.iloc[pos]),
+                        expected=_safe_float(n_derived.iloc[pos]),
+                        delta=_safe_float(n_pre.iloc[pos] - n_derived.iloc[pos]),
                     )
                 )
 

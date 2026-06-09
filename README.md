@@ -253,7 +253,7 @@ add_salt_mass_features(df)  # inplace=True (по умолчанию)
 
 ### Wave 2 Status
 *   **CatBoost:** текущий production default.
-*   **TabPFN:** challenger backend; на текущем датасете слабее CatBoost, особенно по `Sme`.
+*   **TabPFN:** `TabPFN-3` (`tabpfn>=8.0.0`, явный `ModelVersion.V3`) — на внутреннем CV сравнялся с CatBoost (OOF R²: `E0` 0.81, `x0` 0.80, `Sme` 0.74), резкий скачок против 6.4.1 (там отрицательные R²). На внешнем chemistry-holdout оба бэкенда дают отрицательный R². Остаётся challenger (нет interval UQ). Веса v3 требуют ключа `TABPFN_TOKEN` с ux.priorlabs.ai, не только HF-токена.
 *   **BoFire:** текущий production default; native strategy loop.
 *   **BoTorch:** рабочий research backend, но пока уступает BoFire по `best_score_pool`.
 *   **BayBE:** рабочий campaign backend для low-data loop, но не лучший production optimizer.

@@ -13,7 +13,13 @@ RARE_METALS_THRESHOLD: int = 10  # Metals with < 10 samples grouped as "Other"
 
 # Physics-informed loss constants
 R_GAS_J_MOL_K: float = 8.314  # Gas constant in J/(mol·K)
-E0_BOUNDS_KJ_MOL: tuple[float, float] = (10.0, 50.0)  # Bounds for E0 in kJ/mol (physisorption range)
+# Bounds for E0 in kJ/mol (audit #7). Widened from (10, 50) to cover the real data
+# range (9.5–61.2; p1=12.3, p99=56.7) and stay physically consistent: by the
+# Dubinin–Stoeckli relation x0[nm] ≈ 12/E0[kJ/mol], the data's E0=61↔x0=0.20 nm and
+# E0=9.5↔x0=1.26 nm are self-consistent narrow-micropore physisorption values. The
+# old (10, 50) gate unjustly penalized 9 high-E0 + 3 low-E0 legitimate rows and
+# blocked the inverse design from targeting that real region.
+E0_BOUNDS_KJ_MOL: tuple[float, float] = (5.0, 65.0)
 ADSORPTION_ENERGY_RATIO_BOUNDS: tuple[float, float] = (0.2, 1.0)  # Bounds for E/E0 ratio
 THERMODYNAMIC_TOLERANCE: float = 0.15  # 15% tolerance for K_eq vs theoretical
 A0_W0_COEFFICIENT: float = 28.86
@@ -207,6 +213,10 @@ SOLVENT_BOILING_POINTS_C = {
     'Acetonitrile': 82.0,
     'Метанол': 65.0,
     'Methanol': 65.0,
+    # Audit #9: DMSO is present in the data but was missing here.
+    'ДМСО': 189.0,
+    'DMSO': 189.0,
+    'Dimethyl sulfoxide': 189.0,
 }
 
 SOLVENT_POLAR_PROPERTIES = {
@@ -261,6 +271,43 @@ HYDRATION_MAP = {
 
 
 DEFAULT_STOICHIOMETRY_BOUNDS: tuple[float, float] = (0.45, 2.3)
+
+# --- Stoichiometry science references & validation policy (audit #2) ---
+# Framework (formula-unit) metal:linker ratios from the literature. These are the
+# IDEAL crystal compositions, NOT the synthesis feed ratios — real syntheses
+# routinely use metal or linker excess (modulated synthesis). Empirically the lab
+# feed ratios differ systematically from these (e.g. Cu|BTC≈1.71, Fe|BDC≈0.66),
+# so framework ratios are kept for DOCUMENTATION/REFERENCE only and are NOT used
+# as hard validation gates.
+# Sources: HKUST-1 Cu3(BTC)2 (Chui et al. 1999); MOF-5/IRMOF-1 Zn4O(BDC)3
+# (Li et al. 1999); UiO-66 Zr6O4(OH)4(BDC)6 (Cavka et al. 2008); MIL-53(Al/Fe)
+# M(OH)(BDC); MIL-100(Fe) Fe3O(BTC)2 (Horcajada et al. 2007); MOF-177 Zn4O(BTB)2
+# (Chae et al. 2004).
+STOICHIOMETRY_REFERENCE = {
+    ('Cu', 'BTC'): 1.5,        # Cu3(BTC)2 (HKUST-1)
+    ('Zn', 'BDC'): 4.0 / 3.0,  # Zn4O(BDC)3 (MOF-5/IRMOF-1)
+    ('Zr', 'BDC'): 1.0,        # Zr6O4(OH)4(BDC)6 (UiO-66)
+    ('Al', 'BDC'): 1.0,        # Al(OH)(BDC) (MIL-53(Al))
+    ('Fe', 'BDC'): 1.0,        # Fe(OH)(BDC) (MIL-53(Fe))
+    ('Fe', 'BTC'): 1.5,        # Fe3O(BTC)2 (MIL-100(Fe))
+    ('Al', 'BTC'): 1.5,        # Al3O(BTC)2 (MIL-100(Al) analogue)
+    ('Zn', 'BTB'): 2.0,        # Zn4O(BTB)2 (MOF-177)
+    ('La', 'BTC'): 1.0,        # La(BTC), trivalent metal + trivalent linker
+}
+
+# Feed-ratio QC policy (data-driven, audit #2):
+# - Global physical sanity bounds (hard ERROR): a feed ratio outside this range is
+#   almost certainly a data-entry error regardless of chemistry.
+STOICHIOMETRY_GLOBAL_BOUNDS: tuple[float, float] = (0.05, 10.0)
+# - Per-group statistical outliers (WARNING): Tukey fences computed from the
+#   empirical feed-ratio distribution of each (metal, ligand) group, only when the
+#   group has at least STOICHIOMETRY_GROUP_MIN_N rows.
+STOICHIOMETRY_GROUP_MIN_N: int = 6
+# Per-group WARNING fence width as a multiplicative factor around the group median
+# (median/F .. median*F). Deliberately wide: within-group feed-ratio variation is
+# usually an intentional design-of-experiments sweep, not noise — so we only flag
+# gross per-group deviations (likely fat-finger typos, e.g. 25 instead of 2.5).
+STOICHIOMETRY_GROUP_FACTOR: float = 4.0
 
 
 # --- Forward Model (Bayesian Optimization) Constants ---
@@ -338,4 +385,27 @@ FORWARD_MODEL_ENGINEERED_FEATURES = [
     'Molarity_H2O_Hidden',
     'Supersaturation_Index',
     'Reactor_Loading_g_mL'
+]
+
+# --- Schema normalization (audit #10) ---
+# Canonical column names the pipeline depends on. Incoming CSVs (re-exported from
+# Excel) often carry fragile variants: stray whitespace, different degree signs
+# (°/º/ᵒ), and Latin/Cyrillic homoglyphs (T↔Т, C↔С, o↔о, a↔а, p↔р, e↔е, H↔Н, x↔х,
+# y↔у, k↔к, M↔М). `normalize_synthesis_columns` folds those variants back to these
+# canonical names so a benign re-export does not silently break the pipeline.
+SCHEMA_CANONICAL_COLUMNS = [
+    'Металл',
+    'Лиганд',
+    'Растворитель',
+    'm (соли), г',
+    'm(кис-ты), г',
+    'Vсин. (р-ля), мл',
+    'Т.син., °С',
+    'Т суш., °С',
+    'Tрег, ᵒС',
+    'Молярка_соли',
+    'Молярка_кислоты',
+    'E0, кДж/моль',
+    'х0, нм',
+    'Sme, м2/г',
 ]
