@@ -24,3 +24,7 @@ test_*.csv
 # OS clutter
 .DS_Store
 Thumbs.db
+
+# Local tool state / generated snapshots
+.codegraph/
+repomix-output.xml
