@@ -16,7 +16,7 @@
 | 5 | Инъекция LIGAND_3D/2D | Убрана на источнике (`build_lookup_tables`) и в `prepare_forward_dataset` (P4.1) | `data_processing.py` |
 | 6 | Переширокие UQ-интервалы | KPI: `interval_coverage_gap`, `interval_width_normalized` | `train_forward_model.py` |
 | 7 | E0-границы / zero-inflation Sme | E0 (10,50)→(5,65) по Дубинину-Штёкли x0≈12/E0 + данным; zero-inflation Sme задокументирована | `constants.py` |
-| 8 | Нестабильный отбор фич | `stability_select_features` + скрипт анализа | `feature_selection.py`, `scripts/feature_stability.py` |
+| 8 | Нестабильный отбор фич | `stability_select_features` + анализ; **вшито в обучение** флагом `--stability-selection` (per-fold bootstrap на train, без утечки) | `feature_selection.py`, `scripts/feature_stability.py`, `train_forward_model.py` |
 | 9 | Хардкод-справочники | ДМСО добавлен в точки кипения; смеси растворителей (min-bp); провенанс/источники | `constants.py`, `data_validation.py` |
 | 10 | Хрупкие имена колонок | Слой нормализации (пробелы, °/º/ᵒ, гомоглифы Latin↔Cyrillic) | `constants.py` (`SCHEMA_CANONICAL_COLUMNS`), `data_processing.py` (`normalize_synthesis_columns`) |
 | 11 | Рассинхрон молей | Проверка согласованности precomputed vs mass/MW (warning при расхождении >2%) | `data_validation.py` |
@@ -45,6 +45,16 @@
 | Sme | **0.665** | 0.774 |
 
 → утечка дублей рецептов раздувала именно **Sme** (0.77→0.66 после устранения); E0/x0 стабильны. Это честный внутренний показатель.
+
+**Per-fold stability selection (#8, `--stability-selection`, прогон на a100):** на том же GroupKFold:
+
+| target | обычный отбор | stability (10 boot) |
+|---|---|---|
+| E0 | 0.821 | 0.812 |
+| x0 | 0.814 | 0.812 |
+| Sme | 0.665 | **0.754** |
+
+→ на самом шумном таргете Sme стабильный отбор убирает шум в наборе фич → OOF **0.66 → 0.75**; E0/x0 без изменений (уже стабильны). Артефакты: `artifacts/forward_models_stability/`. Флаг opt-in (default off), чтобы не менять поведение молча.
 
 **UQ-KPI (CatBoost+MAPIE, цель покрытия 90%):**
 
