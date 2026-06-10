@@ -58,15 +58,18 @@ def _logo_oof(
     *,
     params: Dict,
     group_columns,
+    label: str = "real",
 ) -> tuple[np.ndarray, np.ndarray, Dict[str, Dict[str, float]]]:
     """Return (y_true, y_oof, per_group_metrics) for one target via LOGO-CV."""
     groups = build_chemistry_group_keys(df, group_columns=group_columns)
+    unique_groups = sorted(groups.unique())
+    total = len(unique_groups)
     n = len(df)
     y_oof = np.full(n, np.nan, dtype=float)
     y_true_full = np.full(n, np.nan, dtype=float)
     per_group: Dict[str, Dict[str, float]] = {}
 
-    for group in sorted(groups.unique()):
+    for i, group in enumerate(unique_groups, start=1):
         test_mask = (groups == group).to_numpy()
         train_mask = ~test_mask
         if train_mask.sum() == 0 or test_mask.sum() == 0:
@@ -97,11 +100,14 @@ def _logo_oof(
         yt = y_test[target].to_numpy(dtype=float)
         per_group[group] = {
             "n": int(test_mask.sum()),
-            # R2 needs >=2 points and variance; report NaN otherwise
             "R2": float(r2_score(yt, pred)) if len(yt) >= 2 and np.ptp(yt) > 0 else None,
             "RMSE": float(np.sqrt(mean_squared_error(yt, pred))),
             "MAE": float(mean_absolute_error(yt, pred)),
         }
+        print(
+            f"    [{target}|{label}] {i}/{total} hold-out {group} (n={int(test_mask.sum())})",
+            flush=True,
+        )
 
     valid = ~np.isnan(y_oof)
     return y_true_full[valid], y_oof[valid], per_group
@@ -126,6 +132,9 @@ def main() -> None:
                         help="Number of y-scrambling permutations for the null baseline.")
     parser.add_argument("--iterations", type=int, default=None,
                         help="Override CatBoost iterations (lower = faster LOGO eval).")
+    parser.add_argument("--threads", type=int, default=8,
+                        help="CatBoost thread_count. On tiny data (380 rows) fewer "
+                             "threads beat 64 — less parallel overhead per fit.")
     parser.add_argument("--validation-mode", choices=["warn", "strict"], default="warn")
     args = parser.parse_args()
 
@@ -155,6 +164,7 @@ def main() -> None:
         params["allow_writing_files"] = False
         if args.iterations is not None:
             params["iterations"] = args.iterations
+        params["thread_count"] = args.threads
 
         y_true, y_oof, per_group = _logo_oof(
             df, target, params=params, group_columns=group_columns
@@ -169,7 +179,8 @@ def main() -> None:
             df_perm = df.copy()
             df_perm[target] = rng.permutation(df[target].to_numpy())
             yt_p, yp_p, _ = _logo_oof(
-                df_perm, target, params=params, group_columns=group_columns
+                df_perm, target, params=params, group_columns=group_columns,
+                label=f"perm{p + 1}",
             )
             null_r2.append(float(r2_score(yt_p, yp_p)))
         if null_r2:
