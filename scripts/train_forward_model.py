@@ -61,18 +61,62 @@ def _feature_selection_for_fold(
     categorical_cols: List[str],
     *,
     use_feature_selection: bool,
+    stability: bool = False,
+    stability_bootstraps: int = 10,
+    stability_threshold: float = 0.5,
+    stability_seed: int = RANDOM_SEED,
 ) -> Tuple[List[str], Dict]:
     if not use_feature_selection:
         return list(X_train.columns), {"removed_correlation": [], "removed_vif": []}
-    return select_curated_features(
-        X_train,
-        y_train,
-        categorical_cols,
-        corr_threshold=FORWARD_MODEL_CONFIG.feature_selection_corr_threshold,
-        vif_threshold=FORWARD_MODEL_CONFIG.feature_selection_vif_threshold,
-        max_features=FORWARD_MODEL_CONFIG.feature_selection_max_features,
-        verbose=False,
+
+    def _curated(X_sub: pd.DataFrame, y_sub: pd.Series) -> Tuple[List[str], Dict]:
+        return select_curated_features(
+            X_sub,
+            y_sub,
+            categorical_cols,
+            corr_threshold=FORWARD_MODEL_CONFIG.feature_selection_corr_threshold,
+            vif_threshold=FORWARD_MODEL_CONFIG.feature_selection_vif_threshold,
+            max_features=FORWARD_MODEL_CONFIG.feature_selection_max_features,
+            verbose=False,
+        )
+
+    if not stability:
+        return _curated(X_train, y_train)
+
+    # Audit #8: per-fold stability selection. Bootstrap the curated selector on
+    # TRAIN ONLY (no leakage) and keep features chosen in >= threshold of resamples.
+    # This replaces the noisy single per-fold selection with a stable, reproducible set.
+    cat = [c for c in categorical_cols if c in X_train.columns]
+    numeric = [c for c in X_train.columns if c not in cat]
+    rng = np.random.default_rng(stability_seed)
+    n = len(X_train)
+    size = max(2, int(round(n * 0.8)))
+    n_boot = max(1, stability_bootstraps)
+    counts = {c: 0 for c in numeric}
+    for _ in range(n_boot):
+        idx = rng.choice(n, size=size, replace=False)
+        sel, _ = _curated(X_train.iloc[idx], y_train.iloc[idx])
+        for feat in sel:
+            if feat in counts:
+                counts[feat] += 1
+    freq = {c: counts[c] / n_boot for c in numeric}
+    stable_numeric = sorted(
+        [c for c in numeric if freq[c] >= stability_threshold],
+        key=lambda c: freq[c],
+        reverse=True,
     )
+    if not stable_numeric:
+        # All features flaky at this threshold — fall back to one curated selection
+        # to avoid handing the model a categorical-only feature set.
+        return _curated(X_train, y_train)
+    report = {
+        "removed_correlation": [],
+        "removed_vif": [],
+        "stability_frequency": freq,
+        "stability_bootstraps": n_boot,
+        "stability_threshold": stability_threshold,
+    }
+    return list(cat) + stable_numeric, report
 
 
 def _build_training_context(
@@ -178,6 +222,9 @@ def train_catboost_models(
     iterations: int | None = None,
     validation_mode: str = "warn",
     use_feature_selection: bool = True,
+    use_stability_selection: bool = False,
+    stability_bootstraps: int = 10,
+    stability_threshold: float = 0.5,
 ) -> None:
     _, X, y, cat_features, sample_weights = _build_training_context(
         data_path,
@@ -233,6 +280,9 @@ def train_catboost_models(
                 y_train,
                 cat_features,
                 use_feature_selection=use_feature_selection,
+                stability=use_stability_selection,
+                stability_bootstraps=stability_bootstraps,
+                stability_threshold=stability_threshold,
             )
             fold_feature_sets.append(selected_features)
             removed_corr_total += len(selection_report.get("removed_correlation", []))
@@ -265,6 +315,9 @@ def train_catboost_models(
             y_target,
             cat_features,
             use_feature_selection=use_feature_selection,
+            stability=use_stability_selection,
+            stability_bootstraps=stability_bootstraps,
+            stability_threshold=stability_threshold,
         )
         selected_cat_full = [feature for feature in selected_features_full if feature in cat_features]
 
@@ -560,6 +613,11 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=None, help="Override CatBoost iterations.")
     parser.add_argument("--backend", choices=["catboost", "tabpfn", "all"], default="catboost")
     parser.add_argument("--no-feature-selection", action="store_true")
+    parser.add_argument("--stability-selection", action="store_true",
+                        help="Audit #8: per-fold bootstrap stability selection (catboost). "
+                             "Keeps features chosen in >= threshold of resamples (train-only, no leakage).")
+    parser.add_argument("--stability-bootstraps", type=int, default=10)
+    parser.add_argument("--stability-threshold", type=float, default=0.5)
     parser.add_argument(
         "--validation-mode",
         type=str,
@@ -579,6 +637,9 @@ def main() -> None:
                 iterations=args.iterations,
                 validation_mode=args.validation_mode,
                 use_feature_selection=not args.no_feature_selection,
+                use_stability_selection=args.stability_selection,
+                stability_bootstraps=args.stability_bootstraps,
+                stability_threshold=args.stability_threshold,
             )
         elif backend == "tabpfn":
             if args.iterations is not None:
