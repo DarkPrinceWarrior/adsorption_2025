@@ -222,7 +222,7 @@ def train_catboost_models(
     iterations: int | None = None,
     validation_mode: str = "warn",
     use_feature_selection: bool = True,
-    use_stability_selection: bool = False,
+    use_stability_selection: bool = True,
     stability_bootstraps: int = 10,
     stability_threshold: float = 0.5,
 ) -> None:
@@ -613,9 +613,10 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=None, help="Override CatBoost iterations.")
     parser.add_argument("--backend", choices=["catboost", "tabpfn", "all"], default="catboost")
     parser.add_argument("--no-feature-selection", action="store_true")
-    parser.add_argument("--stability-selection", action="store_true",
-                        help="Audit #8: per-fold bootstrap stability selection (catboost). "
-                             "Keeps features chosen in >= threshold of resamples (train-only, no leakage).")
+    parser.add_argument("--no-stability-selection", action="store_true",
+                        help="Disable per-fold bootstrap stability selection (catboost). "
+                             "Stability selection is ON by default (audit #8): keeps features "
+                             "chosen in >= threshold of resamples (train-only, no leakage).")
     parser.add_argument("--stability-bootstraps", type=int, default=10)
     parser.add_argument("--stability-threshold", type=float, default=0.5)
     parser.add_argument(
@@ -637,7 +638,7 @@ def main() -> None:
                 iterations=args.iterations,
                 validation_mode=args.validation_mode,
                 use_feature_selection=not args.no_feature_selection,
-                use_stability_selection=args.stability_selection,
+                use_stability_selection=not args.no_stability_selection,
                 stability_bootstraps=args.stability_bootstraps,
                 stability_threshold=args.stability_threshold,
             )
