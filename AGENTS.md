@@ -224,6 +224,26 @@ PYTHONPATH=src python scripts/run_wave2_suite.py --mode full \
 No global lint/format runner is configured. After changes, run the affected
 script directly to check imports/runtime, plus the relevant tests.
 
+## Server workflow (a100)
+
+Heavy runs (forward training, LOGO-CV, feature stability, holdout, inverse search)
+execute on the a100 server; the local checkout is for code editing and MCP
+navigation. Keep **local ⇄ GitHub ⇄ server on the SAME commit** — no commit may
+diverge. Write code locally → commit → `git push` → `git pull` on the server. Never
+edit code directly on the server.
+
+- SSH: `ssh a100` (LAN/office) or `ssh a100-remote` (jump host `jump-37`, any
+  network); both in `~/.ssh/config`. GitHub SSH auth works from the server.
+- Server path: `/root/projects/adsorb_synthesis`, cloned from
+  `git@github.com:DarkPrinceWarrior/adsorption_2025.git` (branch `Bayesian-Optimization`).
+- Env (uv): `uv venv --python 3.13 .venv` + `uv pip install -r requirements.txt`.
+  Verified: uv 0.11.8, Python 3.13.5, torch 2.11.0+cu130, CUDA 13.0, 6× A100-40GB.
+  GPU0 is busy (~8.4 GB) → use `CUDA_VISIBLE_DEVICES=1..5` for GPU jobs (TabPFN).
+- Run long jobs in `tmux` on the server; copy results back with
+  `scp -r a100:/root/projects/adsorb_synthesis/artifacts/<dir> artifacts/`.
+- TabPFN-3 on the server needs a Prior Labs `TABPFN_TOKEN` in `~/.cache/tabpfn/auth_token`.
+- `artifacts/`, `.venv/`, `.codegraph/` stay server-local (gitignored).
+
 ## Coding conventions
 
 - Use `from __future__ import annotations` at the top of Python modules.

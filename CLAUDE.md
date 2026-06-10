@@ -158,6 +158,31 @@ Computes TabPFN / external holdout / BayBE / direct inverse if missing, runs
 No linting, formatting, or test runner is otherwise configured. After changes,
 run the affected script directly to check for import/runtime errors.
 
+## Server workflow (a100)
+
+Heavy runs execute on the a100 server; the local checkout is for code editing and
+MCP navigation. Keep **local ⇄ GitHub ⇄ server on the SAME commit** — no commit may
+diverge. Write code locally → commit → `git push` → `git pull` on the server. Never
+edit code directly on the server.
+
+- **SSH:** `ssh a100` (LAN/office) or `ssh a100-remote` (jump host `jump-37`, any
+  network); both in `~/.ssh/config`. GitHub SSH auth works from the server.
+- **Path:** `/root/projects/adsorb_synthesis`, cloned from
+  `git@github.com:DarkPrinceWarrior/adsorption_2025.git` (branch `Bayesian-Optimization`).
+- **Env (uv):** `uv venv --python 3.13 .venv` + `uv pip install -r requirements.txt`.
+  Verified server stack: uv 0.11.8, Python 3.13.5, torch 2.11.0+cu130, CUDA 13.0,
+  6× A100-40GB. GPU0 is busy (~8.4 GB) → use `CUDA_VISIBLE_DEVICES=1..5` for GPU jobs.
+- **Run heavy jobs on the server in `tmux`**, then copy results back to local `artifacts/`:
+  ```bash
+  ssh a100 'tmux new -d -s adsorb_logo \
+    "cd /root/projects/adsorb_synthesis && PYTHONPATH=src .venv/bin/python \
+     scripts/evaluate_chemistry_logo.py --permutations 3 2>&1 | tee logo.log"'
+  # train_forward_model.py / feature_stability.py / evaluate_forward_holdout.py likewise
+  scp -r a100:/root/projects/adsorb_synthesis/artifacts/forward_logo artifacts/
+  ```
+- **TabPFN-3 on the server** needs a Prior Labs `TABPFN_TOKEN` in `~/.cache/tabpfn/auth_token`.
+- `artifacts/`, `.venv/`, `.codegraph/` stay server-local (gitignored).
+
 ## Architecture
 
 ### Data flow
